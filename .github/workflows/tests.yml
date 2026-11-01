@@ -1,0 +1,31 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+  workflow_call:
+
+permissions: {}
+
+jobs:
+  node-tests:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Validate HACS manifest
+        run: node -e "const h = require('./hacs.json'); if (h.name !== 'AnyList Recipe View') throw new Error('hacs.json name mismatch'); if (h.filename !== 'anylist-recipe-view-card.js') throw new Error('hacs.json filename mismatch')"
+      - name: Check card syntax
+        run: node --check anylist-recipe-view-card.js
+      - name: Run card tests
+        run: node --test anylist-recipe-view-card.test.cjs anylist-recipe-view-card.dom.test.cjs

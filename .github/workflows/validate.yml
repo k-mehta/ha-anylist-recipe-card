@@ -1,0 +1,39 @@
+name: Validate
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+  workflow_call:
+
+permissions: {}
+
+jobs:
+  card-syntax:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check card syntax
+        run: node --check anylist-recipe-view-card.js
+
+  validate-hacs:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - name: HACS validation
+        uses: hacs/action@main
+        with:
+          category: plugin
+          # Topics are set on the repository (GitHub settings), not in
+          # the repo itself; skip that check here.
+          ignore: topics
