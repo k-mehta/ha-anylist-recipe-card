@@ -6,7 +6,7 @@ and the version numbers follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Releases
 are tagged `vX.Y.Z`.
 
-## [Unreleased]
+## [1.1.0] - 2026-11-02
 
 ### Added
 
