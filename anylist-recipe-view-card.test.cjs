@@ -26,6 +26,8 @@ const {
   renderIngredientRow,
   sortRecipes,
   filterByCollection,
+  detectDevice,
+  readDeviceEnv,
 } = require("./anylist-recipe-view-card.js");
 
 // A recipe exactly as the AnyList integration serializes it
@@ -446,3 +448,212 @@ test("deriveCollections dedupes by id and sorts by name", () => {
 });
 
 
+
+// -- Device detection (shared mechanism; the timer-screen card carries
+// the identical block — see ADAPTIVE-LAYOUT.md) ---------------------------
+
+const DESKTOP_UA =
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+const HUB_UA =
+  "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+const IPHONE_UA =
+  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
+const IPAD_UA =
+  "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
+
+test("detectDevice: the hub is a huge landscape touch screen", () => {
+  assert.deepEqual(
+    detectDevice({
+      width: 1920,
+      height: 1200,
+      coarsePointer: true,
+      finePointer: false,
+      touch: true,
+      userAgent: HUB_UA,
+    }),
+    { category: "hub", orientation: "landscape" }
+  );
+  // No user agent at all: size + touch + landscape is enough.
+  assert.deepEqual(
+    detectDevice({
+      width: 1920,
+      height: 1200,
+      coarsePointer: true,
+      finePointer: false,
+      touch: true,
+      userAgent: "",
+    }),
+    { category: "hub", orientation: "landscape" }
+  );
+});
+
+test("detectDevice: a desktop touchscreen that size reads as the hub (documented limit)", () => {
+  assert.deepEqual(
+    detectDevice({
+      width: 1920,
+      height: 1080,
+      coarsePointer: true,
+      finePointer: false,
+      touch: true,
+      userAgent: DESKTOP_UA,
+    }),
+    { category: "hub", orientation: "landscape" }
+  );
+});
+
+test("detectDevice: a mouse is desktop", () => {
+  assert.deepEqual(
+    detectDevice({
+      width: 1440,
+      height: 900,
+      coarsePointer: false,
+      finePointer: true,
+      touch: false,
+      userAgent: DESKTOP_UA,
+    }),
+    { category: "desktop", orientation: "landscape" }
+  );
+  assert.deepEqual(
+    detectDevice({
+      width: 1280,
+      height: 800,
+      coarsePointer: false,
+      finePointer: true,
+      touch: false,
+      userAgent: DESKTOP_UA,
+    }),
+    { category: "desktop", orientation: "landscape" }
+  );
+});
+
+test("detectDevice: a narrow desktop window gets the mobile layout (the layout follows the viewport)", () => {
+  assert.deepEqual(
+    detectDevice({
+      width: 700,
+      height: 900,
+      coarsePointer: false,
+      finePointer: true,
+      touch: false,
+      userAgent: DESKTOP_UA,
+    }),
+    { category: "mobile", orientation: "portrait" }
+  );
+});
+
+test("detectDevice: phones are mobile in both orientations", () => {
+  assert.deepEqual(
+    detectDevice({
+      width: 390,
+      height: 844,
+      coarsePointer: true,
+      finePointer: false,
+      touch: true,
+      userAgent: IPHONE_UA,
+    }),
+    { category: "mobile", orientation: "portrait" }
+  );
+  assert.deepEqual(
+    detectDevice({
+      width: 844,
+      height: 390,
+      coarsePointer: true,
+      finePointer: false,
+      touch: true,
+      userAgent: IPHONE_UA,
+    }),
+    { category: "mobile", orientation: "landscape" }
+  );
+});
+
+test("detectDevice: a mobile user agent wins over a desktop-sized viewport", () => {
+  assert.deepEqual(
+    detectDevice({
+      width: 1440,
+      height: 900,
+      coarsePointer: false,
+      finePointer: true,
+      touch: false,
+      userAgent: IPHONE_UA,
+    }),
+    { category: "mobile", orientation: "landscape" }
+  );
+});
+
+test("detectDevice: tablets are mobile in both orientations", () => {
+  assert.deepEqual(
+    detectDevice({
+      width: 768,
+      height: 1024,
+      coarsePointer: true,
+      finePointer: false,
+      touch: true,
+      userAgent: IPAD_UA,
+    }),
+    { category: "mobile", orientation: "portrait" }
+  );
+  assert.deepEqual(
+    detectDevice({
+      width: 1024,
+      height: 768,
+      coarsePointer: true,
+      finePointer: false,
+      touch: true,
+      userAgent: IPAD_UA,
+    }),
+    { category: "mobile", orientation: "landscape" }
+  );
+});
+
+test("detectDevice: a huge portrait touch screen is mobile, not the hub (the hub is landscape)", () => {
+  assert.deepEqual(
+    detectDevice({
+      width: 1200,
+      height: 1920,
+      coarsePointer: true,
+      finePointer: false,
+      touch: true,
+      userAgent: "",
+    }),
+    { category: "mobile", orientation: "portrait" }
+  );
+});
+
+test("detectDevice: with no pointer information, touch + huge landscape is the hub and a wide viewport is desktop", () => {
+  assert.deepEqual(
+    detectDevice({
+      width: 1920,
+      height: 1200,
+      coarsePointer: false,
+      finePointer: false,
+      touch: true,
+      userAgent: "",
+    }),
+    { category: "hub", orientation: "landscape" }
+  );
+  assert.deepEqual(
+    detectDevice({
+      width: 1440,
+      height: 900,
+      coarsePointer: false,
+      finePointer: false,
+      touch: false,
+      userAgent: "",
+    }),
+    { category: "desktop", orientation: "landscape" }
+  );
+  assert.deepEqual(
+    detectDevice({
+      width: 800,
+      height: 600,
+      coarsePointer: false,
+      finePointer: false,
+      touch: false,
+      userAgent: "",
+    }),
+    { category: "mobile", orientation: "landscape" }
+  );
+});
+
+test("readDeviceEnv returns null outside a browser", () => {
+  assert.equal(readDeviceEnv(), null);
+});

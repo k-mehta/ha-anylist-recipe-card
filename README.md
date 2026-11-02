@@ -24,6 +24,19 @@ a searchable list, tap one to open it. That is all it does.
 - **No shopping-list button, on purpose.** The card never adds
   ingredients to a shopping list and has no button for it.
 
+## Devices
+
+The card adapts to the device it runs on — hub kiosk, desktop, or
+phone/tablet, portrait or landscape — and re-detects on resize or
+rotation. The hub (1920×1200 landscape touch display) keeps the big
+kitchen-grade targets above; a desktop gets a denser layout with
+smaller targets (mouse precision) and a wider detail view; a phone
+gets a single column, large touch targets, full-width detail, and
+collection chips that wrap onto a second row instead of scrolling
+sideways. See [ADAPTIVE-LAYOUT.md](ADAPTIVE-LAYOUT.md) for the
+detection mechanism (shared with the Satellite Timers card) and the
+layout per device.
+
 ## How it works
 
 The card is a single vanilla-JS file (`anylist-recipe-view-card.js`,

@@ -414,6 +414,115 @@ function deriveCollections(recipes) {
   );
 }
 
+// -- Device detection (SHARED MECHANISM) ----------------------------------
+//
+// The same detection runs in the AnyList recipe card
+// (k-mehta/ha-anylist-recipe-card) and the Satellite Timers card
+// (k-mehta/ha-satellite-timers). It is ONE mechanism, copied verbatim
+// into each card file: each card is a single standalone file with no
+// imports, so the code cannot be shared by import — the two copies must
+// stay identical. If you change the signals, the precedence, or the
+// category names here, change them in the other card too, and update
+// ADAPTIVE-LAYOUT.md (which is also identical in both repos).
+//
+// Signals (all read from the browser the card is running in):
+//   viewport width/height — the strongest signal; the layout follows
+//     the viewport, not the device name.
+//   pointer type — matchMedia("(pointer: coarse)") is a finger/touch
+//     screen; "(pointer: fine)" is a mouse/trackpad.
+//   touch — "ontouchstart" in window, or navigator.maxTouchPoints > 0.
+//   user agent — only as a tiebreaker for phones/tablets, never alone:
+//     a desktop browser can spoof it, and a kiosk can strip it.
+//
+// Precedence (first match wins):
+//   1. A phone/tablet user agent ("Mobi", "Android", "iPhone", "iPad",
+//      "iPod") is mobile.
+//   2. A viewport narrower than 768px is mobile (a narrow desktop
+//      window gets the single-column layout too — the layout follows
+//      the viewport).
+//   3. A coarse pointer on anything but a huge landscape screen is
+//      mobile (phones and tablets).
+//   4. A coarse pointer on a landscape screen at least 1600px wide is
+//      the hub: the kitchen kiosk is a 1920x1200 touch display.
+//   5. A fine pointer is desktop.
+//   6. With no pointer information: a touch screen that is landscape
+//      and at least 1600px wide is the hub; a viewport at least 1024px
+//      wide is desktop; anything else is mobile.
+//
+// Known limits (every fallback still renders a usable layout, never a
+// broken one):
+//   - A desktop touchscreen at 1920x1200 reads as the hub. That is
+//     fine: the hub layout is just big targets on a wide screen.
+//   - A phone in desktop mode (no mobile user agent) still reads as
+//     mobile by width (rule 2).
+//   - The hub is recognised by size + touch + landscape, not by name:
+//     if the kiosk display changes size, the thresholds above are the
+//     place to adjust.
+//
+// Orientation is separate from category: landscape is width >= height,
+// portrait is width < height. The category picks the control sizes and
+// the base layout; orientation picks the grid (e.g. one column in
+// portrait, two in landscape on mobile).
+
+const HUB_MIN_WIDTH_PX = 1600;
+const MOBILE_MAX_WIDTH_PX = 768;
+const DESKTOP_MIN_WIDTH_PX = 1024;
+const MOBILE_USER_AGENT = /Mobi|Android|iPhone|iPad|iPod/i;
+
+// The device the card is running on, from a plain environment object
+// (width/height in CSS pixels, pointer flags, touch flag, user agent).
+// Pure — no browser access — so it is unit-testable in node. Returns
+// { category: "hub" | "desktop" | "mobile", orientation:
+// "landscape" | "portrait" }.
+function detectDevice(env) {
+  const width = Number((env && env.width) || 0);
+  const height = Number((env && env.height) || 0);
+  const orientation = width >= height ? "landscape" : "portrait";
+  const userAgent = String((env && env.userAgent) || "");
+  const coarse = Boolean(env && env.coarsePointer);
+  const fine = Boolean(env && env.finePointer);
+  const touch = Boolean(env && env.touch);
+  let category;
+  if (MOBILE_USER_AGENT.test(userAgent)) category = "mobile";
+  else if (width < MOBILE_MAX_WIDTH_PX) category = "mobile";
+  else if (coarse && !(width >= HUB_MIN_WIDTH_PX && orientation === "landscape"))
+    category = "mobile";
+  else if (coarse) category = "hub";
+  else if (fine) category = "desktop";
+  else if (touch && width >= HUB_MIN_WIDTH_PX && orientation === "landscape")
+    category = "hub";
+  else if (width >= DESKTOP_MIN_WIDTH_PX) category = "desktop";
+  else category = "mobile";
+  return { category, orientation };
+}
+
+// The environment the card is actually running in, read from the
+// browser. Returns null outside a browser (node tests), where the card
+// keeps its base layout and detectDevice is never called.
+function readDeviceEnv() {
+  if (typeof window === "undefined" || typeof navigator === "undefined") {
+    return null;
+  }
+  const coarse =
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(pointer: coarse)").matches;
+  const fine =
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(pointer: fine)").matches;
+  const touch =
+    "ontouchstart" in window ||
+    (typeof navigator.maxTouchPoints === "number" &&
+      navigator.maxTouchPoints > 0);
+  return {
+    width: window.innerWidth,
+    height: window.innerHeight,
+    coarsePointer: coarse,
+    finePointer: fine,
+    touch,
+    userAgent: navigator.userAgent || "",
+  };
+}
+
 const CARD_CSS = `
   :host { display: block; }
   /* Design tokens: one warm, food-app palette for the whole card. The
@@ -808,6 +917,69 @@ const CARD_CSS = `
   .skeleton-line.short { width: 55%; }
   .skeleton-thumb, .skeleton-line { animation: pulse 1.4s ease-in-out infinite; }
   @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
+  /* -- Adaptive layout --------------------------------------------------
+     The card detects its device (see detectDevice) and carries the
+     category + orientation as classes on .screen: dev-hub, dev-desktop
+     or dev-mobile, and orient-landscape or orient-portrait. The rules
+     above ARE the hub layout (1920x1200 kitchen kiosk: big touch
+     targets, multi-column grid); the rules below only adjust for
+     desktop and mobile. A card with no device classes (no browser
+     environment) renders the hub layout. */
+  /* Desktop: a mouse is precise, so targets shrink and the grid gets
+     denser — three columns from 1200px, four from 1700px. Hover states
+     from the base rules still apply. */
+  .screen.dev-desktop { font-size: 18px; padding: 20px 28px; }
+  .screen.dev-desktop .title { font-size: 28px; }
+  .screen.dev-desktop .search { min-height: 52px; font-size: 19px; padding: 10px 20px 10px 52px; background-size: 22px 22px; }
+  .screen.dev-desktop .button { min-height: 52px; font-size: 18px; padding: 10px 20px; }
+  .screen.dev-desktop .chip { min-height: 44px; font-size: 17px; padding: 6px 18px; }
+  .screen.dev-desktop .row { min-height: 88px; padding: 12px 16px; }
+  .screen.dev-desktop .thumb { width: 68px; height: 68px; }
+  .screen.dev-desktop .skeleton-row { min-height: 88px; }
+  .screen.dev-desktop .skeleton-thumb { width: 68px; height: 68px; }
+  .screen.dev-desktop .row-name { font-size: 20px; }
+  .screen.dev-desktop .detail { max-width: 1200px; }
+  .screen.dev-desktop .detail-name { font-size: 32px; }
+  .screen.dev-desktop .tab { min-height: 52px; font-size: 18px; }
+  .screen.dev-desktop .ingredient, .screen.dev-desktop .step, .screen.dev-desktop .detail-row { min-height: 52px; font-size: 19px; }
+  @media (min-width: 1200px) { .screen.dev-desktop .list { grid-template-columns: repeat(3, 1fr); } }
+  @media (min-width: 1700px) { .screen.dev-desktop .list { grid-template-columns: repeat(4, 1fr); } }
+  /* Mobile: touch targets stay large (a finger is not a mouse), the
+     type stays readable, and the grid is one column in portrait so
+     nothing overflows or clips. The detail view takes the full width;
+     the tab labels shrink just enough that all four tabs fit. */
+  .screen.dev-mobile { font-size: 18px; padding: 16px; }
+  .screen.dev-mobile .title { font-size: 26px; }
+  .screen.dev-mobile .search { min-height: 56px; font-size: 18px; padding: 10px 16px 10px 48px; background-size: 22px 22px; background-position: 14px center; }
+  .screen.dev-mobile .button { min-height: 56px; font-size: 18px; padding: 10px 18px; }
+  .screen.dev-mobile .chip { min-height: 48px; font-size: 17px; padding: 6px 16px; }
+  /* On a phone the collection chips wrap onto a second row instead of
+     scrolling sideways: a cut-off chip at the screen edge is too easy
+     to miss, and vertical space is cheap on a scrolling list. The
+     wrap only kicks in when the chips do not fit on one row, so wider
+     mobile screens (tablets) keep a single row. */
+  .screen.dev-mobile .chips { flex-wrap: wrap; overflow-x: visible; }
+  .screen.dev-mobile .chips.scrollable { -webkit-mask-image: none; mask-image: none; }
+  .screen.dev-mobile .row { min-height: 88px; padding: 12px 14px; gap: 12px; }
+  .screen.dev-mobile .thumb { width: 64px; height: 64px; }
+  .screen.dev-mobile .skeleton-row { min-height: 88px; }
+  .screen.dev-mobile .skeleton-thumb { width: 64px; height: 64px; }
+  .screen.dev-mobile .row-name { font-size: 19px; }
+  .screen.dev-mobile .row-meta { font-size: 15px; }
+  .screen.dev-mobile .detail { max-width: none; }
+  .screen.dev-mobile .detail-name { font-size: 28px; }
+  .screen.dev-mobile .detail-photo { max-height: 260px; }
+  .screen.dev-mobile .tab { min-height: 56px; font-size: 16px; padding: 8px 6px; }
+  .screen.dev-mobile .ingredient, .screen.dev-mobile .step, .screen.dev-mobile .detail-row { min-height: 56px; font-size: 18px; }
+  .screen.dev-mobile .step { font-size: 19px; }
+  .screen.dev-mobile .detail-label { flex: 0 0 110px; }
+  .screen.dev-mobile .detail-row > span:last-child { min-width: 0; overflow-wrap: break-word; }
+  .screen.dev-mobile .empty { padding: 48px 16px; }
+  .screen.dev-mobile .list { grid-template-columns: 1fr; }
+  /* Landscape phone/tablet: two columns, but only when the viewport is
+     wide enough for two readable columns — a narrow landscape phone
+     keeps the single column. */
+  @media (min-width: 640px) { .screen.dev-mobile.orient-landscape .list { grid-template-columns: repeat(2, 1fr); } }
 `;
 
 class AnyListRecipeViewCard extends HTMLElement {
@@ -829,6 +1001,8 @@ class AnyListRecipeViewCard extends HTMLElement {
     this._searchTimer = null;
     this._shell = null; // Built once: title, toolbar, chips, status, body.
     this._detailEl = null;
+    this._device = null; // { category, orientation } from detectDevice, or null outside a browser.
+    this._resizeBound = null;
     this.attachShadow({ mode: "open" });
     this.shadowRoot.addEventListener("click", (event) => this._onClick(event));
     this.shadowRoot.addEventListener("input", (event) => this._onInput(event));
@@ -866,6 +1040,63 @@ class AnyListRecipeViewCard extends HTMLElement {
     // not double-load.
     if (this._hass) this._loadAll();
     this._render();
+    // The layout follows the viewport: a resize or an orientation
+    // change re-detects the device and re-applies the classes. The
+    // classes drive the CSS, so no re-render is needed.
+    if (
+      typeof window !== "undefined" &&
+      typeof window.addEventListener === "function" &&
+      !this._resizeBound
+    ) {
+      this._resizeBound = () => this._onResize();
+      window.addEventListener("resize", this._resizeBound);
+    }
+  }
+
+  disconnectedCallback() {
+    if (
+      typeof window !== "undefined" &&
+      this._resizeBound &&
+      typeof window.removeEventListener === "function"
+    ) {
+      window.removeEventListener("resize", this._resizeBound);
+      this._resizeBound = null;
+    }
+  }
+
+  _onResize() {
+    this._applyDevice();
+    this._updateChipsFade();
+  }
+
+  // Detect the device and carry it as classes on the screen element:
+  // dev-hub, dev-desktop or dev-mobile, plus orient-landscape or
+  // orient-portrait. The CSS below keys the adaptive layout off these
+  // classes; the base rules are the hub layout. Outside a browser
+  // (node tests) there is no environment to read, so the classes are
+  // left off and the base layout stands.
+  _applyDevice() {
+    if (!this._shell) return;
+    const env = readDeviceEnv();
+    if (!env) return;
+    const device = detectDevice(env);
+    const changed =
+      !this._device ||
+      this._device.category !== device.category ||
+      this._device.orientation !== device.orientation;
+    this._device = device;
+    this._shell.classList.remove(
+      "dev-hub",
+      "dev-desktop",
+      "dev-mobile",
+      "orient-landscape",
+      "orient-portrait"
+    );
+    this._shell.classList.add(
+      `dev-${device.category}`,
+      `orient-${device.orientation}`
+    );
+    if (changed) this._updateChipsFade();
   }
 
   // -- AnyList actions (over the websocket API) ---------------------------
@@ -1057,6 +1288,7 @@ class AnyListRecipeViewCard extends HTMLElement {
   _render() {
     if (!this.shadowRoot) return;
     this._ensureShell();
+    this._applyDevice();
     const listView = this._shell.querySelector(".list-view");
     const title = this._shell.querySelector(".title");
     if (title) title.textContent = this._title;
@@ -1313,6 +1545,8 @@ if (typeof module !== "undefined" && module.exports) {
     renderIngredientRow,
     sortRecipes,
     filterByCollection,
+    detectDevice,
+    readDeviceEnv,
     AnyListRecipeViewCard,
   };
 }

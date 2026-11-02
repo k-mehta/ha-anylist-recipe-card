@@ -829,3 +829,150 @@ test("the card makes exactly ONE data call per view-open — the single get_reci
   ]);
   assert.ok(hass.calls.every((c) => c[0] === "anylist"));
 });
+// -- Device classes ---------------------------------------------------------
+// The card carries its device as classes on .screen (dev-hub,
+// dev-desktop or dev-mobile + orient-landscape/orient-portrait); the
+// CSS keys the adaptive layout off them. The browser environment is
+// stubbed here (window/navigator do not exist in node).
+
+function stubWindow({ width, height, coarse, fine, touch, userAgent }) {
+  globalThis.window = {
+    innerWidth: width,
+    innerHeight: height,
+    matchMedia: (query) =>
+      query === "(pointer: coarse)"
+        ? { matches: coarse }
+        : query === "(pointer: fine)"
+          ? { matches: fine }
+          : { matches: false },
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    ...(touch ? { ontouchstart: () => {} } : {}),
+  };
+  globalThis.navigator = {
+    maxTouchPoints: touch ? 5 : 0,
+    userAgent,
+  };
+}
+
+function clearWindow() {
+  delete globalThis.window;
+  delete globalThis.navigator;
+}
+
+const HUB_WINDOW = {
+  width: 1920,
+  height: 1200,
+  coarse: true,
+  fine: false,
+  touch: true,
+  userAgent:
+    "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+};
+const DESKTOP_WINDOW = {
+  width: 1440,
+  height: 900,
+  coarse: false,
+  fine: true,
+  touch: false,
+  userAgent:
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+};
+const PHONE_WINDOW = {
+  width: 390,
+  height: 844,
+  coarse: true,
+  fine: false,
+  touch: true,
+  userAgent:
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+};
+
+test("the card carries dev-hub + orient-landscape on the kiosk", async () => {
+  stubWindow(HUB_WINDOW);
+  try {
+    const { card } = await loadedCard();
+    const screen = card.shadowRoot.querySelector(".screen");
+    assert.ok(screen.classList.contains("dev-hub"));
+    assert.ok(screen.classList.contains("orient-landscape"));
+    assert.ok(!screen.classList.contains("dev-mobile"));
+  } finally {
+    clearWindow();
+  }
+});
+
+test("the card carries dev-desktop on a mouse-driven screen", async () => {
+  stubWindow(DESKTOP_WINDOW);
+  try {
+    const { card } = await loadedCard();
+    const screen = card.shadowRoot.querySelector(".screen");
+    assert.ok(screen.classList.contains("dev-desktop"));
+    assert.ok(screen.classList.contains("orient-landscape"));
+  } finally {
+    clearWindow();
+  }
+});
+
+test("the card carries dev-mobile + orient-portrait on a phone", async () => {
+  stubWindow(PHONE_WINDOW);
+  try {
+    const { card } = await loadedCard();
+    const screen = card.shadowRoot.querySelector(".screen");
+    assert.ok(screen.classList.contains("dev-mobile"));
+    assert.ok(screen.classList.contains("orient-portrait"));
+  } finally {
+    clearWindow();
+  }
+});
+
+test("on mobile the chips wrap instead of scrolling sideways", async () => {
+  // The shipped CSS must carry the mobile override: a cut-off chip at
+  // the screen edge is too easy to miss on a phone. The style element
+  // is read from the card itself, so this fails if the rule is lost.
+  stubWindow(PHONE_WINDOW);
+  try {
+    const { card } = await loadedCard();
+    const css = card.shadowRoot.querySelector("style").textContent;
+    assert.ok(
+      css.includes(".screen.dev-mobile .chips { flex-wrap: wrap; overflow-x: visible; }")
+    );
+    assert.ok(
+      css.includes(
+        ".screen.dev-mobile .chips.scrollable { -webkit-mask-image: none; mask-image: none; }"
+      )
+    );
+  } finally {
+    clearWindow();
+  }
+});
+
+test("a resize re-detects the device and swaps the classes", async () => {
+  stubWindow(PHONE_WINDOW);
+  try {
+    const { card } = await loadedCard();
+    const screen = card.shadowRoot.querySelector(".screen");
+    assert.ok(screen.classList.contains("dev-mobile"));
+    // Rotate the phone to landscape: same category, new orientation.
+    stubWindow({ ...PHONE_WINDOW, width: 844, height: 390 });
+    card._onResize();
+    assert.ok(screen.classList.contains("dev-mobile"));
+    assert.ok(screen.classList.contains("orient-landscape"));
+    assert.ok(!screen.classList.contains("orient-portrait"));
+    // Move to a desktop window: the category swaps too.
+    stubWindow(DESKTOP_WINDOW);
+    card._onResize();
+    assert.ok(screen.classList.contains("dev-desktop"));
+    assert.ok(!screen.classList.contains("dev-mobile"));
+  } finally {
+    clearWindow();
+  }
+});
+
+test("with no browser environment the card carries no device classes (base layout stands)", async () => {
+  clearWindow();
+  const { card } = await loadedCard();
+  const screen = card.shadowRoot.querySelector(".screen");
+  assert.ok(!screen.classList.contains("dev-hub"));
+  assert.ok(!screen.classList.contains("dev-desktop"));
+  assert.ok(!screen.classList.contains("dev-mobile"));
+});

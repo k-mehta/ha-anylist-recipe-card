@@ -8,6 +8,19 @@ are tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+### Added
+
+- Adaptive layout: the card detects whether it runs on the hub kiosk
+  (1920×1200 touch display), a desktop, or a phone/tablet, in portrait
+  or landscape, and changes control sizes and layout for that device
+  (see ADAPTIVE-LAYOUT.md). The hub layout is unchanged; desktop gets a
+  denser layout with smaller targets and a wider detail view; mobile
+  gets a single column (two in landscape), large touch targets,
+  full-width detail, and collection chips that wrap onto a second row.
+  Detection re-runs on resize/rotation. The detection mechanism is
+  shared verbatim with the Satellite Timers card
+  (`k-mehta/ha-satellite-timers`).
+
 ## [1.0.0] - 2026-11-01
 
 ### Added
