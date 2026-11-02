@@ -1,0 +1,81 @@
+name: Auto-tag release
+
+# Tags are never moved: a new version gets a new tag. When a push to
+# main declares a version newer than the latest tag, this workflow
+# creates the tag v<version> at main HEAD and starts the Release
+# workflow for it. The declared version is the newest [x.y.z] heading
+# in CHANGELOG.md. If the tag already exists there is nothing to do;
+# if the version has no CHANGELOG entry the run fails and creates
+# nothing.
+#
+# A tag pushed with GITHUB_TOKEN does not trigger other workflows, so
+# the Release workflow is started explicitly with workflow_dispatch on
+# the new tag (release.yml accepts workflow_dispatch for this purpose).
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  auto-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Read declared version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - > "$RUNNER_TEMP/version.env" <<'PY'
+          import re
+          from pathlib import Path
+
+          lines = Path("CHANGELOG.md").read_text(encoding="utf-8").splitlines()
+          version = None
+          for line in lines:
+              match = re.match(r"^## \[(\d+\.\d+\.\d+)\]", line)
+              if match:
+                  version = match.group(1)
+                  break
+          if version is None:
+              raise SystemExit("CHANGELOG.md has no [x.y.z] version heading")
+          heading = re.compile(rf"^## \[{re.escape(version)}\]")
+          start = next(i for i, line in enumerate(lines) if heading.match(line))
+          end = len(lines)
+          for i in range(start + 1, len(lines)):
+              if lines[i].startswith("## "):
+                  end = i
+                  break
+          notes = "\n".join(lines[start + 1:end]).strip()
+          if not notes:
+              raise SystemExit(f"CHANGELOG.md has no notes for {version}")
+          print(f"version={version}")
+          PY
+          cat "$RUNNER_TEMP/version.env" >> "$GITHUB_OUTPUT"
+
+      - name: Create tag and start the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --tags origin
+          tag="v$VERSION"
+          if git rev-parse "$tag" >/dev/null 2>&1; then
+            echo "Tag $tag already exists; nothing to do."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "$tag"
+          git push origin "$tag"
+          gh workflow run release.yml --ref "$tag"
