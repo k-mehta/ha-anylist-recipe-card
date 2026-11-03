@@ -334,6 +334,19 @@ function fakeHass(options = {}) {
       switch (message.service) {
         case "get_recipes":
           return { response: { recipes: all } };
+        case "update_recipe": {
+          // The fork returns the updated recipe when return_response
+          // is set. The fake applies the changed fields to the detail
+          // recipe, so the card can refresh its copy from the
+          // response — exactly what the real action returns.
+          const data = message.service_data || {};
+          const updated = {
+            ...pasta,
+            note: data.note !== undefined ? data.note : pasta.note,
+            rating: data.rating !== undefined ? data.rating : pasta.rating,
+          };
+          return { response: { recipe: updated } };
+        }
         default:
           throw new Error(`Service anylist.${message.service} must not be called`);
       }
@@ -551,11 +564,17 @@ test("opening a recipe reads the detail from the loaded list — Cook tab first 
   assert.match(detailHtml(), /Step 1 of 3/);
   assert.equal(card.shadowRoot.querySelectorAll(".step.current").length, 1);
   assert.doesNotMatch(detailHtml(), /Vihaan likes this with extra cheese/);
-  // Notes tab: the note, read-only, with the plain editing gap line.
+  // Notes tab: the note in an editable textarea, with a Save button
+  // (disabled — nothing changed yet) and five stars showing the
+  // saved rating. The old "can't be edited" gap line is gone.
   card.shadowRoot.dispatchClick(fakeTarget("tab", { tab: "notes" }));
   await flush();
   assert.match(card.shadowRoot.innerHTML, /Vihaan likes this with extra cheese/);
-  assert.match(card.shadowRoot.innerHTML, /can't be edited from the hub yet/);
+  assert.doesNotMatch(card.shadowRoot.innerHTML, /can't be edited from the hub yet/);
+  const save = card.shadowRoot.querySelector('[data-action="save-note"]');
+  assert.equal(save.getAttribute("disabled"), "disabled");
+  assert.equal(card.shadowRoot.querySelectorAll(".star").length, 5);
+  assert.equal(card.shadowRoot.querySelectorAll(".star.filled").length, 5);
   // There is no Details tab: metadata does not belong in the cooking view.
   assert.equal(card.shadowRoot.querySelector('[data-tab="details"]'), null);
   assert.equal(card.shadowRoot.querySelector(".detail-view").hidden, false);
@@ -853,11 +872,16 @@ test("a recipe with no photo, ingredients or steps still renders cleanly", async
   assert.match(html, /No ingredients listed/);
   assert.match(html, /No steps listed/);
   assert.equal(card.shadowRoot.querySelector(".step-tracker"), null);
-  // Notes tab: no note, plus the plain editing gap line.
+  // Notes tab: no saved note, so the editor is empty (with a
+  // placeholder) and the rating is unrated — and the old "can't be
+  // edited" gap line is gone: editing is available now.
   card.shadowRoot.dispatchClick(fakeTarget("tab", { tab: "notes" }));
   await flush();
-  assert.match(card.shadowRoot.innerHTML, /No notes for this recipe/);
-  assert.match(card.shadowRoot.innerHTML, /can't be edited from the hub yet/);
+  assert.doesNotMatch(card.shadowRoot.innerHTML, /can't be edited from the hub yet/);
+  const editor = card.shadowRoot.querySelector('[data-role="note"]');
+  assert.equal(editor.getAttribute("placeholder"), "Add a note — e.g. more salt next time…");
+  assert.equal(card.shadowRoot.querySelectorAll(".star").length, 5);
+  assert.equal(card.shadowRoot.querySelectorAll(".star.filled").length, 0);
 });
 
 test("empty states, by cause: empty library, no-match search, empty collection", async () => {
@@ -1102,4 +1126,222 @@ test("with no browser environment the card carries no device classes (base layou
   assert.ok(!screen.classList.contains("dev-hub"));
   assert.ok(!screen.classList.contains("dev-desktop"));
   assert.ok(!screen.classList.contains("dev-mobile"));
+});
+
+// -- Note editing, rating, serving scaling ---------------------------------
+// The fork (k-mehta/ha-anylist 0.11.1) offers note and rating on
+// update_recipe, so the Notes tab is an editor and the Cook tab has a
+// transient serving scaler. The scaler never calls the server.
+
+function typeNote(card, text) {
+  const editor = card.shadowRoot.querySelector('[data-role="note"]');
+  editor.value = text;
+  card.shadowRoot.dispatchInput(editor);
+  return editor;
+}
+
+async function openNotesTab(card) {
+  card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+  await flush();
+  card.shadowRoot.dispatchClick(fakeTarget("tab", { tab: "notes" }));
+  await flush();
+}
+
+test("typing a note enables Save; saving calls update_recipe with the note only", async () => {
+  const { card, hass } = await loadedCard();
+  await openNotesTab(card);
+  const save = card.shadowRoot.querySelector('[data-action="save-note"]');
+  assert.equal(save.getAttribute("disabled"), "disabled");
+  typeNote(card, "More salt next time.");
+  // The button enables as soon as the text differs from the saved note.
+  assert.equal(save.disabled, false);
+  card.shadowRoot.dispatchClick(fakeTarget("save-note"));
+  await flush();
+  // Exactly one save, with the note only — no name, ingredients or
+  // steps resubmitted.
+  assert.equal(hass.calls.length, 2);
+  assert.deepEqual(hass.calls[1], [
+    "anylist",
+    "update_recipe",
+    { recipe_id: "rec-pasta", note: "More salt next time." },
+  ]);
+  assert.match(card.shadowRoot.innerHTML, /Saved\./);
+  // The local copy refreshes from the server response, so the editor
+  // now shows the saved note and Save disables again.
+  assert.match(card.shadowRoot.innerHTML, /More salt next time\./);
+  assert.equal(
+    card.shadowRoot.querySelector('[data-action="save-note"]').getAttribute("disabled"),
+    "disabled"
+  );
+});
+
+test("saving an empty note clears it", async () => {
+  const { card, hass } = await loadedCard();
+  await openNotesTab(card);
+  typeNote(card, "");
+  card.shadowRoot.dispatchClick(fakeTarget("save-note"));
+  await flush();
+  assert.equal(hass.calls.length, 2);
+  assert.deepEqual(hass.calls[1], [
+    "anylist",
+    "update_recipe",
+    { recipe_id: "rec-pasta", note: "" },
+  ]);
+  assert.match(card.shadowRoot.innerHTML, /Saved\./);
+  assert.equal(card._selected.note, "");
+});
+
+test("a failed note save keeps the typed note and says so honestly", async () => {
+  const { card, hass } = await loadedCard({ fail: { update_recipe: "AnyList is down" } });
+  await openNotesTab(card);
+  typeNote(card, "More salt next time.");
+  card.shadowRoot.dispatchClick(fakeTarget("save-note"));
+  await flush();
+  assert.equal(hass.calls.length, 2);
+  assert.equal(hass.calls[1][1], "update_recipe");
+  assert.match(card.shadowRoot.innerHTML, /Couldn't save the note/);
+  assert.match(card.shadowRoot.innerHTML, /your text is still here/);
+  // The typed note survives (the draft is kept) and the saved note
+  // is untouched — nothing is silently lost.
+  assert.equal(card._noteDrafts.get("rec-pasta"), "More salt next time.");
+  assert.equal(card._selected.note, "Vihaan likes this with extra cheese.");
+  assert.match(card.shadowRoot.innerHTML, /More salt next time\./);
+});
+
+test("an unsaved note draft survives leaving the recipe and coming back", async () => {
+  const { card } = await loadedCard();
+  await openNotesTab(card);
+  typeNote(card, "More salt next time.");
+  card.shadowRoot.dispatchClick(fakeTarget("back"));
+  await flush();
+  await openNotesTab(card);
+  assert.match(card.shadowRoot.innerHTML, /More salt next time\./);
+});
+
+test("tapping a star saves the rating with update_recipe and only the rating", async () => {
+  const { card, hass } = await loadedCard();
+  await openNotesTab(card);
+  // Pasta is rated 5; tapping 3 re-rates it.
+  assert.equal(card.shadowRoot.querySelectorAll(".star.filled").length, 5);
+  card.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "3" }));
+  await flush();
+  assert.equal(hass.calls.length, 2);
+  assert.deepEqual(hass.calls[1], [
+    "anylist",
+    "update_recipe",
+    { recipe_id: "rec-pasta", rating: 3 },
+  ]);
+  assert.match(card.shadowRoot.innerHTML, /Saved\./);
+  assert.equal(card.shadowRoot.querySelectorAll(".star.filled").length, 3);
+  assert.equal(card._selected.rating, 3);
+});
+
+test("Clear un-rates the recipe (rating 0)", async () => {
+  const { card, hass } = await loadedCard();
+  await openNotesTab(card);
+  assert.equal(card.shadowRoot.querySelector('[data-action="clear-rating"]').getAttribute("disabled"), null);
+  card.shadowRoot.dispatchClick(fakeTarget("clear-rating"));
+  await flush();
+  assert.equal(hass.calls.length, 2);
+  assert.deepEqual(hass.calls[1], [
+    "anylist",
+    "update_recipe",
+    { recipe_id: "rec-pasta", rating: 0 },
+  ]);
+  assert.equal(card.shadowRoot.querySelectorAll(".star.filled").length, 0);
+  assert.equal(card.shadowRoot.querySelector('[data-action="clear-rating"]'), null);
+});
+
+test("a failed rating save keeps the old rating and says so honestly", async () => {
+  const { card } = await loadedCard({ fail: { update_recipe: "AnyList is down" } });
+  await openNotesTab(card);
+  card.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "3" }));
+  await flush();
+  assert.match(card.shadowRoot.innerHTML, /Couldn't save the rating/);
+  assert.equal(card.shadowRoot.querySelectorAll(".star.filled").length, 5);
+  assert.equal(card._selected.rating, 5);
+});
+
+test("the serving scaler scales the displayed quantities and makes no server call", async () => {
+  const { card, hass } = await loadedCard();
+  card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+  await flush();
+  const qty = (index) =>
+    card.shadowRoot.querySelectorAll(".ingredient")[index].querySelector(".qty").textContent;
+  const count = () => card.shadowRoot.querySelector(".scaler-count").textContent;
+  assert.equal(count(), "4");
+  assert.equal(qty(0), "500 g");
+  // Scale up to 5: 500 g becomes 625 g, 200 ml becomes 250 ml.
+  card.shadowRoot.dispatchClick(fakeTarget("scale-up"));
+  await flush();
+  assert.equal(count(), "5");
+  assert.equal(qty(0), "625 g");
+  assert.equal(qty(2), "250 ml");
+  assert.match(card.shadowRoot.innerHTML, /Reset to 4/);
+  // Scale up to 6: whole numbers stay whole.
+  card.shadowRoot.dispatchClick(fakeTarget("scale-up"));
+  await flush();
+  assert.equal(count(), "6");
+  assert.equal(qty(0), "750 g");
+  assert.equal(qty(2), "300 ml");
+  // Scaling is transient and client-side: still exactly the one
+  // view-open call, no update_recipe, nothing persisted.
+  assert.equal(hass.calls.length, 1);
+  assert.equal(hass.calls[0][1], "get_recipes");
+  // Scale down, then reset back to the stored servings.
+  card.shadowRoot.dispatchClick(fakeTarget("scale-down"));
+  await flush();
+  assert.equal(count(), "5");
+  assert.equal(qty(0), "625 g");
+  card.shadowRoot.dispatchClick(fakeTarget("scale-reset"));
+  await flush();
+  assert.equal(count(), "4");
+  assert.equal(qty(0), "500 g");
+  assert.equal(card.shadowRoot.querySelector('[data-action="scale-reset"]'), null);
+});
+
+test("the scaler leaves non-numeric quantities alone and hides when servings is not a number", async () => {
+  const pinch = lightRecipe("rec-pinch", "Salted Butter", {
+    servings: "4",
+    ingredients: [
+      { name: "Butter", quantity: "100 g", note: "", raw_ingredient: "100 g butter" },
+      { name: "Salt", quantity: "a pinch", note: "", raw_ingredient: "a pinch of salt" },
+    ],
+    preparation_steps: ["Melt the butter.", "Stir in the salt."],
+  });
+  const { card } = await loadedCard({ recipes: [pinch], detail: pinch });
+  card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pinch" }));
+  await flush();
+  card.shadowRoot.dispatchClick(fakeTarget("scale-up"));
+  await flush();
+  const qty = (index) =>
+    card.shadowRoot.querySelectorAll(".ingredient")[index].querySelector(".qty").textContent;
+  assert.equal(qty(0), "125 g");
+  assert.equal(qty(1), "a pinch");
+  // A freeform servings string has no clean base to scale from, so
+  // there is no scaler at all.
+  const freeform = lightRecipe("rec-free", "Family Soup", { servings: "4 servings" });
+  const second = await loadedCard({ recipes: [freeform], detail: freeform });
+  second.card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-free" }));
+  await flush();
+  assert.equal(second.card.shadowRoot.querySelector(".scaler"), null);
+});
+
+test("re-opening a recipe resets the scaler to the stored servings", async () => {
+  const { card } = await loadedCard();
+  card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+  await flush();
+  card.shadowRoot.dispatchClick(fakeTarget("scale-up"));
+  card.shadowRoot.dispatchClick(fakeTarget("scale-up"));
+  await flush();
+  assert.equal(card.shadowRoot.querySelector(".scaler-count").textContent, "6");
+  card.shadowRoot.dispatchClick(fakeTarget("back"));
+  await flush();
+  card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+  await flush();
+  assert.equal(card.shadowRoot.querySelector(".scaler-count").textContent, "4");
+  assert.equal(
+    card.shadowRoot.querySelectorAll(".ingredient")[0].querySelector(".qty").textContent,
+    "500 g"
+  );
 });

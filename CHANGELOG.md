@@ -6,6 +6,44 @@ and the version numbers follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Releases
 are tagged `vX.Y.Z`.
 
+## [1.3.0] - 2026-11-03
+
+### Added
+
+- Notes are editable in the Notes tab: a big textarea pre-filled
+  with the saved note, a Save button (enabled only when the text
+  actually changed), and a "Saved." confirmation. Saving calls the
+  AnyList integration's `update_recipe` with the note only — name,
+  ingredients and steps are never resubmitted. An empty note clears
+  it. A failed save keeps the typed note and says so honestly instead
+  of dropping it. An unsaved draft survives leaving the recipe (or
+  the tab) and coming back. (Requires the fork, k-mehta/ha-anylist
+  0.11.1, which added the `note` field to `update_recipe`.)
+- Rating in the Notes tab: five big tappable stars plus Clear.
+  Tapping a star saves the rating at once (`update_recipe` with the
+  rating only); Clear un-rates the recipe (rating 0). A failed save
+  keeps the old rating displayed and says so honestly.
+- Serving scaler in the Cook tab: a "Serves − N +" stepper above the
+  ingredients that scales the displayed quantities for this cooking
+  session only (500 g at 6 from 4 becomes 750 g; a quantity with no
+  leading number, like "1/2 tsp" or "a pinch", is left alone). It
+  never calls the server and never changes the stored recipe — it
+  resets to the recipe's stored servings when the recipe is
+  re-opened. It shows only when the recipe lists servings as a bare
+  number; a freeform servings string ("4 servings") has no clean
+  base to scale from, so there is no scaler.
+
+### Fixed
+
+- Typing a note no longer loses focus when Home Assistant pushes a
+  state update: the draft keeps the text and the caret is restored
+  after a re-render.
+
+### Known gaps (backend work, not the card)
+
+- Timer chips need a `start_timer` service on the Satellite Timers
+  bridge before they can start a timer.
+
 ## [1.2.0] - 2026-11-03
 
 ### Changed

@@ -22,6 +22,8 @@ const {
   formatDuration,
   formatServings,
   formatStars,
+  parseServings,
+  scaleQuantity,
   renderStepText,
   renderIngredientRow,
   sortRecipes,
@@ -298,6 +300,36 @@ test("formatStars clamps to five and hides zero", () => {
   assert.equal(formatStars(7), "★★★★★");
   assert.equal(formatStars(0), "");
   assert.equal(formatStars(null), "");
+});
+
+test("parseServings reads a bare number, refuses freeform servings", () => {
+  assert.equal(parseServings("4"), 4);
+  assert.equal(parseServings("4.5"), 4.5);
+  assert.equal(parseServings(" 6 "), 6);
+  assert.equal(parseServings(""), null);
+  assert.equal(parseServings(null), null);
+  assert.equal(parseServings("4 servings"), null);
+  assert.equal(parseServings("2 (bowls)"), null);
+  assert.equal(parseServings("0"), null);
+  assert.equal(parseServings("-2"), null);
+  assert.equal(parseServings("four"), null);
+});
+
+test("scaleQuantity mirrors the fork's _scale_quantity: first number scaled, rest untouched", () => {
+  assert.equal(scaleQuantity("500 g", 2), "1000 g");
+  assert.equal(scaleQuantity("500 g", 0.5), "250 g");
+  assert.equal(scaleQuantity("500 g", 1.5), "750 g");
+  assert.equal(scaleQuantity("200 ml", 1.25), "250 ml");
+  assert.equal(scaleQuantity("0.5 tsp", 3), "1.5 tsp");
+  assert.equal(scaleQuantity("2", 3), "6");
+  // A whole result stays whole — no trailing ".0".
+  assert.equal(scaleQuantity("400 g", 1.5), "600 g");
+  // No leading number: unchanged, never a NaN or a crash.
+  assert.equal(scaleQuantity("a pinch", 2), "a pinch");
+  assert.equal(scaleQuantity("to taste", 2), "to taste");
+  assert.equal(scaleQuantity("1/2 cup", 2), "1/2 cup");
+  assert.equal(scaleQuantity("", 2), "");
+  assert.equal(scaleQuantity(null, 2), "");
 });
 
 test("renderStepText renders AnyList's light step markdown, never raw HTML", () => {

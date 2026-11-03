@@ -13,6 +13,14 @@
 // from memory: the list, the collection chips (derived from the
 // recipes themselves, so no get_collections call), the local search,
 // and the detail view. No per-search download, no per-recipe download.
+// The one exception is a save: editing a note or a rating calls
+// anylist.update_recipe with only the changed field (recipe_id +
+// note, or recipe_id + rating) — the fork (k-mehta/ha-anylist
+// 0.11.1) made name/ingredients/steps optional so a note-only or
+// rating-only edit never resubmits the whole recipe. Serving scaling
+// is transient and client-side: it changes only the quantities shown
+// while cooking and never calls update_recipe, so the stored recipe
+// is untouched.
 //
 // Response shapes are taken from the integration's own source
 // (custom_components/anylist/__init__.py `_serialize_recipe` and
@@ -392,6 +400,41 @@ function formatDuration(seconds) {
 function formatServings(servings) {
   if (!servings) return "";
   return /^\d+$/.test(servings) ? `Serves ${servings}` : servings;
+}
+
+// The recipe's stored servings as a number, or null when it is not
+// one. Servings is a freeform string in AnyList ("4", "4 servings",
+// "2 (bowls)") — only a bare number can be a scaling base. Mirrors
+// the fork's scale_recipe, which reads float(recipe.servings) and
+// refuses to scale when that is not a number.
+function parseServings(servings) {
+  const text = asTrimmed(servings);
+  if (!text) return null;
+  const n = Number(text);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+// Scale the first numeric token of a quantity string ("500 g" at 1.5
+// becomes "750 g"), leaving the rest untouched. A quantity with no
+// leading number ("a pinch", "to taste") comes back unchanged.
+// Mirrors the fork's _scale_quantity exactly: Python's float() on the
+// first whitespace-separated token, integer results rendered without
+// a decimal, the remainder rejoined with single spaces. A whole
+// number stays whole (500 * 1.5 = 750, not 750.0); a fractional
+// result keeps its decimals (0.5 * 3 = 1.5).
+function scaleQuantity(quantity, scale) {
+  const text = asTrimmed(quantity);
+  if (!text) return asString(quantity);
+  const parts = text.split(/\s+/);
+  const number = Number(parts[0]);
+  if (!Number.isFinite(number)) return asString(quantity);
+  const scaled = number * scale;
+  // A whole number stays whole: in JS String(750) is "750" and
+  // String(1.5) is "1.5", which is exactly the fork's rendering
+  // (int when whole, float otherwise).
+  const scaledText = String(scaled);
+  const rest = parts.slice(1).join(" ");
+  return rest ? `${scaledText} ${rest}` : scaledText;
 }
 
 function formatStars(rating) {
@@ -842,7 +885,101 @@ const CARD_CSS = `
     margin: 0;
     color: var(--ink);
   }
-  .detail-note { font-size: 24px; line-height: 1.6; color: var(--ink); }
+  /* The Notes tab: an editable note, a rating, and a plain status
+     line. The note is a big textarea (wet/dirty hands, readable
+     from the counter); Save is a full 72 px button, enabled only
+     when the text actually changed, and disabled while a save is in
+     flight. The status line says "Saved." or an honest error — a
+     failed save never drops the typed note, so the text stays in
+     the editor to try again. The rating is five big star buttons
+     plus Clear; tapping one saves it at once. The serving scaler
+     lives in the Cook tab, not here. */
+  .note-view { display: flex; flex-direction: column; gap: 24px; }
+  .note-label,
+  .rating-label,
+  .scaler-label {
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--ink);
+  }
+  .note-editor {
+    width: 100%;
+    min-height: 180px;
+    box-sizing: border-box;
+    padding: 16px 20px;
+    border-radius: 16px;
+    border: 1px solid var(--line);
+    background: var(--card);
+    box-shadow: var(--shadow-card);
+    color: var(--ink);
+    font-size: 24px;
+    line-height: 1.6;
+    font-family: inherit;
+    resize: vertical;
+  }
+  .note-editor:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .note-editor::placeholder { color: var(--muted); }
+  .note-actions { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+  .note-status,
+  .rating-status {
+    font-size: 20px;
+    font-weight: 600;
+    color: var(--accent);
+  }
+  .note-status.error,
+  .rating-status.error { color: var(--error); }
+  /* The rating is its own section, separated from the note by a
+     divider — it is a "what did you think" annotation like the
+     note, and it belongs in the Notes tab rather than as metadata
+     in the cooking view. */
+  .rating-block {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    border-top: 1px solid var(--line);
+    padding-top: 24px;
+  }
+  .rating-stars { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .star {
+    flex: 0 0 auto;
+    min-width: 72px;
+    min-height: 72px;
+    padding: 0;
+    border: none;
+    background: transparent;
+    color: var(--muted);
+    font-size: 44px;
+    line-height: 1;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .star:active { transform: scale(0.94); }
+  .star.filled { color: var(--star); }
+  .star:disabled { opacity: 0.5; cursor: default; }
+  /* The serving scaler: a soft bar above the ingredient list, in
+     the Cook tab. "Serves" with a − / + stepper and the current
+     serving count; Reset (labelled with the recipe's stored
+     servings) appears only while scaled. It changes only the
+     quantities shown while cooking — nothing is saved, so there is
+     no save button and no status line. */
+  .scaler {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+    padding: 12px 16px;
+    margin-bottom: 16px;
+    background: var(--chip-bg);
+    border-radius: 16px;
+  }
+  .scaler-count {
+    min-width: 48px;
+    text-align: center;
+    font-size: 26px;
+    font-weight: 700;
+    color: var(--ink);
+  }
+  .scaler-btn { min-width: 72px; padding: 12px 16px; font-size: 28px; }
   /* Tabs are a segmented control: one soft bar, the active segment a
      white pill floating on it — the modern tab pattern, not four
      separate bordered buttons. */
@@ -1077,19 +1214,6 @@ const CARD_CSS = `
     white-space: nowrap;
   }
   .step-nav { flex: 0 0 auto; }
-  /* The Notes tab: the note as saved in AnyList, and a plain line
-     saying editing is not available yet (the integration has no
-     note-write path). The gap line sits on a soft chip background so
-     it reads as information, not an error. */
-  .note-view { display: flex; flex-direction: column; gap: 16px; }
-  .note-gap {
-    font-size: 20px;
-    line-height: 1.5;
-    color: var(--muted);
-    padding: 16px;
-    background: var(--chip-bg);
-    border-radius: 16px;
-  }
   /* Empty states are typographic, not a bare line: a title, one line of
      guidance, and the way out. Generous padding makes the whitespace
      intentional rather than a hole in the page. */
@@ -1161,8 +1285,16 @@ const CARD_CSS = `
   .screen.dev-desktop .cook-count { font-size: 17px; }
   .screen.dev-desktop .step-position { font-size: 19px; }
   .screen.dev-desktop .timer-status { font-size: 17px; }
-  .screen.dev-desktop .detail-note { font-size: 19px; }
-  .screen.dev-desktop .note-gap { font-size: 17px; }
+  .screen.dev-desktop .note-editor { min-height: 140px; font-size: 19px; padding: 12px 16px; }
+  .screen.dev-desktop .note-label,
+  .screen.dev-desktop .rating-label,
+  .screen.dev-desktop .scaler-label { font-size: 18px; }
+  .screen.dev-desktop .note-status,
+  .screen.dev-desktop .rating-status { font-size: 17px; }
+  .screen.dev-desktop .star { min-width: 52px; min-height: 52px; font-size: 32px; }
+  .screen.dev-desktop .scaler { padding: 10px 12px; margin-bottom: 12px; }
+  .screen.dev-desktop .scaler-count { font-size: 20px; min-width: 36px; }
+  .screen.dev-desktop .scaler-btn { min-width: 52px; min-height: 52px; font-size: 22px; padding: 8px 12px; }
   .screen.dev-desktop .cook-grid { gap: 32px; }
   @media (min-width: 1200px) { .screen.dev-desktop .list { grid-template-columns: repeat(3, 1fr); } }
   @media (min-width: 1700px) { .screen.dev-desktop .list { grid-template-columns: repeat(4, 1fr); } }
@@ -1204,8 +1336,16 @@ const CARD_CSS = `
   .screen.dev-mobile .step-position { font-size: 19px; }
   .screen.dev-mobile .step-tracker { padding: 10px 12px; gap: 10px; }
   .screen.dev-mobile .timer-status { font-size: 17px; }
-  .screen.dev-mobile .detail-note { font-size: 19px; }
-  .screen.dev-mobile .note-gap { font-size: 17px; }
+  .screen.dev-mobile .note-editor { min-height: 160px; font-size: 19px; padding: 12px 16px; }
+  .screen.dev-mobile .note-label,
+  .screen.dev-mobile .rating-label,
+  .screen.dev-mobile .scaler-label { font-size: 18px; }
+  .screen.dev-mobile .note-status,
+  .screen.dev-mobile .rating-status { font-size: 17px; }
+  .screen.dev-mobile .star { min-width: 56px; min-height: 56px; font-size: 36px; }
+  .screen.dev-mobile .scaler { padding: 10px 12px; margin-bottom: 12px; }
+  .screen.dev-mobile .scaler-count { font-size: 22px; min-width: 40px; }
+  .screen.dev-mobile .scaler-btn { min-width: 56px; min-height: 56px; font-size: 24px; padding: 8px 12px; }
   .screen.dev-mobile .empty { padding: 48px 16px; }
   .screen.dev-mobile .list { grid-template-columns: 1fr; }
   /* Landscape phone/tablet: two columns, but only when the viewport is
@@ -1239,6 +1379,25 @@ class AnyListRecipeViewCard extends HTMLElement {
     this._checked = new Map();
     this._currentStep = new Map();
     this._timerStatus = "";
+    // Note editing: an unsaved draft per recipe id, so typing
+    // survives leaving the tab (or the recipe) and coming back, and
+    // so a re-render mid-typing never drops the text. The draft is
+    // cleared only by a successful save. The status is the feedback
+    // line under the editor ("Saved." or an honest error); a failed
+    // save keeps the draft, so nothing typed is ever lost.
+    this._noteDrafts = new Map();
+    this._noteStatus = null; // { text, error } or null
+    this._savingNote = false;
+    // Rating: a tap saves at once (no separate Save button). The
+    // status is the feedback line under the stars. _ratingBusy
+    // blocks double-taps while a save is in flight.
+    this._ratingStatus = null; // { text, error } or null
+    this._ratingBusy = false;
+    // Serving scaling is transient by design: the chosen serving
+    // count per recipe id, for this cooking session only. It resets
+    // when the recipe is opened (see _openRecipe) and never calls
+    // update_recipe — it only changes the quantities shown.
+    this._scaleServings = new Map();
     this._searchTimer = null;
     this._shell = null; // Built once: title, toolbar, chips, status, body.
     this._detailEl = null;
@@ -1419,6 +1578,16 @@ class AnyListRecipeViewCard extends HTMLElement {
     if (!recipe) return;
     this._selected = recipe;
     this._detailTab = "cook";
+    // Fresh open, fresh session: the serving scaler resets to the
+    // recipe's stored servings (it is transient by design), and the
+    // save feedback lines clear. The note draft is NOT cleared — an
+    // unsaved note survives leaving the recipe and coming back, the
+    // same way checked ingredients and the current step do.
+    this._scaleServings.delete(id);
+    this._noteStatus = null;
+    this._ratingStatus = null;
+    this._savingNote = false;
+    this._ratingBusy = false;
     this._render();
   }
 
@@ -1428,9 +1597,11 @@ class AnyListRecipeViewCard extends HTMLElement {
   // are checkable (tap to cross off, tap again to un-cross); steps are
   // a guided walkthrough (one current step, the rest dimmed, "Step N
   // of M"); times in a step are tappable timer chips; the note is
-  // read-only (editing needs a backend write path — see the note
-  // above _friendlyError). Cooking state lives on the card, keyed by
-  // leaving a recipe and coming back keeps your place.
+  // editable in the Notes tab (Save calls update_recipe with the note
+  // only) and the rating is five tappable stars there too. Serving
+  // scaling is transient: it changes only the quantities shown while
+  // cooking and never saves. Cooking state lives on the card, keyed by
+  // recipe id — leaving a recipe and coming back keeps your place.
 
   // The ingredient rows in display order, each with a stable index
   // (section headings excluded — they are labels, not ingredients).
@@ -1512,16 +1683,140 @@ class AnyListRecipeViewCard extends HTMLElement {
     this._render();
   }
 
-  // NOTE — no note-write path is shipped. The AnyList integration's
-  // update_recipe action has no note field (and its client update
-  // replaces only name, ingredients and steps), so a note cannot be
-  // written to AnyList today. Shipping a Save button that can never
-  // persist the note would be a broken half-feature: the cook would
-  // type a note, press Save, and lose it. So the Notes tab shows the
-  // note read-only and says plainly that editing is not available
-  // yet. The backend gap: update_recipe needs a `note` field (or a
-  // dedicated set_recipe_note action) before a note can be saved from
-  // the hub. When that lands, the editor + save can be added here.
+  // -- note, rating, serving scaling ------------------------------------
+  //
+  // The Notes tab edits the note and the rating; the Cook tab scales
+  // servings. All three read from the loaded recipe and touch nothing
+  // else.
+
+  // The serving count currently shown for a recipe: the cook's chosen
+  // count, or the recipe's stored servings when nothing is chosen.
+  _targetServings(recipe) {
+    const stored = parseServings(recipe.servings);
+    if (!stored) return null;
+    const chosen = this._scaleServings.get(recipe.id);
+    return typeof chosen === "number" && chosen > 0 ? chosen : stored;
+  }
+
+  // The factor to multiply displayed quantities by: chosen servings
+  // over stored servings, or null when the recipe has no numeric
+  // servings (then there is no scaler at all).
+  _scaleFactor(recipe) {
+    const stored = parseServings(recipe.servings);
+    if (!stored) return null;
+    return this._targetServings(recipe) / stored;
+  }
+
+  // A copy of an ingredient row with its quantity scaled for display.
+  // Section headings pass through untouched; a row with no quantity
+  // is returned as-is. The original row is never mutated.
+  _scaledItem(item, factor) {
+    if (!factor || factor === 1 || !item || item.type === "section") return item;
+    if (!item.quantity) return item;
+    return { ...item, quantity: scaleQuantity(item.quantity, factor) };
+  }
+
+  // Save the note draft: update_recipe with recipe_id + note only.
+  // The action returns the updated recipe, so the card's copy is
+  // refreshed from the server rather than assumed. On failure the
+  // draft stays, the typed note is not lost, and the status says so.
+  async _saveNote() {
+    const recipe = this._selected;
+    if (!recipe || this._savingNote) return;
+    const draft = this._noteDrafts.has(recipe.id)
+      ? this._noteDrafts.get(recipe.id)
+      : recipe.note;
+    const note = asTrimmed(draft);
+    if (note === asTrimmed(recipe.note)) return;
+    this._savingNote = true;
+    this._noteStatus = null;
+    this._render();
+    try {
+      const result = await this._callAction("update_recipe", {
+        recipe_id: recipe.id,
+        note,
+      });
+      this._applyUpdatedRecipe(result, { note });
+      this._noteDrafts.delete(recipe.id);
+      this._noteStatus = { text: "Saved.", error: false };
+    } catch (err) {
+      this._noteStatus = {
+        text: "Couldn't save the note — your text is still here, try again.",
+        error: true,
+      };
+    } finally {
+      this._savingNote = false;
+      this._render();
+    }
+  }
+
+  // Save a rating at once (a tap, no separate Save button):
+  // update_recipe with recipe_id + rating only. Rating 0 clears the
+  // rating. On failure the old rating stays displayed and the status
+  // says so.
+  async _rate(value) {
+    const recipe = this._selected;
+    if (!recipe || this._ratingBusy) return;
+    const rating = Number(value);
+    if (!Number.isFinite(rating) || rating < 0 || rating > 5) return;
+    const current = recipe.rating || 0;
+    if (rating === current) return;
+    this._ratingBusy = true;
+    this._ratingStatus = null;
+    this._render();
+    try {
+      const result = await this._callAction("update_recipe", {
+        recipe_id: recipe.id,
+        rating,
+      });
+      this._applyUpdatedRecipe(result, { rating });
+      this._ratingStatus = { text: "Saved.", error: false };
+    } catch (err) {
+      this._ratingStatus = {
+        text: "Couldn't save the rating — try again.",
+        error: true,
+      };
+    } finally {
+      this._ratingBusy = false;
+      this._render();
+    }
+  }
+
+  // Refresh the card's copy of the open recipe from an update_recipe
+  // response. Only the note and rating are taken from the server —
+  // the save changed nothing else, and the response's ingredient list
+  // may not carry the heading-aware entries, so the local
+  // ingredients, entries and steps stay exactly as they were. When
+  // there is no usable response (an older integration, a bare
+  // response), fall back to the value that was just saved: the call
+  // succeeding means the server accepted it. Either way the list row
+  // stays in sync too.
+  _applyUpdatedRecipe(result, fallback) {
+    const recipe = this._selected;
+    if (!recipe) return;
+    const updated = result && result.recipe ? normalizeRecipe(result.recipe) : null;
+    const next =
+      updated && updated.id === recipe.id
+        ? { ...recipe, note: updated.note, rating: updated.rating }
+        : { ...recipe, ...fallback };
+    const index = this._recipes.findIndex((item) => item.id === recipe.id);
+    if (index >= 0) this._recipes[index] = next;
+    this._selected = next;
+  }
+
+  // Saving a note or a rating calls the fork's update_recipe with
+  // only the changed field (recipe_id + note, or recipe_id +
+  // rating). The fork (k-mehta/ha-anylist 0.11.1) made
+  // name/ingredients/steps optional, so a note-only or rating-only
+  // edit never resubmits the whole recipe, and the client replaces
+  // only the supplied fields — a note-only save cannot drop
+  // ingredient headings or anything else it does not model. An
+  // empty note clears the note; rating 0 clears the rating. The
+  // action returns the updated recipe when return_response is set,
+  // so a successful save refreshes the card's copy from the server
+  // instead of assuming the local edit stuck. A failed save keeps
+  // the typed note (the draft stays) and says so honestly — the
+  // cook never loses what they typed to a silent failure.
   _friendlyError(err) {
     const message = String((err && err.message) || err || "");
     if (/not found/i.test(message) && /service/i.test(message)) {
@@ -1538,6 +1833,22 @@ class AnyListRecipeViewCard extends HTMLElement {
   _onInput(event) {
     const target = event.target;
     if (!target || !target.dataset) return;
+    if (target.dataset.role === "note") {
+      // Typing a note updates the draft only — no re-render, or the
+      // textarea would be rebuilt (and lose focus) on every
+      // keystroke. The Save button's disabled state is updated
+      // directly instead.
+      if (!this._selected) return;
+      const draft = target.value || "";
+      this._noteDrafts.set(this._selected.id, draft);
+      const save = this.shadowRoot.querySelector('[data-action="save-note"]');
+      if (save) {
+        save.disabled =
+          asTrimmed(draft) === asTrimmed(this._selected.note) ||
+          this._savingNote;
+      }
+      return;
+    }
     if (target.dataset.role !== "search") return;
     this._query = target.value || "";
     if (this._searchTimer !== null) clearTimeout(this._searchTimer);
@@ -1633,6 +1944,41 @@ class AnyListRecipeViewCard extends HTMLElement {
       }
       return;
     }
+    // -- note, rating, serving scaling --------------------------------
+    if (action === "save-note") {
+      this._saveNote();
+      return;
+    }
+    if (action === "rate") {
+      const rating = Number(target.dataset.rating);
+      if (Number.isFinite(rating)) this._rate(rating);
+      return;
+    }
+    if (action === "clear-rating") {
+      this._rate(0);
+      return;
+    }
+    if (action === "scale-down" || action === "scale-up") {
+      // Transient only: the scaler changes the quantities shown, and
+      // makes no server call at all.
+      if (!this._selected) return;
+      const base = parseServings(this._selected.servings);
+      if (!base) return;
+      const current = this._targetServings(this._selected);
+      const next =
+        action === "scale-down"
+          ? Math.max(1, current - 1)
+          : current + 1;
+      this._scaleServings.set(this._selected.id, next);
+      this._render();
+      return;
+    }
+    if (action === "scale-reset") {
+      if (!this._selected) return;
+      this._scaleServings.delete(this._selected.id);
+      this._render();
+      return;
+    }
   }
 
   _visibleRecipes() {
@@ -1677,6 +2023,22 @@ class AnyListRecipeViewCard extends HTMLElement {
     if (!this.shadowRoot) return;
     this._ensureShell();
     this._applyDevice();
+    // If the cook is typing a note, a re-render (a Home Assistant
+    // state update rebuilds the detail view) would destroy the
+    // textarea mid-typing — and with it the focus and the caret. The
+    // draft keeps the text; restore the focus and the caret so typing
+    // continues uninterrupted. Guarded for environments without a
+    // focused element or a focus method (the DOM tests).
+    const active = this.shadowRoot.activeElement;
+    const wasNote = !!(
+      active &&
+      active.dataset &&
+      active.dataset.role === "note"
+    );
+    const caret =
+      wasNote && typeof active.selectionStart === "number"
+        ? active.selectionStart
+        : null;
     const listView = this._shell.querySelector(".list-view");
     const title = this._shell.querySelector(".title");
     if (title) title.textContent = this._title;
@@ -1684,6 +2046,22 @@ class AnyListRecipeViewCard extends HTMLElement {
       listView.hidden = true;
       this._detailEl.hidden = false;
       this._detailEl.innerHTML = this._detailHtml();
+      if (wasNote) {
+        const note = this._detailEl.querySelector('[data-role="note"]');
+        if (note && typeof note.focus === "function") {
+          note.focus();
+          if (
+            caret !== null &&
+            typeof note.setSelectionRange === "function"
+          ) {
+            try {
+              note.setSelectionRange(caret, caret);
+            } catch (_err) {
+              // Caret restore is best-effort; the text is safe either way.
+            }
+          }
+        }
+      }
       return;
     }
     this._detailEl.hidden = true;
@@ -1868,9 +2246,29 @@ class AnyListRecipeViewCard extends HTMLElement {
       (count, _item, index) => count + (checked.has(index) ? 1 : 0),
       0
     );
+    // Serving scaling is transient: the factor comes from the cook's
+    // chosen serving count over the recipe's stored servings. The
+    // scaler bar shows only when the recipe lists servings as a
+    // number; a freeform servings string ("4 servings", "2 (bowls)")
+    // has no clean base to scale from.
+    const baseServings = parseServings(recipe.servings);
+    const factor = baseServings ? this._scaleFactor(recipe) : null;
+    const targetServings = baseServings ? this._targetServings(recipe) : null;
+    const isScaled = baseServings !== null && targetServings !== baseServings;
+    const scalerHtml = baseServings
+      ? `<div class="scaler" role="group" aria-label="Servings">
+          <span class="scaler-label">Serves</span>
+          <button class="button scaler-btn" data-action="scale-down" ${targetServings <= 1 ? "disabled" : ""} aria-label="Fewer servings">−</button>
+          <span class="scaler-count" aria-live="polite">${targetServings}</span>
+          <button class="button scaler-btn" data-action="scale-up" aria-label="More servings">+</button>
+          ${isScaled ? `<button class="button small ghost" data-action="scale-reset">Reset to ${baseServings}</button>` : ""}
+        </div>`
+      : "";
     // Headed recipes interleave section sub-headings with ingredient
     // rows. The checkable index counts ingredient rows only, in
-    // display order, so it matches the set stored per recipe.
+    // display order, so it matches the set stored per recipe. The
+    // quantities shown are the scaled ones when the scaler is in
+    // use; the stored recipe is untouched.
     let ingIndex = -1;
     const ingredientsHtml = recipe.entries.length
       ? recipe.entries
@@ -1879,11 +2277,12 @@ class AnyListRecipeViewCard extends HTMLElement {
               return `<div class="ingredient-section">${escapeHtml(item.name)}</div>`;
             }
             ingIndex += 1;
-            return this._ingredientRowHtml(item, ingIndex, checked.has(ingIndex));
+            const display = this._scaledItem(item, factor);
+            return this._ingredientRowHtml(display, ingIndex, checked.has(ingIndex));
           })
           .join("")
       : recipe.ingredients
-          .map((item, index) => this._ingredientRowHtml(item, index, checked.has(index)))
+          .map((item, index) => this._ingredientRowHtml(this._scaledItem(item, factor), index, checked.has(index)))
           .join("");
     const steps = this._navigableSteps(recipe);
     const current = this._currentStepIndex(recipe.id, steps.length);
@@ -1923,6 +2322,7 @@ class AnyListRecipeViewCard extends HTMLElement {
             <span class="cook-count">${checkedCount} of ${rows.length} gathered</span>
             ${checkedCount > 0 ? `<button class="button small ghost" data-action="clear-checks">Start over</button>` : ""}
           </div>
+          ${scalerHtml}
           ${ingredientsHtml ? `<div class="ingredients">${ingredientsHtml}</div>` : `<div class="status">No ingredients listed.</div>`}
         </section>
         <section class="cook-steps" aria-label="Steps">
@@ -1951,16 +2351,47 @@ class AnyListRecipeViewCard extends HTMLElement {
     </button>`;
   }
 
-  // The Notes tab: the note as saved in AnyList, read-only. Editing
-  // is not offered here because the AnyList integration has no way to
-  // save a note (see the note above _friendlyError) — a Save button
-  // would be a promise the hub cannot keep. The message says so in
-  // plain words rather than leaving the cook to discover it.
+  // The Notes tab: the note as an editable textarea, and the rating
+  // as five tappable stars. The editor is pre-filled with the saved
+  // note (or the unsaved draft, if the cook typed one and left the
+  // tab); Save is enabled only when the text actually changed. The
+  // rating saves on tap — no separate Save button — and Clear
+  // un-rates the recipe. Both show a status line ("Saved." or an
+  // honest error); a failed note save keeps the typed text.
   _notesHtml(recipe) {
+    const draft = this._noteDrafts.has(recipe.id)
+      ? this._noteDrafts.get(recipe.id)
+      : recipe.note;
+    const hasChanges = asTrimmed(draft) !== asTrimmed(recipe.note);
+    const noteStatus = this._noteStatus
+      ? `<span class="note-status${this._noteStatus.error ? " error" : ""}" role="status">${escapeHtml(this._noteStatus.text)}</span>`
+      : "";
+    const rating = recipe.rating || 0;
+    const stars = [1, 2, 3, 4, 5]
+      .map(
+        (value) =>
+          `<button class="star${value <= rating ? " filled" : ""}" data-action="rate" data-rating="${value}" ${this._ratingBusy ? 'disabled="disabled"' : ""} aria-label="Rate ${value} out of 5">${value <= rating ? "★" : "☆"}</button>`
+      )
+      .join("");
+    const ratingStatus = this._ratingStatus
+      ? `<span class="rating-status${this._ratingStatus.error ? " error" : ""}" role="status">${escapeHtml(this._ratingStatus.text)}</span>`
+      : "";
     return `
       <div class="note-view">
-        ${recipe.note ? `<div class="detail-note">${escapeHtml(recipe.note)}</div>` : `<div class="status">No notes for this recipe.</div>`}
-        <div class="note-gap">Notes can't be edited from the hub yet — the AnyList integration doesn't offer a way to save them.</div>
+        <label class="note-label" for="note-editor">Your note</label>
+        <textarea class="note-editor" id="note-editor" data-role="note" rows="4" placeholder="Add a note — e.g. more salt next time…">${escapeHtml(draft)}</textarea>
+        <div class="note-actions">
+          <button class="button primary" data-action="save-note" ${!hasChanges || this._savingNote ? 'disabled="disabled"' : ""}>Save note</button>
+          ${noteStatus}
+        </div>
+        <div class="rating-block">
+          <div class="rating-label">Your rating</div>
+          <div class="rating-stars" role="group" aria-label="Rate this recipe">
+            ${stars}
+            ${rating > 0 ? `<button class="button small ghost" data-action="clear-rating" ${this._ratingBusy ? 'disabled="disabled"' : ""}>Clear</button>` : ""}
+          </div>
+          ${ratingStatus}
+        </div>
       </div>`;
   }
 }
@@ -1979,6 +2410,8 @@ if (typeof module !== "undefined" && module.exports) {
     formatDuration,
     formatServings,
     formatStars,
+    parseServings,
+    scaleQuantity,
     renderStepText,
     renderIngredientRow,
     sortRecipes,

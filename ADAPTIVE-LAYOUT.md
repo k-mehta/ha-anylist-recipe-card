@@ -97,7 +97,11 @@ cooking view shows ingredients and steps together: two columns on
 the hub (ingredients left, steps right), stacked on a phone
 (ingredients above steps, step tracker sticky). There is no photo
 and no metadata in the cooking view — the photo lives only in the
-list, and there is no Details tab. Two tabs: Cook and Notes.
+list, and there is no Details tab. Two tabs: Cook and Notes. The
+Notes tab is editable (a note editor with Save, and five tappable
+rating stars); the Cook tab has a transient serving scaler above the
+ingredients (it changes only the quantities shown, never the stored
+recipe).
 
 | | Hub (1920×1200 landscape) | Desktop (large screen, mouse) | Mobile (phone/tablet) |
 | --- | --- | --- | --- |
@@ -108,6 +112,9 @@ list, and there is no Details tab. Two tabs: Cook and Notes.
 | Recipe rows | Base (112 px, 96 px thumbnail) | 88 px, 68 px thumbnail | 88 px, 64 px thumbnail |
 | Detail view | Max width 1500 px, two-column cooking view | Max width 1200 px, two-column cooking view | Full width, name 28 px, stacked cooking view, sticky step tracker |
 | Tabs | 72 px | 52 px | 56 px |
+| Notes editor | 24 px text, 180 px min height, 72 px Save | 19 px, 140 px min height, 52 px | 19 px, 160 px min height, 56 px |
+| Rating stars | 72 px targets, 44 px stars | 52 px, 32 px stars | 56 px, 36 px stars |
+| Serving scaler | 72 px −/+ buttons, 26 px count | 52 px, 20 px count | 56 px, 22 px count |
 
 Long recipe names wrap to two lines in the list (then ellipsis) and
 in full in the detail view. Search, tabs, ingredient headings and the
@@ -157,4 +164,7 @@ expected.
 - **Screenshots in a real Chromium** at all six sizes above, viewed
   before release: recipe list, cooking view (Cook tab with
   ingredients + steps, and the Notes tab), a search, and a long-name
-  recipe; timer screen with 1, 3, and 5 timers.
+  recipe; timer screen with 1, 3, and 5 timers. The Notes tab is
+  also screenshotted with the editor and the rating stars, and the
+  Cook tab with the serving scaler in use, so the editing controls
+  are seen at hub and phone sizes — not just asserted by tests.

@@ -11,9 +11,23 @@ a searchable list, tap one to open it. That is all it does.
   with collection chips and local search. Search runs entirely in the
   browser: typing never downloads anything, and partial words find
   recipes ("carr" finds carrot recipes).
-- **Tabbed detail view** — tap a recipe to open it with four tabs:
-  **Ingredients**, **Recipe** (steps), **Details** (times, servings,
-  rating, source), and **Notes**.
+- **Cooking view** — tap a recipe to open it as a cooking tool, not
+  a recipe page: ingredients and steps together (two columns on the
+  hub, stacked on a phone), checkable ingredients, a guided step
+  walkthrough with "Step N of M", and tappable timer chips in the
+  steps. No photo and no metadata in the cooking view. Two tabs:
+  **Cook** and **Notes**.
+- **Editable notes and rating** — the Notes tab has a note editor
+  with Save (an empty note clears it) and five tappable rating
+  stars plus Clear. Saving calls the AnyList integration's
+  `update_recipe` with only the changed field. (Requires the
+  [k-mehta/ha-anylist fork](https://github.com/k-mehta/ha-anylist)
+  0.11.1 or newer, which added `note` and `rating` to
+  `update_recipe`.)
+- **Serving scaler** — a "Serves − N +" stepper above the
+  ingredients scales the displayed quantities for this cooking
+  session only. It never saves anything and resets when the recipe
+  is re-opened.
 - **Ingredient headings** — section headings inside a recipe (e.g.
   "Sauce", "Topping") render as headings, never as ingredients.
 - **Times shown properly** — AnyList stores prep/cook times in
@@ -45,16 +59,23 @@ AnyList action per view-open — `anylist.get_recipes` with ingredients
 and steps included — and everything after that reads from memory: the
 list, the collection chips (derived from the recipes themselves), the
 search, and the detail view. No per-search download, no per-recipe
-download.
+download. The one exception is a save: editing a note or a rating
+calls `anylist.update_recipe` with only the changed field. Serving
+scaling is transient and client-side — it changes only the quantities
+shown while cooking and never calls the server.
 
 ## Requirements
 
 - Home Assistant 2025.12.0 or newer.
 - The [AnyList integration](https://github.com/moryoav/ha-anylist)
   (AnyList by moryoav) installed and configured — the card calls its
-  `get_recipes` action over the websocket API. The
-  [k-mehta/ha-anylist fork](https://github.com/k-mehta/ha-anylist),
-  which adds a local SQLite recipe cache, works too.
+  `get_recipes` action over the websocket API. Note and rating
+  editing need the
+  [k-mehta/ha-anylist fork](https://github.com/k-mehta/ha-anylist)
+  0.11.1 or newer, which adds `note` and `rating` to `update_recipe`
+  (and a local SQLite recipe cache); with the upstream integration
+  the card still browses and cooks, but a note/rating save reports
+  honestly that it could not be saved.
 
 ## Install
 
