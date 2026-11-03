@@ -324,6 +324,38 @@ test("renderStepText renders AnyList's light step markdown, never raw HTML", () 
   });
 });
 
+test("renderStepText turns times in a step into tappable timer chips", () => {
+  assert.deepEqual(renderStepText("Simmer for 10 minutes."), {
+    header: false,
+    html: 'Simmer for <button class="time-chip" data-action="start-timer" data-seconds="600" aria-label="Start a 10 minutes timer">10 minutes</button>.',
+  });
+  assert.deepEqual(renderStepText("Bake for 1 hour, then rest for 30 sec."), {
+    header: false,
+    html: 'Bake for <button class="time-chip" data-action="start-timer" data-seconds="3600" aria-label="Start a 1 hour timer">1 hour</button>, then rest for <button class="time-chip" data-action="start-timer" data-seconds="30" aria-label="Start a 30 sec timer">30 sec</button>.',
+  });
+  // "a minute" is one minute, not a literal string.
+  assert.deepEqual(renderStepText("Let it sit a minute."), {
+    header: false,
+    html: 'Let it sit <button class="time-chip" data-action="start-timer" data-seconds="60" aria-label="Start a a minute timer">a minute</button>.',
+  });
+  // A time inside bold still becomes a chip (the markup is split into
+  // tags and text first, so only the text is touched).
+  assert.deepEqual(renderStepText("Simmer for **10 minutes**."), {
+    header: false,
+    html: 'Simmer for <strong><button class="time-chip" data-action="start-timer" data-seconds="600" aria-label="Start a 10 minutes timer">10 minutes</button></strong>.',
+  });
+  // Headers are labels, never actionable: no chip in a section header.
+  assert.deepEqual(renderStepText("# Simmer for 10 minutes"), {
+    header: true,
+    html: "Simmer for 10 minutes",
+  });
+  // A plain step with no time has no chip.
+  assert.deepEqual(renderStepText("Boil the pasta."), {
+    header: false,
+    html: "Boil the pasta.",
+  });
+});
+
 test("sortRecipes orders alphabetically, case-insensitive", () => {
   const sorted = sortRecipes([
     normalizeRecipe({ id: "1", name: "zucchini soup" }),
@@ -496,6 +528,37 @@ test("detectDevice: a desktop touchscreen that size reads as the hub (documented
       finePointer: false,
       touch: true,
       userAgent: DESKTOP_UA,
+    }),
+    { category: "hub", orientation: "landscape" }
+  );
+});
+
+test("detectDevice: the hub with a mouse attached still reads as the hub", () => {
+  // The kiosk has a mouse attached, so it reports a fine pointer too.
+  // A hub-sized landscape touch screen is the hub regardless of the
+  // mouse — the mouse is for setup, not for cooking. Checking fine
+  // first would mis-detect the hub as a desktop (the audit's finding).
+  assert.deepEqual(
+    detectDevice({
+      width: 1920,
+      height: 1200,
+      coarsePointer: true,
+      finePointer: true,
+      touch: true,
+      userAgent: HUB_UA,
+    }),
+    { category: "hub", orientation: "landscape" }
+  );
+  // Even when only the fine pointer is reported (no coarse), touch +
+  // hub size + landscape still wins.
+  assert.deepEqual(
+    detectDevice({
+      width: 1920,
+      height: 1200,
+      coarsePointer: false,
+      finePointer: true,
+      touch: true,
+      userAgent: HUB_UA,
     }),
     { category: "hub", orientation: "landscape" }
   );

@@ -195,13 +195,13 @@ function matches(el, selector) {
     if (!(key in el.dataset)) return false;
     return dataAttr[2] === undefined || el.dataset[key] === dataAttr[2];
   }
-  const classOnly = /^\.([\w-]+)$/.exec(selector);
-  if (classOnly) return el.classList.contains(classOnly[1]);
-  const tagClass = /^([a-zA-Z][\w-]*)\.([\w-]+)$/.exec(selector);
+  const classOnly = /^\.([\w-]+(?:\.[\w-]+)*)$/.exec(selector);
+  if (classOnly) return classOnly[1].split(".").every((cls) => el.classList.contains(cls));
+  const tagClass = /^([a-zA-Z][\w-]*)\.([\w-]+(?:\.[\w-]+)*)$/.exec(selector);
   if (tagClass) {
     return (
       el.tagName === tagClass[1].toUpperCase() &&
-      el.classList.contains(tagClass[2])
+      tagClass[2].split(".").every((cls) => el.classList.contains(cls))
     );
   }
   if (/^[a-zA-Z][\w-]*$/.test(selector)) {
@@ -514,7 +514,7 @@ test("clearing the search goes back to the full list", async () => {
   assert.doesNotMatch(card.shadowRoot.innerHTML, /matching/);
 });
 
-test("opening a recipe reads the detail from the loaded list — ingredients tab first, then each tab's content", async () => {
+test("opening a recipe reads the detail from the loaded list — Cook tab first (ingredients + steps together), then the Notes tab", async () => {
   const twoCollections = {
     ...PASTA_FULL,
     collections: [
@@ -528,37 +528,36 @@ test("opening a recipe reads the detail from the loaded list — ingredients tab
   // No second download: the view-open load already brought the detail.
   assert.equal(hass.calls.length, 1);
   assert.equal(hass.calls[0][1], "get_recipes");
-  // The header (photo, name, meta) is above the tabs; the Ingredients tab
-  // is the default panel.
-  const html = card.shadowRoot.innerHTML;
-  assert.match(html, /Creamy Tomato Pasta/);
+  // Cooking mode: no photo hero and no metadata line in the detail
+  // view — the photo lives only in the list (where it helps you pick
+  // a recipe) and the metadata does not belong while cooking. The
+  // name is a compact label, not a display title. (Scoped to the
+  // detail view: the hidden list still shows the photo and meta.)
+  const detailHtml = () => card.shadowRoot.querySelector(".detail-view").innerHTML;
+  assert.match(detailHtml(), /Creamy Tomato Pasta/);
   assert.equal(card.shadowRoot.querySelectorAll(".detail-name").length, 1);
-  assert.match(html, /photos\.anylist\.com\/abc123\.jpg/);
-  assert.match(html, /500 g/);
-  assert.match(html, /Cherry tomatoes/);
-  assert.match(html, /halved/);
+  assert.doesNotMatch(detailHtml(), /photos\.anylist\.com\/abc123\.jpg/);
+  assert.equal(card.shadowRoot.querySelector(".detail-photo"), null);
+  assert.doesNotMatch(detailHtml(), /Serves 4/);
+  assert.doesNotMatch(detailHtml(), /Family cookbook/);
+  // The Cook tab is the default panel: ingredients AND steps together.
+  assert.match(detailHtml(), /500 g/);
+  assert.match(detailHtml(), /Cherry tomatoes/);
+  assert.match(detailHtml(), /halved/);
   assert.equal(card.shadowRoot.querySelectorAll(".ingredient").length, 3);
-  assert.equal(card.shadowRoot.querySelectorAll(".step").length, 0);
-  assert.doesNotMatch(html, /Boil the pasta/);
-  assert.doesNotMatch(html, /Vihaan likes this with extra cheese/);
-  // Recipe tab: the steps.
-  card.shadowRoot.dispatchClick(fakeTarget("tab", { tab: "recipe" }));
-  await flush();
-  assert.match(card.shadowRoot.innerHTML, /Boil the pasta/);
+  assert.match(detailHtml(), /Boil the pasta/);
   assert.equal(card.shadowRoot.querySelectorAll(".step").length, 3);
-  assert.equal(card.shadowRoot.querySelectorAll(".ingredient").length, 0);
-  // Notes tab: the note.
+  // Step 1 of 3 is current; the note lives on the Notes tab, not here.
+  assert.match(detailHtml(), /Step 1 of 3/);
+  assert.equal(card.shadowRoot.querySelectorAll(".step.current").length, 1);
+  assert.doesNotMatch(detailHtml(), /Vihaan likes this with extra cheese/);
+  // Notes tab: the note, read-only, with the plain editing gap line.
   card.shadowRoot.dispatchClick(fakeTarget("tab", { tab: "notes" }));
   await flush();
   assert.match(card.shadowRoot.innerHTML, /Vihaan likes this with extra cheese/);
-  // Details tab: servings, rating, collections, source.
-  card.shadowRoot.dispatchClick(fakeTarget("tab", { tab: "details" }));
-  await flush();
-  const details = card.shadowRoot.innerHTML;
-  assert.match(details, /Serves 4/);
-  assert.match(details, /★★★★★/);
-  assert.match(details, /Pasta, Weeknight/);
-  assert.match(details, /Family cookbook/);
+  assert.match(card.shadowRoot.innerHTML, /can't be edited from the hub yet/);
+  // There is no Details tab: metadata does not belong in the cooking view.
+  assert.equal(card.shadowRoot.querySelector('[data-tab="details"]'), null);
   assert.equal(card.shadowRoot.querySelector(".detail-view").hidden, false);
   assert.equal(card.shadowRoot.querySelector(".list-view").hidden, true);
   // Back returns to the list.
@@ -568,38 +567,38 @@ test("opening a recipe reads the detail from the loaded list — ingredients tab
   assert.equal(card.shadowRoot.querySelectorAll(".row").length, 3);
 });
 
-test("detail shows four tabs — Ingredients, Recipe, Details, Notes — Ingredients active by default", async () => {
+test("detail shows two tabs — Cook and Notes — Cook active by default", async () => {
   const { card } = await loadedCard();
   card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
   await flush();
   const tabs = [...card.shadowRoot.querySelectorAll(".tab")];
   assert.deepEqual(
     tabs.map((t) => t.textContent),
-    ["Ingredients", "Recipe", "Details", "Notes"],
+    ["Cook", "Notes"],
   );
   assert.deepEqual(
     tabs.map((t) => t.getAttribute("aria-selected")),
-    ["true", "false", "false", "false"],
+    ["true", "false"],
   );
-  assert.equal(card.shadowRoot.querySelector('[data-tab="ingredients"]').getAttribute("aria-selected"), "true");
+  assert.equal(card.shadowRoot.querySelector('[data-tab="cook"]').getAttribute("aria-selected"), "true");
 });
 
 test("switching tabs shows the right panel and marks only that tab active", async () => {
   const { card } = await loadedCard();
   card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
   await flush();
-  card.shadowRoot.dispatchClick(fakeTarget("tab", { tab: "details" }));
+  card.shadowRoot.dispatchClick(fakeTarget("tab", { tab: "notes" }));
   await flush();
-  assert.equal(card.shadowRoot.querySelector('[data-tab="details"]').getAttribute("aria-selected"), "true");
-  assert.equal(card.shadowRoot.querySelector('[data-tab="ingredients"]').getAttribute("aria-selected"), "false");
-  assert.match(card.shadowRoot.innerHTML, /Serves 4/);
-  card.shadowRoot.dispatchClick(fakeTarget("tab", { tab: "ingredients" }));
+  assert.equal(card.shadowRoot.querySelector('[data-tab="notes"]').getAttribute("aria-selected"), "true");
+  assert.equal(card.shadowRoot.querySelector('[data-tab="cook"]').getAttribute("aria-selected"), "false");
+  assert.match(card.shadowRoot.innerHTML, /Vihaan likes this with extra cheese/);
+  card.shadowRoot.dispatchClick(fakeTarget("tab", { tab: "cook" }));
   await flush();
-  assert.equal(card.shadowRoot.querySelector('[data-tab="ingredients"]').getAttribute("aria-selected"), "true");
+  assert.equal(card.shadowRoot.querySelector('[data-tab="cook"]').getAttribute("aria-selected"), "true");
   assert.match(card.shadowRoot.innerHTML, /Cherry tomatoes/);
 });
 
-test("opening a recipe always resets to the Ingredients tab", async () => {
+test("opening a recipe always resets to the Cook tab", async () => {
   const { card } = await loadedCard();
   card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
   await flush();
@@ -610,7 +609,7 @@ test("opening a recipe always resets to the Ingredients tab", async () => {
   await flush();
   card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
   await flush();
-  assert.equal(card.shadowRoot.querySelector('[data-tab="ingredients"]').getAttribute("aria-selected"), "true");
+  assert.equal(card.shadowRoot.querySelector('[data-tab="cook"]').getAttribute("aria-selected"), "true");
   assert.equal(card.shadowRoot.querySelector('[data-tab="notes"]').getAttribute("aria-selected"), "false");
   assert.match(card.shadowRoot.innerHTML, /Cherry tomatoes/);
 });
@@ -626,6 +625,136 @@ test("opening the same recipe twice makes no server call at all", async () => {
   assert.equal(hass.calls.length, 1);
   assert.equal(hass.calls[0][1], "get_recipes");
 });
+
+test("ingredients are checkable — tap to cross off, tap again to un-cross, Start over clears", async () => {
+  const { card } = await loadedCard();
+  card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+  await flush();
+  // Nothing gathered yet; no Start over button.
+  assert.match(card.shadowRoot.innerHTML, /0 of 3 gathered/);
+  assert.equal(card.shadowRoot.querySelector('[data-action="clear-checks"]'), null);
+  // Tap the first ingredient: crossed off, count updates.
+  card.shadowRoot.dispatchClick(fakeTarget("toggle-ingredient", { index: "0" }));
+  await flush();
+  assert.match(card.shadowRoot.innerHTML, /1 of 3 gathered/);
+  assert.equal(card.shadowRoot.querySelectorAll(".ingredient")[0].classList.contains("checked"), true);
+  assert.equal(card.shadowRoot.querySelectorAll(".ingredient")[0].getAttribute("aria-pressed"), "true");
+  // Tap again: un-crossed.
+  card.shadowRoot.dispatchClick(fakeTarget("toggle-ingredient", { index: "0" }));
+  await flush();
+  assert.match(card.shadowRoot.innerHTML, /0 of 3 gathered/);
+  assert.equal(card.shadowRoot.querySelectorAll(".ingredient")[0].classList.contains("checked"), false);
+  // Check two, then Start over clears both.
+  card.shadowRoot.dispatchClick(fakeTarget("toggle-ingredient", { index: "0" }));
+  card.shadowRoot.dispatchClick(fakeTarget("toggle-ingredient", { index: "2" }));
+  await flush();
+  assert.match(card.shadowRoot.innerHTML, /2 of 3 gathered/);
+  card.shadowRoot.dispatchClick(fakeTarget("clear-checks"));
+  await flush();
+  assert.match(card.shadowRoot.innerHTML, /0 of 3 gathered/);
+  assert.equal(card.shadowRoot.querySelectorAll(".ingredient.checked").length, 0);
+});
+
+test("checked ingredients and the current step survive leaving the recipe and coming back", async () => {
+  const { card } = await loadedCard();
+  card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+  await flush();
+  card.shadowRoot.dispatchClick(fakeTarget("toggle-ingredient", { index: "1" }));
+  card.shadowRoot.dispatchClick(fakeTarget("step-next"));
+  await flush();
+  assert.match(card.shadowRoot.innerHTML, /Step 2 of 3/);
+  card.shadowRoot.dispatchClick(fakeTarget("back"));
+  await flush();
+  card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+  await flush();
+  assert.match(card.shadowRoot.innerHTML, /1 of 3 gathered/);
+  assert.match(card.shadowRoot.innerHTML, /Step 2 of 3/);
+  assert.equal(card.shadowRoot.querySelectorAll(".ingredient")[1].classList.contains("checked"), true);
+});
+
+test("steps are a guided walkthrough — current step highlighted, Step N of M, Prev/Next and tap to set", async () => {
+  const { card } = await loadedCard();
+  card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+  await flush();
+  // Step 1 of 3, the first step current, the rest dimmed (no .current).
+  assert.match(card.shadowRoot.innerHTML, /Step 1 of 3/);
+  assert.equal(card.shadowRoot.querySelectorAll(".step.current").length, 1);
+  assert.equal(card.shadowRoot.querySelectorAll(".step")[0].classList.contains("current"), true);
+  // Prev on the first step stays on step 1 (clamped, not an error).
+  card.shadowRoot.dispatchClick(fakeTarget("step-prev"));
+  await flush();
+  assert.match(card.shadowRoot.innerHTML, /Step 1 of 3/);
+  // Next moves to step 2.
+  card.shadowRoot.dispatchClick(fakeTarget("step-next"));
+  await flush();
+  assert.match(card.shadowRoot.innerHTML, /Step 2 of 3/);
+  assert.equal(card.shadowRoot.querySelectorAll(".step")[1].classList.contains("current"), true);
+  // Tap the third step to make it current.
+  card.shadowRoot.dispatchClick(fakeTarget("step", { stepIndex: "2" }));
+  await flush();
+  assert.match(card.shadowRoot.innerHTML, /Step 3 of 3/);
+  assert.equal(card.shadowRoot.querySelectorAll(".step")[2].classList.contains("current"), true);
+  // Next on the last step stays on step 3 (clamped, not an error).
+  card.shadowRoot.dispatchClick(fakeTarget("step-next"));
+  await flush();
+  assert.match(card.shadowRoot.innerHTML, /Step 3 of 3/);
+});
+
+test("a time in a step is a tappable chip — tapping it reports honestly that the bridge has no start action yet", async () => {
+  const timed = {
+    ...PASTA_FULL,
+    preparation_steps: [
+      "Boil the pasta for 10 minutes.",
+      "Simmer the sauce for 1 hour.",
+    ],
+  };
+  const { card, hass } = await loadedCard({ detail: timed });
+  card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+  await flush();
+  const chips = card.shadowRoot.querySelectorAll(".time-chip");
+  assert.equal(chips.length, 2);
+  assert.equal(chips[0].dataset.seconds, "600");
+  assert.equal(chips[1].dataset.seconds, "3600");
+  // Tapping the chip calls satellite_timers.start_timer, which does
+  // not exist — the card reports that honestly instead of pretending
+  // a timer started. No AnyList call is made by the tap.
+  card.shadowRoot.dispatchClick(fakeTarget("start-timer", { seconds: "600" }));
+  await flush();
+  assert.match(card.shadowRoot.innerHTML, /Couldn't start the timer/);
+  assert.match(card.shadowRoot.innerHTML, /doesn't offer a start action yet/);
+  assert.equal(hass.calls.filter((call) => call[0] === "anylist").length, 1);
+  assert.equal(hass.calls[1][0], "satellite_timers");
+  assert.equal(hass.calls[1][1], "start_timer");
+});
+
+test("the step tracker pins below Home Assistant's header, not under it", async () => {
+  const { card } = await loadedCard();
+  card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+  await flush();
+  // HA's header is 56 px tall and stays fixed while the page scrolls;
+  // a sticky top of 0 would slide the tracker underneath it and hide
+  // it. The tracker pins below the header via HA's own
+  // --header-height variable (56 px fallback).
+  const style = card.shadowRoot.querySelector("style").textContent;
+  assert.match(style, /\.step-tracker \{[^}]*position: sticky;/s);
+  assert.match(style, /top: var\(--header-height, 56px\);/);
+  assert.ok(card.shadowRoot.querySelector(".step-tracker"));
+});
+
+test("a recipe without a photo gets a deliberate tile in the list, not a grey box", async () => {
+  const { card } = await loadedCard();
+  // SOUP and RICE have no photo; PASTA does. Each no-photo recipe
+  // gets one tile with its initial.
+  const tiles = card.shadowRoot.querySelectorAll(".thumb.missing");
+  assert.equal(tiles.length, 2);
+  const rice = [...card.shadowRoot.querySelectorAll(".row")].find((row) =>
+    row.textContent.includes("Rice Pudding"),
+  );
+  assert.ok(rice);
+  const tile = rice.querySelector(".thumb.missing");
+  assert.ok(tile);
+  assert.equal(tile.textContent.trim(), "R");
+});
 test("step section headers render as headings, not numbered steps", async () => {
   const withHeader = {
     ...PASTA_FULL,
@@ -638,9 +767,8 @@ test("step section headers render as headings, not numbered steps", async () => 
   const { card } = await loadedCard({ detail: withHeader });
   card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
   await flush();
-  // Step headers live on the Recipe tab.
-  card.shadowRoot.dispatchClick(fakeTarget("tab", { tab: "recipe" }));
-  await flush();
+  // Step headers live in the Cook view (the default tab), alongside
+  // the numbered steps.
   const html = card.shadowRoot.innerHTML;
   const headers = card.shadowRoot.querySelectorAll(".step-header");
   assert.equal(headers.length, 1);
@@ -720,17 +848,16 @@ test("a recipe with no photo, ingredients or steps still renders cleanly", async
   // No photo: no hero image and no placeholder block — just the title.
   assert.equal(card.shadowRoot.querySelector(".detail-photo"), null);
   assert.equal(card.shadowRoot.querySelectorAll(".detail-name").length, 1);
-  // Each tab has its own empty state.
+  // The Cook tab shows both empty states together, and no step
+  // tracker when there are no steps.
   assert.match(html, /No ingredients listed/);
-  card.shadowRoot.dispatchClick(fakeTarget("tab", { tab: "recipe" }));
-  await flush();
-  assert.match(card.shadowRoot.innerHTML, /No steps listed/);
-  card.shadowRoot.dispatchClick(fakeTarget("tab", { tab: "details" }));
-  await flush();
-  assert.match(card.shadowRoot.innerHTML, /No details for this recipe/);
+  assert.match(html, /No steps listed/);
+  assert.equal(card.shadowRoot.querySelector(".step-tracker"), null);
+  // Notes tab: no note, plus the plain editing gap line.
   card.shadowRoot.dispatchClick(fakeTarget("tab", { tab: "notes" }));
   await flush();
   assert.match(card.shadowRoot.innerHTML, /No notes for this recipe/);
+  assert.match(card.shadowRoot.innerHTML, /can't be edited from the hub yet/);
 });
 
 test("empty states, by cause: empty library, no-match search, empty collection", async () => {

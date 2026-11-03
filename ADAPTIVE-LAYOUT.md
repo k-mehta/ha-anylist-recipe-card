@@ -41,12 +41,16 @@ Precedence (first match wins):
 2. A viewport narrower than 768 px is mobile.
 3. A coarse pointer on anything but a huge landscape screen is
    mobile (phones and tablets).
-4. A coarse pointer on a landscape screen at least 1600 px wide is
-   the hub (the kitchen kiosk is a 1920×1200 touch display).
-5. A fine pointer is desktop.
-6. With no pointer information: a touch screen that is landscape and
-   at least 1600 px wide is the hub; a viewport at least 1024 px wide
-   is desktop; anything else is mobile.
+4. A touch screen that is hub-sized (at least 1600 px wide) and
+   landscape is the hub — even when a mouse is also attached. The
+   kiosk has a mouse, so a fine pointer is present too; checking fine
+   first would mis-detect the hub as a desktop. Touch + hub size
+   wins over fine pointer.
+5. A coarse pointer on a huge landscape screen is the hub (a touch
+   screen whose touch signal is missing but whose pointer is coarse).
+6. A fine pointer is desktop.
+7. With no pointer information: a viewport at least 1024 px wide is
+   desktop; anything else is mobile.
 
 The detection is a pure function, `detectDevice(env)`, that takes
 `{ width, height, coarsePointer, finePointer, touch, userAgent }` and
@@ -86,18 +90,24 @@ card.
 
 ### Recipe card (`custom:anylist-recipe-view`)
 
-The hub layout is the baseline and is unchanged: big targets
-(≥ 64 px), multi-column grid, big readable text.
+The hub layout is the baseline: big targets (≥ 72 px), multi-column
+grid, big readable text — the hub base is 24 px type (steps 26 px),
+readable from the counter at 3 feet on a 10.1" 192 ppi display. The
+cooking view shows ingredients and steps together: two columns on
+the hub (ingredients left, steps right), stacked on a phone
+(ingredients above steps, step tracker sticky). There is no photo
+and no metadata in the cooking view — the photo lives only in the
+list, and there is no Details tab. Two tabs: Cook and Notes.
 
 | | Hub (1920×1200 landscape) | Desktop (large screen, mouse) | Mobile (phone/tablet) |
 | --- | --- | --- | --- |
 | Grid | 3 columns (4 at ≥ 1700 px) | 3 columns (4 at ≥ 1700 px) | 1 column portrait; 2 columns landscape at ≥ 640 px width |
-| Type | Base size | 18 px, tighter padding | 18 px, 16 px padding |
-| Search / buttons | Base (64 px) | 52 px | 56 px |
+| Type | Base 24 px (steps 26 px) | 18 px, tighter padding | 18 px, 16 px padding |
+| Search / buttons | Base (72 px) | 52 px | 56 px |
 | Collection chips | Base, scroll sideways with a fade | 44 px | 48 px, wrap onto a second row instead of scrolling |
-| Recipe rows | Base (88 px, 68 px thumbnail) | 88 px, 68 px thumbnail | 88 px, 64 px thumbnail |
-| Detail view | Max width 1150 px | Max width 1200 px | Full width, name 28 px, photo max height 260 px |
-| Tabs | ≥ 64 px | 52 px | 56 px |
+| Recipe rows | Base (112 px, 96 px thumbnail) | 88 px, 68 px thumbnail | 88 px, 64 px thumbnail |
+| Detail view | Max width 1500 px, two-column cooking view | Max width 1200 px, two-column cooking view | Full width, name 28 px, stacked cooking view, sticky step tracker |
+| Tabs | 72 px | 52 px | 56 px |
 
 Long recipe names wrap to two lines in the list (then ellipsis) and
 in full in the detail view. Search, tabs, ingredient headings and the
@@ -140,9 +150,11 @@ expected.
 
 - **Node tests in each repo** cover `detectDevice` for every category
   and orientation (including the edge cases: desktop touchscreen
-  reading as hub, narrow desktop window reading as mobile, phone in
-  desktop mode, no-pointer-info fallbacks) and the layout classes
-  being applied to the card root, plus a resize re-detection test.
+  reading as hub, the hub with a mouse attached still reading as hub,
+  narrow desktop window reading as mobile, phone in desktop mode,
+  no-pointer-info fallbacks) and the layout classes being applied to
+  the card root, plus a resize re-detection test.
 - **Screenshots in a real Chromium** at all six sizes above, viewed
-  before release: recipe list, detail view (all four tabs), a search,
-  and a long-name recipe; timer screen with 1, 3, and 5 timers.
+  before release: recipe list, cooking view (Cook tab with
+  ingredients + steps, and the Notes tab), a search, and a long-name
+  recipe; timer screen with 1, 3, and 5 timers.

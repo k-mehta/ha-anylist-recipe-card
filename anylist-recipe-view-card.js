@@ -71,7 +71,56 @@ function renderStepText(value) {
   let html = escapeHtml(body);
   html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
   html = html.replace(/_([^_]+)_/g, "<em>$1</em>");
+  // A real step (not a section header) gets its times as tappable
+  // timer chips: "simmer for 10 minutes" becomes a chip that starts
+  // a 10-minute timer. Headers are labels, never actionable.
+  if (!headerMatch) html = linkDurations(html);
   return { header: Boolean(headerMatch), html };
+}
+
+// Time phrases in step text, as tappable timer chips. Matches a number
+// (integer or decimal) or "a"/"an" with a unit — hours, minutes or
+// seconds, singular/plural/abbreviated ("10 minutes", "1 hour",
+// "30 sec", "a minute"). Combined durations ("1 hour 30 minutes")
+// become one chip per part. Only text is touched: the HTML is split
+// into tags and text first, so a time-looking string inside a tag or
+// attribute is never rewritten. Each chip carries the total seconds;
+// the card starts a timer for that long when it is tapped.
+const DURATION_RE =
+  /\b(?:(\d+(?:\.\d+)?)\s*(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)|(a|an)\s+(hour|minute|second))\b/gi;
+
+function durationSeconds(amount, unit) {
+  const n = amount === null ? 1 : Number(amount);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const u = String(unit).toLowerCase();
+  if (u.startsWith("h")) return Math.round(n * 3600);
+  if (u.startsWith("m")) return Math.round(n * 60);
+  return Math.round(n);
+}
+
+function linkDurations(html) {
+  // Split into tags (left alone) and text (time phrases become chips).
+  const parts = String(html).split(/(<[^>]*>)/g);
+  return parts
+    .map((part) => {
+      if (!part || part.startsWith("<")) return part;
+      DURATION_RE.lastIndex = 0;
+      let out = "";
+      let last = 0;
+      let match;
+      while ((match = DURATION_RE.exec(part)) !== null) {
+        const seconds = match[1] !== undefined
+          ? durationSeconds(match[1], match[2])
+          : durationSeconds(null, match[4]);
+        if (seconds === null) continue;
+        out += part.slice(last, match.index);
+        out += `<button class="time-chip" data-action="start-timer" data-seconds="${seconds}" aria-label="Start a ${escapeHtml(match[0])} timer">${escapeHtml(match[0])}</button>`;
+        last = match.index + match[0].length;
+      }
+      out += part.slice(last);
+      return out;
+    })
+    .join("");
 }
 
 // One ingredient row: quantity, name, optional note. Section headings
@@ -487,10 +536,14 @@ function detectDevice(env) {
   else if (width < MOBILE_MAX_WIDTH_PX) category = "mobile";
   else if (coarse && !(width >= HUB_MIN_WIDTH_PX && orientation === "landscape"))
     category = "mobile";
-  else if (coarse) category = "hub";
-  else if (fine) category = "desktop";
+  // A touch screen that is hub-sized and landscape IS the hub, even
+  // when a mouse is also attached: the kiosk has a mouse, so a fine
+  // pointer is present too, and checking fine first would mis-detect
+  // the hub as a desktop. Touch + hub size wins over fine pointer.
   else if (touch && width >= HUB_MIN_WIDTH_PX && orientation === "landscape")
     category = "hub";
+  else if (coarse) category = "hub";
+  else if (fine) category = "desktop";
   else if (width >= DESKTOP_MIN_WIDTH_PX) category = "desktop";
   else category = "mobile";
   return { category, orientation };
@@ -555,7 +608,7 @@ const CARD_CSS = `
        chips, tabs and secondary labels, 400 for body. Nothing at
        display size; the largest text on the card is the recipe title. */
     font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-    font-size: 20px;
+    font-size: 24px;
     line-height: 1.45;
   }
   /* Vertical rhythm: each view is a flex column with one shared gap;
@@ -569,17 +622,19 @@ const CARD_CSS = `
      ever added. */
   .list-view[hidden], .detail-view[hidden] { display: none; }
   /* The detail column is capped so long lines stay readable; the list
-     grid takes the full width instead (see .list). */
+     grid takes the full width instead (see .list). The cap is wide
+     enough for the cooking view's two columns (ingredients + steps)
+     on the hub. */
   .detail {
     width: 100%;
-    max-width: 1150px;
+    max-width: 1500px;
     margin: 0 auto;
     display: flex;
     flex-direction: column;
     gap: 24px;
   }
   .title {
-    font-size: 32px;
+    font-size: 36px;
     font-weight: 700;
     line-height: 1.15;
     letter-spacing: -0.02em;
@@ -589,9 +644,9 @@ const CARD_CSS = `
   .toolbar { display: flex; gap: 12px; align-items: stretch; }
   .search {
     flex: 1;
-    min-height: 64px;
+    min-height: 72px;
     padding: 12px 24px 12px 58px;
-    font-size: 22px;
+    font-size: 24px;
     border-radius: 999px;
     border: 1px solid var(--line);
     background-color: var(--card);
@@ -606,15 +661,15 @@ const CARD_CSS = `
   .search::placeholder { color: var(--muted); }
   .search:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   .button {
-    min-height: 64px;
-    min-width: 64px;
+    min-height: 72px;
+    min-width: 72px;
     padding: 12px 24px;
     border-radius: 16px;
     border: 1px solid var(--line);
     background: var(--card);
     box-shadow: var(--shadow-card);
     color: var(--ink);
-    font-size: 20px;
+    font-size: 22px;
     font-weight: 700;
     cursor: pointer;
     font-family: inherit;
@@ -629,6 +684,16 @@ const CARD_CSS = `
     box-shadow: none;
     color: var(--accent);
     padding-left: 4px;
+  }
+  /* Small button: an inline action inside a section header (e.g.
+     "Start over" next to the ingredient count). Same shape as a
+     button, but compact — it sits in a header, not on its own row. */
+  .button.small {
+    min-height: 48px;
+    min-width: 0;
+    padding: 8px 18px;
+    font-size: 18px;
+    border-radius: 12px;
   }
   .button:disabled { opacity: 0.5; cursor: default; }
   /* Chips scroll horizontally with the scrollbar hidden; the fade at
@@ -652,13 +717,13 @@ const CARD_CSS = `
   }
   .chip {
     flex: 0 0 auto;
-    min-height: 56px;
+    min-height: 60px;
     padding: 8px 22px;
     border-radius: 999px;
     border: 1px solid transparent;
     background: var(--chip-bg);
     color: var(--ink);
-    font-size: 20px;
+    font-size: 21px;
     font-weight: 600;
     cursor: pointer;
     font-family: inherit;
@@ -670,8 +735,8 @@ const CARD_CSS = `
     color: #fff;
     box-shadow: var(--shadow-accent);
   }
-  .status { font-size: 18px; color: var(--muted); padding: 0; }
-  .error { font-size: 20px; color: var(--error); padding: 0; }
+  .status { font-size: 20px; color: var(--muted); padding: 0; }
+  .error { font-size: 22px; color: var(--error); padding: 0; }
   /* The list is a grid that uses the width it is given: one column on
      narrow screens, two from 1000px, three from 1500px. The Recipes
      view is a panel view, so on the 1920px hub display the grid has
@@ -688,7 +753,7 @@ const CARD_CSS = `
     gap: 20px;
     align-items: center;
     width: 100%;
-    min-height: 104px;
+    min-height: 112px;
     padding: 16px 20px;
     box-sizing: border-box;
     text-align: left;
@@ -704,19 +769,25 @@ const CARD_CSS = `
   .row:active { transform: scale(0.99); }
   .thumb {
     flex: 0 0 auto;
-    width: 84px;
-    height: 84px;
+    width: 96px;
+    height: 96px;
     border-radius: 16px;
     object-fit: cover;
     background: var(--chip-bg);
   }
+  /* A recipe without a photo gets a deliberate tile, not a cheap
+     placeholder: a warm terracotta-tinted gradient with the initial
+     in the accent colour, so it reads as designed and matches the
+     photo thumbnails instead of looking like a missing image. */
   .thumb.missing {
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 38px;
+    font-size: 42px;
     font-weight: 700;
     color: var(--accent);
+    background: linear-gradient(135deg, #FDF0E6, #FBE3D3);
+    border: 1px solid #F3D9C8;
   }
   .row-text { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 6px; }
   /* Names wrap to two lines, never a single-line ellipsis: a long name
@@ -726,15 +797,15 @@ const CARD_CSS = `
     -webkit-line-clamp: 2;
     -webkit-box-orient: vertical;
     overflow: hidden;
-    font-size: 22px;
+    font-size: 24px;
     font-weight: 700;
     line-height: 1.25;
     letter-spacing: -0.01em;
   }
   /* Meta segments are unbreakable units (see formatMetaHtml); the line
-     wraps only between them. */
-  .row-meta,
-  .detail-meta {
+     wraps only between them. The meta line lives on list rows only —
+     the cooking view has no metadata. */
+  .row-meta {
     display: flex;
     flex-wrap: wrap;
     column-gap: 10px;
@@ -742,7 +813,7 @@ const CARD_CSS = `
     color: var(--muted);
     line-height: 1.4;
   }
-  .row-meta { font-size: 16px; }
+  .row-meta { font-size: 17px; }
   .meta-seg { white-space: nowrap; }
   .meta-sep { color: var(--muted); }
   /* The rating reads as a rating, not more grey metadata: amber stars
@@ -759,24 +830,19 @@ const CARD_CSS = `
     line-height: 1.5;
     white-space: nowrap;
   }
-  .detail-photo {
-    width: 100%;
-    max-height: 420px;
-    object-fit: cover;
-    border-radius: 20px;
-    background: var(--chip-bg);
-    box-shadow: var(--shadow-card);
-  }
+  /* The cooking view has no photo and no metadata line: the photo
+     lives only in the list (where it helps you pick a recipe) and
+     the metadata does not belong while cooking. So there is no
+     .detail-photo and no .detail-meta rule at all. */
   .detail-name {
-    font-size: 36px;
+    font-size: 40px;
     font-weight: 700;
     line-height: 1.15;
     letter-spacing: -0.02em;
     margin: 0;
     color: var(--ink);
   }
-  .detail-meta { font-size: 18px; }
-  .detail-note { font-size: 21px; line-height: 1.6; color: var(--ink); }
+  .detail-note { font-size: 24px; line-height: 1.6; color: var(--ink); }
   /* Tabs are a segmented control: one soft bar, the active segment a
      white pill floating on it — the modern tab pattern, not four
      separate bordered buttons. */
@@ -789,13 +855,13 @@ const CARD_CSS = `
   }
   .tab {
     flex: 1;
-    min-height: 64px;
+    min-height: 72px;
     padding: 8px 12px;
     border-radius: 14px;
     border: none;
     background: transparent;
     color: var(--muted);
-    font-size: 20px;
+    font-size: 22px;
     font-weight: 600;
     cursor: pointer;
     font-family: inherit;
@@ -807,52 +873,39 @@ const CARD_CSS = `
     font-weight: 700;
     box-shadow: var(--shadow-tab);
   }
+  /* -- Cooking mode ---------------------------------------------------
+     Ingredients are checkable full-row buttons: a checkbox square, a
+     quantity in the accent colour, and the name. Tap to cross off
+     (tap again to un-cross). A checked row is struck through and
+     dimmed; its checkbox fills with a tick. */
   .ingredients { display: flex; flex-direction: column; }
   .ingredient {
     display: flex;
     gap: 16px;
-    align-items: baseline;
-    min-height: 64px;
-    padding: 14px 4px;
+    align-items: flex-start;
+    width: 100%;
+    min-height: 76px;
+    padding: 16px 12px;
+    border: none;
     border-bottom: 1px solid var(--line);
-    font-size: 20px;
+    border-radius: 12px;
+    background: transparent;
+    color: var(--ink);
+    font-size: 24px;
     line-height: 1.45;
+    text-align: left;
+    cursor: pointer;
+    font-family: inherit;
   }
   .ingredient:last-child { border-bottom: none; }
-  /* Quantities take the accent colour: they separate from the name at
-     a glance, and the colour is the card's single restrained accent. */
-  .ingredient .qty { flex: 0 0 auto; font-weight: 700; white-space: nowrap; color: var(--accent); }
-  .ingredient .ing-name { flex: 1; min-width: 0; overflow-wrap: break-word; }
-  .ingredient .ing-note { color: var(--muted); font-size: 18px; }
-  /* Section headings are set apart from the rows: smaller, uppercase,
-     letterspaced, secondary colour — a label, not another ingredient. */
-  .ingredient-section {
-    font-size: 17px;
-    font-weight: 700;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: var(--muted);
-    padding: 22px 0 4px;
-  }
-  .ingredient-section:first-child { padding-top: 0; }
-  .steps { display: flex; flex-direction: column; gap: 8px; margin: 0; padding: 0; list-style: none; counter-reset: step; }
-  .step {
-    display: flex;
-    gap: 18px;
-    align-items: flex-start;
-    min-height: 64px;
-    padding: 14px 4px;
-    font-size: 21px;
-    line-height: 1.55;
-  }
-  .step::before {
-    counter-increment: step;
-    content: counter(step);
+  .ingredient:active { transform: scale(0.99); }
+  .ingredient .check {
     flex: 0 0 auto;
-    width: 44px;
-    height: 44px;
-    border-radius: 50%;
-    background: var(--accent);
+    width: 34px;
+    height: 34px;
+    border-radius: 9px;
+    border: 2px solid var(--muted);
+    background: var(--card);
     color: #fff;
     font-size: 22px;
     font-weight: 700;
@@ -861,26 +914,182 @@ const CARD_CSS = `
     justify-content: center;
     margin-top: 2px;
   }
+  .ingredient.checked .check {
+    background: var(--accent);
+    border-color: var(--accent);
+  }
+  .ingredient.checked .ing-name,
+  .ingredient.checked .qty {
+    text-decoration: line-through;
+    opacity: 0.5;
+  }
+  /* Quantities take the accent colour: they separate from the name at
+     a glance, and the colour is the card's single restrained accent. */
+  .ingredient .qty { flex: 0 0 auto; font-weight: 700; white-space: nowrap; color: var(--accent); }
+  .ingredient .ing-name { flex: 1; min-width: 0; overflow-wrap: break-word; }
+  .ingredient .ing-note { color: var(--muted); font-size: 20px; }
+  /* Section headings are set apart from the rows: smaller, uppercase,
+     letterspaced, secondary colour — a label, not another ingredient. */
+  .ingredient-section {
+    font-size: 19px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--muted);
+    padding: 22px 0 4px;
+  }
+  .ingredient-section:first-child { padding-top: 0; }
+  /* Steps are a guided walkthrough: one current step, the rest dimmed.
+     The current step is a raised card with a filled accent number; the
+     others are plain text at half opacity. Tap any step to make it
+     current. Step numbers are rendered in the markup (span.step-num),
+     not a CSS counter, so a headed step list numbers only the
+     navigable steps. */
+  .steps { display: flex; flex-direction: column; gap: 8px; margin: 0; padding: 0; list-style: none; }
+  .step {
+    display: flex;
+    gap: 18px;
+    align-items: flex-start;
+    min-height: 76px;
+    padding: 18px 16px;
+    font-size: 26px;
+    line-height: 1.55;
+    border-radius: 16px;
+    border: 1px solid transparent;
+    cursor: pointer;
+    opacity: 0.5;
+  }
+  .step.current {
+    opacity: 1;
+    background: var(--card);
+    border-color: var(--line);
+    box-shadow: var(--shadow-card);
+  }
+  .step-num {
+    flex: 0 0 auto;
+    width: 56px;
+    height: 56px;
+    border-radius: 50%;
+    background: var(--chip-bg);
+    color: var(--muted);
+    font-size: 26px;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-top: 2px;
+  }
+  .step.current .step-num {
+    background: var(--accent);
+    color: #fff;
+  }
   .step-text { flex: 1; min-width: 0; white-space: pre-wrap; overflow-wrap: break-word; }
   .step-header {
     padding: 18px 4px 4px;
-    font-size: 21px;
+    font-size: 24px;
     font-weight: 700;
     color: var(--ink);
   }
-  .detail-rows { display: flex; flex-direction: column; }
-  .detail-row {
-    display: flex;
-    gap: 16px;
-    align-items: baseline;
-    min-height: 64px;
-    padding: 14px 4px;
-    border-bottom: 1px solid var(--line);
-    font-size: 20px;
-    line-height: 1.45;
+  /* A time inside a step is a tappable chip: warm tint, accent text,
+     pill shape — it reads as an action, not body text. Sized in em so
+     it scales with the step text on every device. */
+  .time-chip {
+    display: inline-block;
+    padding: 4px 14px;
+    border-radius: 999px;
+    border: 1px solid #F3D9C8;
+    background: #FDEFE6;
+    color: var(--accent);
+    font-size: 0.92em;
+    font-weight: 700;
+    cursor: pointer;
+    font-family: inherit;
+    line-height: 1.4;
   }
-  .detail-row:last-child { border-bottom: none; }
-  .detail-label { flex: 0 0 160px; font-weight: 700; color: var(--muted); }
+  .time-chip:active { transform: scale(0.97); }
+  /* The timer outcome line: one line under the step tracker, accent
+     colour, so a failed start is visible in the cooking view. */
+  .timer-status {
+    font-size: 20px;
+    font-weight: 600;
+    color: var(--accent);
+    padding: 4px 4px 8px;
+  }
+  /* The cooking view puts ingredients and steps together: two columns
+     on the hub (ingredients left, steps right — the cook needs both
+     at once), one stacked column on a phone (ingredients above steps).
+     The columns align at the top so a short ingredient list does not
+     stretch the steps column. */
+  .cook-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 5fr) minmax(0, 7fr);
+    gap: 40px;
+    align-items: start;
+  }
+  .cook-head {
+    display: flex;
+    align-items: baseline;
+    gap: 16px;
+    flex-wrap: wrap;
+    margin-bottom: 8px;
+  }
+  .section-title {
+    font-size: 26px;
+    font-weight: 700;
+    margin: 0;
+    color: var(--ink);
+  }
+  .cook-count {
+    font-size: 20px;
+    font-weight: 600;
+    color: var(--muted);
+  }
+  /* The step tracker is the "Step N of M" bar with Prev/Next. It is
+     sticky, so your place in the steps stays visible while the steps
+     scroll — on a phone, where the ingredients sit above the steps,
+     it pins to the top once you reach the steps. It pins BELOW Home
+     Assistant's own header, not at the very top: the header is 56 px
+     tall and stays fixed while the page scrolls, so a top of 0 would
+     slide the tracker underneath it and hide it. HA exposes the
+     header height as --header-height (56 px here); the 56 px fallback
+     covers a Home Assistant that does not define it. It is a card on
+     the screen background, so content scrolling under it stays hidden. */
+  .step-tracker {
+    position: sticky;
+    top: var(--header-height, 56px);
+    z-index: 2;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 12px 16px;
+    margin-bottom: 12px;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    box-shadow: var(--shadow-card);
+  }
+  .step-position {
+    flex: 1;
+    text-align: center;
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--ink);
+    white-space: nowrap;
+  }
+  .step-nav { flex: 0 0 auto; }
+  /* The Notes tab: the note as saved in AnyList, and a plain line
+     saying editing is not available yet (the integration has no
+     note-write path). The gap line sits on a soft chip background so
+     it reads as information, not an error. */
+  .note-view { display: flex; flex-direction: column; gap: 16px; }
+  .note-gap {
+    font-size: 20px;
+    line-height: 1.5;
+    color: var(--muted);
+    padding: 16px;
+    background: var(--chip-bg);
+    border-radius: 16px;
+  }
   /* Empty states are typographic, not a bare line: a title, one line of
      guidance, and the way out. Generous padding makes the whitespace
      intentional rather than a hole in the page. */
@@ -903,7 +1112,7 @@ const CARD_CSS = `
     display: flex;
     gap: 20px;
     align-items: center;
-    min-height: 104px;
+    min-height: 112px;
     padding: 16px 20px;
     box-sizing: border-box;
     border-radius: 20px;
@@ -911,7 +1120,7 @@ const CARD_CSS = `
     background: var(--card);
     box-shadow: var(--shadow-card);
   }
-  .skeleton-thumb { flex: 0 0 auto; width: 84px; height: 84px; border-radius: 16px; background: var(--chip-bg); }
+  .skeleton-thumb { flex: 0 0 auto; width: 96px; height: 96px; border-radius: 16px; background: var(--chip-bg); }
   .skeleton-lines { flex: 1; display: flex; flex-direction: column; gap: 10px; }
   .skeleton-line { height: 18px; border-radius: 9px; background: var(--chip-bg); }
   .skeleton-line.short { width: 55%; }
@@ -927,7 +1136,8 @@ const CARD_CSS = `
      environment) renders the hub layout. */
   /* Desktop: a mouse is precise, so targets shrink and the grid gets
      denser — three columns from 1200px, four from 1700px. Hover states
-     from the base rules still apply. */
+     from the base rules still apply. The cooking view keeps two
+     columns (the desktop is wide), at desktop type sizes. */
   .screen.dev-desktop { font-size: 18px; padding: 20px 28px; }
   .screen.dev-desktop .title { font-size: 28px; }
   .screen.dev-desktop .search { min-height: 52px; font-size: 19px; padding: 10px 20px 10px 52px; background-size: 22px 22px; }
@@ -941,13 +1151,26 @@ const CARD_CSS = `
   .screen.dev-desktop .detail { max-width: 1200px; }
   .screen.dev-desktop .detail-name { font-size: 32px; }
   .screen.dev-desktop .tab { min-height: 52px; font-size: 18px; }
-  .screen.dev-desktop .ingredient, .screen.dev-desktop .step, .screen.dev-desktop .detail-row { min-height: 52px; font-size: 19px; }
+  .screen.dev-desktop .ingredient { min-height: 56px; font-size: 19px; padding: 12px 8px; }
+  .screen.dev-desktop .ingredient .check { width: 24px; height: 24px; font-size: 16px; border-radius: 7px; }
+  .screen.dev-desktop .ingredient .ing-note { font-size: 16px; }
+  .screen.dev-desktop .step { min-height: 56px; font-size: 20px; padding: 12px 10px; }
+  .screen.dev-desktop .step-num { width: 40px; height: 40px; font-size: 20px; }
+  .screen.dev-desktop .step-header { font-size: 20px; }
+  .screen.dev-desktop .section-title { font-size: 22px; }
+  .screen.dev-desktop .cook-count { font-size: 17px; }
+  .screen.dev-desktop .step-position { font-size: 19px; }
+  .screen.dev-desktop .timer-status { font-size: 17px; }
+  .screen.dev-desktop .detail-note { font-size: 19px; }
+  .screen.dev-desktop .note-gap { font-size: 17px; }
+  .screen.dev-desktop .cook-grid { gap: 32px; }
   @media (min-width: 1200px) { .screen.dev-desktop .list { grid-template-columns: repeat(3, 1fr); } }
   @media (min-width: 1700px) { .screen.dev-desktop .list { grid-template-columns: repeat(4, 1fr); } }
   /* Mobile: touch targets stay large (a finger is not a mouse), the
      type stays readable, and the grid is one column in portrait so
      nothing overflows or clips. The detail view takes the full width;
-     the tab labels shrink just enough that all four tabs fit. */
+     the cooking view stacks (ingredients above steps) with the step
+     tracker sticky, so your place stays visible while you scroll. */
   .screen.dev-mobile { font-size: 18px; padding: 16px; }
   .screen.dev-mobile .title { font-size: 26px; }
   .screen.dev-mobile .search { min-height: 56px; font-size: 18px; padding: 10px 16px 10px 48px; background-size: 22px 22px; background-position: 14px center; }
@@ -968,12 +1191,21 @@ const CARD_CSS = `
   .screen.dev-mobile .row-meta { font-size: 15px; }
   .screen.dev-mobile .detail { max-width: none; }
   .screen.dev-mobile .detail-name { font-size: 28px; }
-  .screen.dev-mobile .detail-photo { max-height: 260px; }
-  .screen.dev-mobile .tab { min-height: 56px; font-size: 16px; padding: 8px 6px; }
-  .screen.dev-mobile .ingredient, .screen.dev-mobile .step, .screen.dev-mobile .detail-row { min-height: 56px; font-size: 18px; }
-  .screen.dev-mobile .step { font-size: 19px; }
-  .screen.dev-mobile .detail-label { flex: 0 0 110px; }
-  .screen.dev-mobile .detail-row > span:last-child { min-width: 0; overflow-wrap: break-word; }
+  .screen.dev-mobile .tab { min-height: 56px; font-size: 18px; padding: 8px 6px; }
+  .screen.dev-mobile .cook-grid { grid-template-columns: 1fr; gap: 32px; }
+  .screen.dev-mobile .section-title { font-size: 22px; }
+  .screen.dev-mobile .cook-count { font-size: 17px; }
+  .screen.dev-mobile .ingredient { min-height: 60px; font-size: 19px; padding: 12px 8px; }
+  .screen.dev-mobile .ingredient .check { width: 28px; height: 28px; font-size: 18px; }
+  .screen.dev-mobile .ingredient .ing-note { font-size: 16px; }
+  .screen.dev-mobile .step { min-height: 60px; font-size: 20px; padding: 12px 10px; }
+  .screen.dev-mobile .step-num { width: 44px; height: 44px; font-size: 20px; }
+  .screen.dev-mobile .step-header { font-size: 20px; }
+  .screen.dev-mobile .step-position { font-size: 19px; }
+  .screen.dev-mobile .step-tracker { padding: 10px 12px; gap: 10px; }
+  .screen.dev-mobile .timer-status { font-size: 17px; }
+  .screen.dev-mobile .detail-note { font-size: 19px; }
+  .screen.dev-mobile .note-gap { font-size: 17px; }
   .screen.dev-mobile .empty { padding: 48px 16px; }
   .screen.dev-mobile .list { grid-template-columns: 1fr; }
   /* Landscape phone/tablet: two columns, but only when the viewport is
@@ -994,10 +1226,19 @@ class AnyListRecipeViewCard extends HTMLElement {
     this._searchResults = null; // Ranked results from the local search, or null.
     this._collectionId = "";
     this._selected = null; // The open recipe, from the loaded list, or null (list view).
-    this._detailTab = "ingredients"; // Active tab of the open recipe.
+    this._detailTab = "cook"; // Active tab of the open recipe: cook or notes.
     this._loading = false;
     this._error = "";
     this._loaded = false;
+    // Cooking state, per recipe id, kept for the card's lifetime so a
+    // cook can leave a recipe and come back without losing their place
+    // (Paprika keeps the highlighted step and crossed-off ingredients
+    // the same way). Checked ingredients are a set of row indexes;
+    // the current step is an index into the numbered (non-header)
+    // steps. The timer status line holds the last timer-start outcome.
+    this._checked = new Map();
+    this._currentStep = new Map();
+    this._timerStatus = "";
     this._searchTimer = null;
     this._shell = null; // Built once: title, toolbar, chips, status, body.
     this._detailEl = null;
@@ -1177,10 +1418,110 @@ class AnyListRecipeViewCard extends HTMLElement {
     const recipe = this._recipes.find((item) => item.id === id);
     if (!recipe) return;
     this._selected = recipe;
-    this._detailTab = "ingredients";
+    this._detailTab = "cook";
     this._render();
   }
 
+  // -- cooking mode -------------------------------------------------------
+  //
+  // The detail view is a cooking tool, not a recipe page. Ingredients
+  // are checkable (tap to cross off, tap again to un-cross); steps are
+  // a guided walkthrough (one current step, the rest dimmed, "Step N
+  // of M"); times in a step are tappable timer chips; the note is
+  // read-only (editing needs a backend write path — see the note
+  // above _friendlyError). Cooking state lives on the card, keyed by
+  // leaving a recipe and coming back keeps your place.
+
+  // The ingredient rows in display order, each with a stable index
+  // (section headings excluded — they are labels, not ingredients).
+  // Headed recipes use their ordered entries; older responses fall
+  // back to the flat ingredient list.
+  _ingredientRows(recipe) {
+    const rows = [];
+    if (recipe.entries.length) {
+      for (const item of recipe.entries) {
+        if (item.type === "ingredient") rows.push(item);
+      }
+    } else {
+      rows.push(...recipe.ingredients);
+    }
+    return rows;
+  }
+
+  _checkedSet(recipeId) {
+    let set = this._checked.get(recipeId);
+    if (!set) {
+      set = new Set();
+      this._checked.set(recipeId, set);
+    }
+    return set;
+  }
+
+  // The numbered (non-header) steps in order, each with its display
+  // number (1-based) and its position in the full steps list.
+  // Headers are section labels: they render between steps but never
+  // consume a number and can never be the current step.
+  _navigableSteps(recipe) {
+    const steps = [];
+    let number = 0;
+    recipe.steps.forEach((step, index) => {
+      const rendered = renderStepText(step);
+      if (rendered.header) return;
+      number += 1;
+      steps.push({ number, index, html: rendered.html });
+    });
+    return steps;
+  }
+
+  _currentStepIndex(recipeId, total) {
+    if (total <= 0) return 0;
+    const stored = this._currentStep.get(recipeId);
+    if (typeof stored !== "number" || stored < 0) return 0;
+    return Math.min(stored, total - 1);
+  }
+
+  // Start a voice timer for a time tapped in a step. The timer lives
+  // on the kitchen satellite, so this calls the Satellite Timers
+  // bridge's start action. That action does not exist yet (the bridge
+  // only operates on timers that already exist) — until it does, the
+  // tap reports that honestly instead of pretending a timer started.
+  async _startTimer(seconds, label) {
+    const total = Number(seconds);
+    if (!Number.isFinite(total) || total <= 0) return;
+    this._timerStatus = "";
+    this._render();
+    try {
+      const minutes = Math.floor(total / 60);
+      const secs = total % 60;
+      await this._hass.callWS({
+        type: "call_service",
+        domain: "satellite_timers",
+        service: "start_timer",
+        service_data: {
+          minutes,
+          seconds: secs,
+          name: this._selected ? this._selected.name : undefined,
+        },
+        return_response: false,
+      });
+      this._timerStatus = `Timer started: ${label}.`;
+    } catch (err) {
+      this._timerStatus =
+        "Couldn't start the timer — the timer bridge doesn't offer a start action yet.";
+    }
+    this._render();
+  }
+
+  // NOTE — no note-write path is shipped. The AnyList integration's
+  // update_recipe action has no note field (and its client update
+  // replaces only name, ingredients and steps), so a note cannot be
+  // written to AnyList today. Shipping a Save button that can never
+  // persist the note would be a broken half-feature: the cook would
+  // type a note, press Save, and lose it. So the Notes tab shows the
+  // note read-only and says plainly that editing is not available
+  // yet. The backend gap: update_recipe needs a `note` field (or a
+  // dedicated set_recipe_note action) before a note can be saved from
+  // the hub. When that lands, the editor + save can be added here.
   _friendlyError(err) {
     const message = String((err && err.message) || err || "");
     if (/not found/i.test(message) && /service/i.test(message)) {
@@ -1196,7 +1537,8 @@ class AnyListRecipeViewCard extends HTMLElement {
 
   _onInput(event) {
     const target = event.target;
-    if (!target || !target.dataset || target.dataset.role !== "search") return;
+    if (!target || !target.dataset) return;
+    if (target.dataset.role !== "search") return;
     this._query = target.value || "";
     if (this._searchTimer !== null) clearTimeout(this._searchTimer);
     this._searchTimer = setTimeout(() => {
@@ -1233,7 +1575,7 @@ class AnyListRecipeViewCard extends HTMLElement {
       return;
     }
     if (action === "tab") {
-      this._detailTab = target.dataset.tab || "ingredients";
+      this._detailTab = target.dataset.tab || "cook";
       this._render();
       return;
     }
@@ -1244,6 +1586,52 @@ class AnyListRecipeViewCard extends HTMLElement {
     }
     if (action === "open") {
       this._openRecipe(target.dataset.recipeId);
+      return;
+    }
+    // -- cooking mode ---------------------------------------------------
+    if (action === "toggle-ingredient") {
+      if (!this._selected) return;
+      const index = Number(target.dataset.index);
+      if (!Number.isFinite(index)) return;
+      const set = this._checkedSet(this._selected.id);
+      if (set.has(index)) set.delete(index);
+      else set.add(index);
+      this._render();
+      return;
+    }
+    if (action === "clear-checks") {
+      if (!this._selected) return;
+      this._checked.delete(this._selected.id);
+      this._render();
+      return;
+    }
+    if (action === "step") {
+      if (!this._selected) return;
+      const index = Number(target.dataset.stepIndex);
+      if (!Number.isFinite(index)) return;
+      this._currentStep.set(this._selected.id, index);
+      this._render();
+      return;
+    }
+    if (action === "step-prev" || action === "step-next") {
+      if (!this._selected) return;
+      const steps = this._navigableSteps(this._selected);
+      if (steps.length === 0) return;
+      const current = this._currentStepIndex(this._selected.id, steps.length);
+      const next =
+        action === "step-prev"
+          ? Math.max(0, current - 1)
+          : Math.min(steps.length - 1, current + 1);
+      this._currentStep.set(this._selected.id, next);
+      this._render();
+      return;
+    }
+    if (action === "start-timer") {
+      const seconds = Number(target.dataset.seconds);
+      if (Number.isFinite(seconds) && seconds > 0) {
+        this._startTimer(seconds, target.textContent || "");
+      }
+      return;
     }
   }
 
@@ -1429,14 +1817,14 @@ class AnyListRecipeViewCard extends HTMLElement {
 
   _detailHtml() {
     const recipe = this._selected;
-    const meta = formatMetaHtml(recipe);
-    const photo = recipe.photoUrls[0];
-    // A recipe with a photo gets a photo hero; a recipe without one
-    // gets no placeholder block at all — just the title, once.
+    // Cooking mode: the detail view is a cooking tool, not a recipe
+    // page. No photo hero and no metadata line — the photo lives only
+    // in the list (where it helps you pick a recipe) and the metadata
+    // (times, servings, source) does not belong in the cooking view at
+    // all. The name is a compact label, not a display title. Two tabs:
+    // Cook (ingredients + steps together) and Notes (editable).
     const tabs = [
-      ["ingredients", "Ingredients"],
-      ["recipe", "Recipe"],
-      ["details", "Details"],
+      ["cook", "Cook"],
       ["notes", "Notes"],
     ];
     const tabBar = `<div class="tabbar" role="tablist">${tabs
@@ -1451,79 +1839,129 @@ class AnyListRecipeViewCard extends HTMLElement {
           <button class="button ghost" data-action="back">← All recipes</button>
         </div>
         ${this._error ? `<div class="error">${escapeHtml(this._error)}</div><button class="button primary" data-action="retry">Try again</button>` : ""}
-        ${photo ? `<img class="detail-photo" src="${escapeHtml(photo)}" alt="" onerror="this.remove()" />` : ""}
         <h1 class="detail-name">${escapeHtml(recipe.name)}</h1>
-        ${meta ? `<div class="detail-meta">${meta}</div>` : ""}
         ${tabBar}
         <div class="tab-panel">${this._detailTabHtml(recipe)}</div>
       </div>`;
   }
 
-  // The active tab's panel. Ingredients is the default tab: the quantities
-  // a cook needs first. Headed recipes render their ordered entries
-  // (section sub-headings interleaved with ingredient rows); without
-  // entries — older integration responses — the flat list renders as before.
+  // The active tab's panel. Cook is the default tab: ingredients and
+  // steps together (two columns on the hub, ingredients above steps on
+  // a phone), because a cook needs both at once. Notes is the editable
+  // note. There is no Details tab: metadata (times, servings, source)
+  // does not belong in the cooking view.
   _detailTabHtml(recipe) {
-    if (this._detailTab === "recipe") {
-      const steps = recipe.steps
-        .map((step) => {
-          const rendered = renderStepText(step);
-          if (rendered.header) {
-            return `<li class="step-header">${rendered.html}</li>`;
-          }
-          return `<li class="step"><span class="step-text">${rendered.html}</span></li>`;
-        })
-        .join("");
-      return steps
-        ? `<ol class="steps">${steps}</ol>`
-        : `<div class="status">No steps listed.</div>`;
-    }
-    if (this._detailTab === "details") {
-      const rows = [];
-      const prep = formatDuration(recipe.prepTime);
-      if (prep) rows.push(["Prep", prep]);
-      const cook = formatDuration(recipe.cookTime);
-      if (cook) rows.push(["Cook", cook]);
-      const servings = formatServings(recipe.servings);
-      if (servings) rows.push(["Servings", servings]);
-      const stars = formatStars(recipe.rating);
-      if (stars) rows.push(["Rating", stars]);
-      const collections = recipe.collections.map((item) => item.name).join(", ");
-      if (collections) rows.push(["Collections", collections]);
-      if (recipe.sourceName || recipe.sourceUrl) {
-        rows.push(["Source", recipe.sourceName || recipe.sourceUrl]);
-      }
-      if (rows.length === 0) {
-        return `<div class="status">No details for this recipe.</div>`;
-      }
-      return `<div class="detail-rows">${rows
-        .map(([label, value]) => {
-          // The rating renders as amber stars, like the meta line.
-          const valueHtml =
-            label === "Rating"
-              ? `<span class="stars">${escapeHtml(value)}</span>`
-              : escapeHtml(value);
-          return `<div class="detail-row"><span class="detail-label">${escapeHtml(label)}</span><span>${valueHtml}</span></div>`;
-        })
-        .join("")}</div>`;
-    }
     if (this._detailTab === "notes") {
-      return recipe.note
-        ? `<div class="detail-note">${escapeHtml(recipe.note)}</div>`
-        : `<div class="status">No notes for this recipe.</div>`;
+      return this._notesHtml(recipe);
     }
-    const ingredients = recipe.entries.length
+    return this._cookHtml(recipe);
+  }
+
+  // The cooking view: ingredients (checkable) and steps (guided
+  // walkthrough) together. On the hub they sit side by side; on a
+  // phone they stack, ingredients first, with the step tracker sticky
+  // so your place in the steps stays visible while you scroll.
+  _cookHtml(recipe) {
+    const rows = this._ingredientRows(recipe);
+    const checked = this._checkedSet(recipe.id);
+    const checkedCount = rows.reduce(
+      (count, _item, index) => count + (checked.has(index) ? 1 : 0),
+      0
+    );
+    // Headed recipes interleave section sub-headings with ingredient
+    // rows. The checkable index counts ingredient rows only, in
+    // display order, so it matches the set stored per recipe.
+    let ingIndex = -1;
+    const ingredientsHtml = recipe.entries.length
       ? recipe.entries
-          .map((item) =>
-            item.type === "section"
-              ? `<div class="ingredient-section">${escapeHtml(item.name)}</div>`
-              : renderIngredientRow(item),
-          )
+          .map((item) => {
+            if (item.type === "section") {
+              return `<div class="ingredient-section">${escapeHtml(item.name)}</div>`;
+            }
+            ingIndex += 1;
+            return this._ingredientRowHtml(item, ingIndex, checked.has(ingIndex));
+          })
           .join("")
-      : recipe.ingredients.map(renderIngredientRow).join("");
-    return ingredients
-      ? `<div class="ingredients">${ingredients}</div>`
-      : `<div class="status">No ingredients listed.</div>`;
+      : recipe.ingredients
+          .map((item, index) => this._ingredientRowHtml(item, index, checked.has(index)))
+          .join("");
+    const steps = this._navigableSteps(recipe);
+    const current = this._currentStepIndex(recipe.id, steps.length);
+    const stepNav =
+      steps.length > 0
+        ? `<div class="step-tracker">
+            <button class="button step-nav" data-action="step-prev" ${current === 0 ? "disabled" : ""} aria-label="Previous step">← Prev</button>
+            <span class="step-position" aria-live="polite">Step ${current + 1} of ${steps.length}</span>
+            <button class="button step-nav" data-action="step-next" ${current === steps.length - 1 ? "disabled" : ""} aria-label="Next step">Next →</button>
+          </div>`
+        : "";
+    // Steps render in full order (headers interleaved as section
+    // labels). Only the numbered steps are navigable; the current one
+    // is highlighted and the rest are dimmed. Tapping a step makes it
+    // current.
+    let stepNumber = 0;
+    const stepsHtml = recipe.steps
+      .map((step) => {
+        const rendered = renderStepText(step);
+        if (rendered.header) {
+          return `<li class="step-header">${rendered.html}</li>`;
+        }
+        const navIndex = stepNumber;
+        stepNumber += 1;
+        const isCurrent = navIndex === current;
+        return `<li class="step${isCurrent ? " current" : ""}" data-action="step" data-step-index="${navIndex}" role="button" tabindex="0" aria-current="${isCurrent ? "step" : "false"}"><span class="step-num">${navIndex + 1}</span><span class="step-text">${rendered.html}</span></li>`;
+      })
+      .join("");
+    const timerStatus = this._timerStatus
+      ? `<div class="timer-status" role="status">${escapeHtml(this._timerStatus)}</div>`
+      : "";
+    return `
+      <div class="cook-grid">
+        <section class="cook-ingredients" aria-label="Ingredients">
+          <div class="cook-head">
+            <h2 class="section-title">Ingredients</h2>
+            <span class="cook-count">${checkedCount} of ${rows.length} gathered</span>
+            ${checkedCount > 0 ? `<button class="button small ghost" data-action="clear-checks">Start over</button>` : ""}
+          </div>
+          ${ingredientsHtml ? `<div class="ingredients">${ingredientsHtml}</div>` : `<div class="status">No ingredients listed.</div>`}
+        </section>
+        <section class="cook-steps" aria-label="Steps">
+          <div class="cook-head">
+            <h2 class="section-title">Steps</h2>
+          </div>
+          ${stepNav}
+          ${timerStatus}
+          ${stepsHtml ? `<ol class="steps">${stepsHtml}</ol>` : `<div class="status">No steps listed.</div>`}
+        </section>
+      </div>`;
+  }
+
+  // One checkable ingredient row: a full-row button with a checkbox
+  // square. Tap to cross it off (tap again to un-cross). A checked
+  // row is struck through and dimmed; the checkbox fills with a tick.
+  _ingredientRowHtml(item, index, isChecked) {
+    const display = item.name || item.raw;
+    const qty = item.quantity
+      ? `<span class="qty">${escapeHtml(item.quantity)}</span>`
+      : `<span class="qty"></span>`;
+    const note = item.note ? ` <span class="ing-note">${escapeHtml(item.note)}</span>` : "";
+    return `<button class="ingredient${isChecked ? " checked" : ""}" data-action="toggle-ingredient" data-index="${index}" aria-pressed="${isChecked ? "true" : "false"}">
+      <span class="check" aria-hidden="true">${isChecked ? "✓" : ""}</span>
+      ${qty}<span class="ing-name">${escapeHtml(display)}${note}</span>
+    </button>`;
+  }
+
+  // The Notes tab: the note as saved in AnyList, read-only. Editing
+  // is not offered here because the AnyList integration has no way to
+  // save a note (see the note above _friendlyError) — a Save button
+  // would be a promise the hub cannot keep. The message says so in
+  // plain words rather than leaving the cook to discover it.
+  _notesHtml(recipe) {
+    return `
+      <div class="note-view">
+        ${recipe.note ? `<div class="detail-note">${escapeHtml(recipe.note)}</div>` : `<div class="status">No notes for this recipe.</div>`}
+        <div class="note-gap">Notes can't be edited from the hub yet — the AnyList integration doesn't offer a way to save them.</div>
+      </div>`;
   }
 }
 
