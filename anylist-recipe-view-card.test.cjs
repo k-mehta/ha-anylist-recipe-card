@@ -617,7 +617,8 @@ test("detectDevice: the hub is a huge landscape touch screen", () => {
 test("detectDevice: a hub-sized touch-only screen is mobile, not the hub (P8-16)", () => {
   // Rule 8 (touch + >=1600px landscape = hub) is deleted: a
   // touch-only screen at 1920x1080 is not the hub — only the exact
-  // 1920x1200 signature is. Coarse with no fine pointer is mobile.
+  // panel signature (either orientation, rule 1) is. Coarse with no
+  // fine pointer is mobile.
   assert.deepEqual(
     detectDevice({
       width: 1920,
@@ -778,11 +779,81 @@ test("detectDevice: tablets are tablets in both orientations (DESIGN-9)", () => 
   );
 });
 
-test("detectDevice: a huge portrait touch screen is mobile, not the hub (the hub is landscape)", () => {
+test("detectDevice: the rotated panel (1200x1920) is the portrait hub (O2-01)", () => {
+  // The wall rotated is the SAME panel, so rule 1 catches it in
+  // either orientation — it gets the hub layout (with the portrait
+  // reflow), not the phone layout. Without this, Home would read hub
+  // at 1200x1920 while Recipes read mobile, and the O2-01 portrait
+  // layout would never trigger in the recipe card.
   assert.deepEqual(
     detectDevice({
       width: 1200,
       height: 1920,
+      coarsePointer: true,
+      finePointer: false,
+      touch: true,
+      userAgent: HUB_UA,
+    }),
+    { category: "hub", orientation: "portrait" }
+  );
+  // No user agent at all: size + touch + portrait is enough.
+  assert.deepEqual(
+    detectDevice({
+      width: 1200,
+      height: 1920,
+      coarsePointer: true,
+      finePointer: false,
+      touch: true,
+      userAgent: "",
+    }),
+    { category: "hub", orientation: "portrait" }
+  );
+  // A mouse attached does not demote it: rule 1 fires before any
+  // pointer check.
+  assert.deepEqual(
+    detectDevice({
+      width: 1200,
+      height: 1920,
+      coarsePointer: false,
+      finePointer: true,
+      touch: true,
+      userAgent: HUB_UA,
+    }),
+    { category: "hub", orientation: "portrait" }
+  );
+  // 1080x1920 is NOT the panel: a fine pointer is a desktop, and a
+  // coarse-only touch screen outside the tablet band is mobile.
+  assert.deepEqual(
+    detectDevice({
+      width: 1080,
+      height: 1920,
+      coarsePointer: false,
+      finePointer: true,
+      touch: false,
+      userAgent: "",
+    }),
+    { category: "desktop", orientation: "portrait" }
+  );
+  assert.deepEqual(
+    detectDevice({
+      width: 1080,
+      height: 1920,
+      coarsePointer: true,
+      finePointer: false,
+      touch: true,
+      userAgent: "",
+    }),
+    { category: "mobile", orientation: "portrait" }
+  );
+});
+
+test("detectDevice: a huge portrait touch screen that is not the panel signature is mobile", () => {
+  // 1200x1600 is big and portrait and touch — but it is not the
+  // panel, so rule 1 does not fire and it falls through to mobile.
+  assert.deepEqual(
+    detectDevice({
+      width: 1200,
+      height: 1600,
       coarsePointer: true,
       finePointer: false,
       touch: true,
@@ -1101,7 +1172,7 @@ test("sortRecipes sorts by rating, cook and prep, nulls last (RECIPE-19)", () =>
   );
 });
 
-test("detectDevice: the exact 1920x1200 panel is the hub FIRST, even with a mouse and no touch (spec §3.7)", () => {
+test("detectDevice: the exact panel signature is the hub FIRST, in either orientation, even with a mouse and no touch (spec §3.7, O2-01)", () => {
   assert.deepEqual(
     detectDevice({ width: 1920, height: 1200, finePointer: true, coarsePointer: false, touch: false, userAgent: "" }),
     { category: "hub", orientation: "landscape" }
@@ -1111,10 +1182,12 @@ test("detectDevice: the exact 1920x1200 panel is the hub FIRST, even with a mous
     detectDevice({ width: 1920, height: 1080, finePointer: true, coarsePointer: false, touch: false, userAgent: "" }),
     { category: "desktop", orientation: "landscape" }
   );
-  // The portrait panel is not the hub signature.
+  // The portrait panel IS the hub signature too (O2-01): rule 1
+  // catches the panel in either orientation, before any pointer
+  // check.
   assert.deepEqual(
     detectDevice({ width: 1200, height: 1920, finePointer: false, coarsePointer: true, touch: true, userAgent: "" }),
-    { category: "mobile", orientation: "portrait" }
+    { category: "hub", orientation: "portrait" }
   );
 });
 
@@ -1278,10 +1351,12 @@ test("detectDevice: tablet category — band, iPad, Android tablet (DESIGN-9)", 
     detectDevice({ width: 1080, height: 1920, coarsePointer: true, finePointer: true, touch: true }).category,
     "desktop"
   );
-  // A huge portrait touch screen is mobile, not the hub (the hub is
-  // landscape) — and not a tablet either (1200px is outside the band).
+  // A huge portrait touch screen that is NOT the panel signature is
+  // mobile, not the hub — and not a tablet either (1200px is outside
+  // the band). The panel itself (1200x1920) IS the hub; see the
+  // O2-01 rotated-panel test above.
   assert.equal(
-    detectDevice({ width: 1200, height: 1920, coarsePointer: true, touch: true }).category,
+    detectDevice({ width: 1200, height: 1600, coarsePointer: true, touch: true }).category,
     "mobile"
   );
 });

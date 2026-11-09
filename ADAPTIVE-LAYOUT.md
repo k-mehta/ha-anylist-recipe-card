@@ -36,11 +36,12 @@ Each card reads four signals from the browser it is running in:
 
 Precedence (first match wins) — the unified rule (spec §3.7):
 
-1. The exact 1920×1200 panel signature, landscape, is the hub —
-   FIRST, before any pointer check, so a hub with a mouse attached
-   (or a bench test with mouse only) still reads as the hub. A bare
-   "width ≥ 1600 + landscape → hub" rule is FORBIDDEN: it classifies
-   every 1920×1080 desktop monitor as a hub.
+1. The exact 1920×1200 panel signature, either orientation, is the
+   hub — FIRST, before any pointer check, so a hub with a mouse
+   attached (or a bench test with mouse only) still reads as the hub.
+   The same panel rotated (1200×1920) is the hub in portrait (O2-01).
+   A bare "width ≥ 1600 + landscape → hub" rule is FORBIDDEN: it
+   classifies every 1920×1080 desktop monitor as a hub.
 2. A phone/tablet user agent (`Mobi`, `Android`, `iPhone`, `iPad`,
    `iPod`) is mobile.
 3. A viewport narrower than 768 px is mobile.

@@ -120,7 +120,7 @@ The card is one file with node tests alongside it:
 
 ```sh
 node --check anylist-recipe-view-card.js
-node --test anylist-recipe-view-card.test.cjs anylist-recipe-view-card.dom.test.cjs
+node --test anylist-recipe-view-card.test.cjs anylist-recipe-view-card.dom.test.cjs design-tokens.test.cjs
 ```
 
 ## License

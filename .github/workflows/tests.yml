@@ -28,4 +28,4 @@ jobs:
       - name: Check card syntax
         run: node --check anylist-recipe-view-card.js
       - name: Run card tests
-        run: node --test anylist-recipe-view-card.test.cjs anylist-recipe-view-card.dom.test.cjs
+        run: node --test anylist-recipe-view-card.test.cjs anylist-recipe-view-card.dom.test.cjs design-tokens.test.cjs

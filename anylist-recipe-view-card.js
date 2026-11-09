@@ -1057,12 +1057,13 @@ function deriveCollections(recipes) {
 //
 // Precedence (first match wins) — the unified rule (spec §3.7),
 // with the DESIGN-9 tablet category (Phase 7):
-//   1. The exact 1920x1200 panel signature, landscape, is the hub —
-//      FIRST, before any pointer check, so a hub with a mouse
-//      attached (or a bench test with mouse only) still reads as the
-//      hub. A bare "width >= 1600 + landscape → hub" rule is
-//      FORBIDDEN: it classifies every 1920x1080 desktop monitor as
-//      a hub.
+//   1. The exact 1920x1200 panel signature, either orientation, is
+//      the hub — FIRST, before any pointer check, so a hub with a
+//      mouse attached (or a bench test with mouse only) still reads
+//      as the hub. The same panel rotated (1200x1920) is the hub in
+//      portrait (O2-01). A bare "width >= 1600 + landscape → hub"
+//      rule is FORBIDDEN: it classifies every 1920x1080 desktop
+//      monitor as a hub.
 //   2. An iPad user agent is a tablet; an Android tablet ("Android"
 //      with no "Mobi"/"Mobile" token, viewport at least 768px) is a
 //      tablet.
@@ -1087,10 +1088,11 @@ function deriveCollections(recipes) {
 //
 // Known limits (every fallback still renders a usable layout, never a
 // broken one):
-//   - A 1920x1200 laptop reads as the hub: the panel signature is
-//     the only discriminator, and a laptop that size is
-//     indistinguishable from the wall panel by size alone. That is
-//     fine: the hub layout is just big targets on a wide screen.
+//   - A 1920x1200 laptop reads as the hub, and so does a 1200x1920
+//     one: the panel signature is the only discriminator, and a
+//     laptop that size is indistinguishable from the wall panel by
+//     size alone. That is fine: the hub layout is just big targets
+//     on a wide screen.
 //   - A phone in desktop mode (no mobile user agent) still reads as
 //     mobile by width (rule 4).
 //   - A touchscreen laptop at 1366x768 (coarse, outside the tablet
@@ -1128,10 +1130,15 @@ function detectDevice(env) {
   const fine = Boolean(env && env.finePointer);
   const touch = Boolean(env && env.touch);
   let category;
+  // Rule 1 — the kitchen panel, either orientation: the exact
+  // 1920x1200 signature is the hub in landscape, and the same panel
+  // rotated (1200x1920) is the hub in portrait (O2-01 — the portrait
+  // wall needs its OWN layout, not the phone layout). A 1920x1200
+  // laptop reads as hub too — the documented residual (spec §3.7):
+  // the panel signature is the only discriminator.
   if (
-    width === HUB_PANEL_WIDTH_PX &&
-    height === HUB_PANEL_HEIGHT_PX &&
-    orientation === "landscape"
+    (width === HUB_PANEL_WIDTH_PX && height === HUB_PANEL_HEIGHT_PX) ||
+    (width === HUB_PANEL_HEIGHT_PX && height === HUB_PANEL_WIDTH_PX)
   )
     category = "hub";
   // A tablet user agent is a tablet, whatever the viewport: an iPad

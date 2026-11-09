@@ -6,6 +6,28 @@ and the version numbers follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Releases
 are tagged `vX.Y.Z`.
 
+## [1.4.1] - 2026-11-08
+
+### Fixed
+
+- Device detection rule 1 catches the kitchen panel signature in
+  either orientation (O2-01): 1920×1200 is the hub in landscape, and
+  the same panel rotated (1200×1920) is the hub in portrait. Without
+  this, Home read hub at 1200×1920 while Recipes read mobile, so the
+  portrait-hub layout never triggered in the recipe card. The rule
+  still fires first, before any pointer check, so a hub with a mouse
+  attached still reads as hub in either orientation; 1080×1920 and
+  other non-signature sizes are unaffected.
+
+### Added
+
+- Token parity test (DESIGN-1): `design-tokens.test.cjs` asserts the
+  40 design tokens the recipe card inlines (palette, elevation, type,
+  spacing, radius, targets, icons) against a vendored copy of
+  pi-family-hub's `dashboard/design-tokens.json`, with an explicit
+  skipped list for the other 77 tokens. The test runs in CI alongside
+  the card tests.
+
 ## [1.4.0] - 2026-11-08
 
 ### Added
