@@ -34,22 +34,27 @@ Each card reads four signals from the browser it is running in:
 - **User agent** — only as a tiebreaker for phones/tablets, never
   alone: a desktop browser can spoof it, and a kiosk can strip it.
 
-Precedence (first match wins):
+Precedence (first match wins) — the unified rule (spec §3.7):
 
-1. A phone/tablet user agent (`Mobi`, `Android`, `iPhone`, `iPad`,
+1. The exact 1920×1200 panel signature, landscape, is the hub —
+   FIRST, before any pointer check, so a hub with a mouse attached
+   (or a bench test with mouse only) still reads as the hub. A bare
+   "width ≥ 1600 + landscape → hub" rule is FORBIDDEN: it classifies
+   every 1920×1080 desktop monitor as a hub.
+2. A phone/tablet user agent (`Mobi`, `Android`, `iPhone`, `iPad`,
    `iPod`) is mobile.
-2. A viewport narrower than 768 px is mobile.
-3. A coarse pointer on anything but a huge landscape screen is
+3. A viewport narrower than 768 px is mobile.
+4. A coarse pointer on anything but a huge landscape screen is
    mobile (phones and tablets).
-4. A touch screen that is hub-sized (at least 1600 px wide) and
+5. A touch screen that is hub-sized (at least 1600 px wide) and
    landscape is the hub — even when a mouse is also attached. The
    kiosk has a mouse, so a fine pointer is present too; checking fine
    first would mis-detect the hub as a desktop. Touch + hub size
    wins over fine pointer.
-5. A coarse pointer on a huge landscape screen is the hub (a touch
+6. A coarse pointer on a huge landscape screen is the hub (a touch
    screen whose touch signal is missing but whose pointer is coarse).
-6. A fine pointer is desktop.
-7. With no pointer information: a viewport at least 1024 px wide is
+7. A fine pointer is desktop.
+8. With no pointer information: a viewport at least 1024 px wide is
    desktop; anything else is mobile.
 
 The detection is a pure function, `detectDevice(env)`, that takes
@@ -66,10 +71,12 @@ the layout live.
 Known limits (every fallback still renders a usable layout, never a
 broken one):
 
-- A desktop touchscreen at 1920×1200 reads as the hub. That is fine:
-  the hub layout is just big targets on a wide screen.
+- A 1920×1200 laptop reads as the hub: the panel signature is the
+  only discriminator, and a laptop that size is indistinguishable
+  from the wall panel by size alone. That is fine: the hub layout is
+  just big targets on a wide screen.
 - A phone in desktop mode (no mobile user agent) still reads as
-  mobile by width (rule 2).
+  mobile by width (rule 3).
 - The hub is recognised by size + touch + landscape, not by name: if
   the kiosk display changes size, the thresholds above (1600 px hub
   minimum, 768 px mobile maximum, 1024 px desktop minimum) are the

@@ -145,6 +145,15 @@ class FakeElement {
     return child;
   }
 
+  insertBefore(child, before) {
+    if (child.parentNode) child.parentNode.removeChild(child);
+    child.parentNode = this;
+    const index = before ? this.children.indexOf(before) : -1;
+    if (index >= 0) this.children.splice(index, 0, child);
+    else this.children.push(child);
+    return child;
+  }
+
   removeChild(child) {
     const index = this.children.indexOf(child);
     if (index >= 0) this.children.splice(index, 1);
@@ -222,6 +231,16 @@ class FakeShadowRoot extends FakeElement {
 
   dispatchInput(target) {
     const fn = this._listeners.input;
+    if (fn) fn({ target });
+  }
+
+  dispatchChange(target) {
+    const fn = this._listeners.change;
+    if (fn) fn({ target });
+  }
+
+  dispatchError(target) {
+    const fn = this._listeners.error;
     if (fn) fn({ target });
   }
 }
@@ -323,10 +342,20 @@ function fakeHass(options = {}) {
   const pasta = options.detail ?? PASTA_FULL;
   const all = options.recipes ?? [pasta, SOUP_LIGHT, RICE_LIGHT];
   const fail = options.fail ?? {};
+  const states = options.states ?? [];
   return {
     calls,
+    states,
     callWS: async (message) => {
       calls.push([message.domain, message.service, message.service_data]);
+      // The Phase 3 bridge offers start_timer {name, duration} —
+      // the card calls it from the timer chips. It succeeds unless
+      // the test fails it (fail.start_timer), so the success and
+      // failure paths are both testable.
+      if (message.domain === "satellite_timers" && message.service === "start_timer") {
+        if (fail.start_timer) throw new Error(fail.start_timer);
+        return {};
+      }
       if (message.domain !== "anylist") {
         throw new Error(`Service ${message.domain}.${message.service} not found`);
       }
@@ -388,7 +417,7 @@ test("meta segments are unbreakable units and the rating is an amber stars segme
   const segments = row.querySelectorAll(".meta-seg");
   assert.deepEqual(
     segments.map((s) => s.textContent),
-    ["Prep 10 min", "Cook 20 min", "Serves 4", "★★★★★"]
+    ["Prep 10 min", "Cook 20 min", "Serves 4", "★★★★★ 5/5"]
   );
   assert.equal(segments[3].classList.contains("stars"), true);
   assert.equal(segments[0].classList.contains("stars"), false);
@@ -541,17 +570,17 @@ test("opening a recipe reads the detail from the loaded list — Cook tab first 
   // No second download: the view-open load already brought the detail.
   assert.equal(hass.calls.length, 1);
   assert.equal(hass.calls[0][1], "get_recipes");
-  // Cooking mode: no photo hero and no metadata line in the detail
-  // view — the photo lives only in the list (where it helps you pick
-  // a recipe) and the metadata does not belong while cooking. The
-  // name is a compact label, not a display title. (Scoped to the
-  // detail view: the hidden list still shows the photo and meta.)
+  // Cooking mode: the Cook tab has no photo hero and no metadata line
+  // — those live on the Details tab (RECIPE-7), one tap away. The
+  // photo lives in the list (where it helps you pick a recipe) and
+  // the metadata does not compete with the cooking view. The name is
+  // a compact label, not a display title. (Scoped to the detail view:
+  // the hidden list still shows the photo and meta.)
   const detailHtml = () => card.shadowRoot.querySelector(".detail-view").innerHTML;
   assert.match(detailHtml(), /Creamy Tomato Pasta/);
   assert.equal(card.shadowRoot.querySelectorAll(".detail-name").length, 1);
   assert.doesNotMatch(detailHtml(), /photos\.anylist\.com\/abc123\.jpg/);
   assert.equal(card.shadowRoot.querySelector(".detail-photo"), null);
-  assert.doesNotMatch(detailHtml(), /Serves 4/);
   assert.doesNotMatch(detailHtml(), /Family cookbook/);
   // The Cook tab is the default panel: ingredients AND steps together.
   assert.match(detailHtml(), /500 g/);
@@ -564,6 +593,13 @@ test("opening a recipe reads the detail from the loaded list — Cook tab first 
   assert.match(detailHtml(), /Step 1 of 3/);
   assert.equal(card.shadowRoot.querySelectorAll(".step.current").length, 1);
   assert.doesNotMatch(detailHtml(), /Vihaan likes this with extra cheese/);
+  // The total time line sits at the top of the Cook tab (RECIPE-7):
+  // prep 10 min + cook 20 min.
+  assert.match(detailHtml(), /Total 30 min/);
+  assert.match(detailHtml(), /Prep 10 min/);
+  assert.match(detailHtml(), /Cook 20 min/);
+  // The voice hint sits next to the timer chips (RECIPE-20).
+  assert.match(detailHtml(), /Say 'Okay Nabu, start a 9 minute timer'/);
   // Notes tab: the note in an editable textarea, with a Save button
   // (disabled — nothing changed yet) and five stars showing the
   // saved rating. The old "can't be edited" gap line is gone.
@@ -575,8 +611,17 @@ test("opening a recipe reads the detail from the loaded list — Cook tab first 
   assert.equal(save.getAttribute("disabled"), "disabled");
   assert.equal(card.shadowRoot.querySelectorAll(".star").length, 5);
   assert.equal(card.shadowRoot.querySelectorAll(".star.filled").length, 5);
-  // There is no Details tab: metadata does not belong in the cooking view.
-  assert.equal(card.shadowRoot.querySelector('[data-tab="details"]'), null);
+  // The Details tab exists (RECIPE-7): photo hero, metadata line and
+  // every stored field — the Cook tab is uncluttered, not bare.
+  card.shadowRoot.dispatchClick(fakeTarget("tab", { tab: "details" }));
+  await flush();
+  const detailsHtml = card.shadowRoot.querySelector(".detail-view").innerHTML;
+  assert.match(detailsHtml, /photos\.anylist\.com\/abc123\.jpg/);
+  assert.ok(card.shadowRoot.querySelector(".detail-photo"));
+  assert.match(detailsHtml, /Family cookbook/);
+  assert.match(detailsHtml, /Serves 4/);
+  assert.match(detailsHtml, /★★★★★ 5\/5/);
+  assert.match(detailsHtml, /Total/);
   assert.equal(card.shadowRoot.querySelector(".detail-view").hidden, false);
   assert.equal(card.shadowRoot.querySelector(".list-view").hidden, true);
   // Back returns to the list.
@@ -586,18 +631,18 @@ test("opening a recipe reads the detail from the loaded list — Cook tab first 
   assert.equal(card.shadowRoot.querySelectorAll(".row").length, 3);
 });
 
-test("detail shows two tabs — Cook and Notes — Cook active by default", async () => {
+test("detail shows three tabs — Cook, Notes and Details — Cook active by default (RECIPE-7)", async () => {
   const { card } = await loadedCard();
   card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
   await flush();
   const tabs = [...card.shadowRoot.querySelectorAll(".tab")];
   assert.deepEqual(
     tabs.map((t) => t.textContent),
-    ["Cook", "Notes"],
+    ["Cook", "Notes", "Details"],
   );
   assert.deepEqual(
     tabs.map((t) => t.getAttribute("aria-selected")),
-    ["true", "false"],
+    ["true", "false", "false"],
   );
   assert.equal(card.shadowRoot.querySelector('[data-tab="cook"]').getAttribute("aria-selected"), "true");
 });
@@ -719,7 +764,7 @@ test("steps are a guided walkthrough — current step highlighted, Step N of M, 
   assert.match(card.shadowRoot.innerHTML, /Step 3 of 3/);
 });
 
-test("a time in a step is a tappable chip — tapping it reports honestly that the bridge has no start action yet", async () => {
+test("a time in a step is a tappable chip — tapping it starts a timer via the bridge (RECIPE-5)", async () => {
   const timed = {
     ...PASTA_FULL,
     preparation_steps: [
@@ -734,16 +779,34 @@ test("a time in a step is a tappable chip — tapping it reports honestly that t
   assert.equal(chips.length, 2);
   assert.equal(chips[0].dataset.seconds, "600");
   assert.equal(chips[1].dataset.seconds, "3600");
-  // Tapping the chip calls satellite_timers.start_timer, which does
-  // not exist — the card reports that honestly instead of pretending
-  // a timer started. No AnyList call is made by the tap.
+  // Tapping the chip calls satellite_timers.start_timer with the
+  // Phase 3 shape: {name, duration} in seconds, named after the
+  // recipe. No AnyList call is made by the tap.
+  card.shadowRoot.dispatchClick(fakeTarget("start-timer", { seconds: "600" }));
+  await flush();
+  assert.match(card.shadowRoot.innerHTML, /Timer started:/);
+  assert.equal(hass.calls.filter((call) => call[0] === "anylist").length, 1);
+  assert.equal(hass.calls[1][0], "satellite_timers");
+  assert.equal(hass.calls[1][1], "start_timer");
+  assert.deepEqual(hass.calls[1][2], { name: "Creamy Tomato Pasta", duration: 600 });
+});
+
+test("a failed timer start keeps the honest reason and offers the voice alternative (RECIPE-17)", async () => {
+  const timed = {
+    ...PASTA_FULL,
+    preparation_steps: ["Boil the pasta for 10 minutes."],
+  };
+  const { card } = await loadedCard({
+    detail: timed,
+    fail: { start_timer: "Service satellite_timers.start_timer not found" },
+  });
+  card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+  await flush();
   card.shadowRoot.dispatchClick(fakeTarget("start-timer", { seconds: "600" }));
   await flush();
   assert.match(card.shadowRoot.innerHTML, /Couldn't start the timer/);
   assert.match(card.shadowRoot.innerHTML, /doesn't offer a start action yet/);
-  assert.equal(hass.calls.filter((call) => call[0] === "anylist").length, 1);
-  assert.equal(hass.calls[1][0], "satellite_timers");
-  assert.equal(hass.calls[1][1], "start_timer");
+  assert.match(card.shadowRoot.innerHTML, /Say 'Okay Nabu, start a 9 minute timer'/);
 });
 
 test("the step tracker pins below Home Assistant's header, not under it", async () => {
@@ -800,6 +863,14 @@ test("step section headers render as headings, not numbered steps", async () => 
 test("ingredient headings render as sub-headings in the detail view", async () => {
   const headed = {
     ...PASTA_FULL,
+    // Real-shaped data: the flat list and the entries carry the same
+    // ingredients (entries add the sections); the merge dedups them,
+    // so the list shows each ingredient once, in entry order.
+    ingredients: [
+      { name: "Cherry tomatoes", quantity: "400 g", note: "halved", raw_ingredient: "400 g cherry tomatoes, halved" },
+      { name: "Cream", quantity: "200 ml", note: "", raw_ingredient: "200 ml cream" },
+      { name: "Salt", quantity: "", note: "to taste", raw_ingredient: "Salt to taste" },
+    ],
     ingredient_entries: [
       { type: "section", name: "For the sauce" },
       { type: "ingredient", name: "Cherry tomatoes", quantity: "400 g", note: "halved", raw_ingredient: "400 g cherry tomatoes, halved" },
@@ -894,7 +965,7 @@ test("empty states, by cause: empty library, no-match search, empty collection",
   await flush();
   const noMatch = card.shadowRoot.querySelector(".empty");
   assert.equal(noMatch.querySelector(".empty-title").textContent, "No recipes match “pasta”.");
-  assert.match(noMatch.querySelector(".empty-sub").textContent, /different spelling/);
+  assert.match(noMatch.querySelector(".empty-sub").textContent, /ingredient or a dish name/);
   assert.match(noMatch.querySelector(".button").textContent, /Show all recipes/);
   card.shadowRoot.dispatchClick(fakeTarget("clear-search"));
   await flush();
@@ -986,10 +1057,15 @@ test("the card makes exactly ONE data call per view-open — the single get_reci
 // CSS keys the adaptive layout off them. The browser environment is
 // stubbed here (window/navigator do not exist in node).
 
-function stubWindow({ width, height, coarse, fine, touch, userAgent }) {
+function stubWindow({ width, height, coarse, fine, touch, userAgent, search = "" }) {
+  const pushed = [];
+  const dispatched = [];
   globalThis.window = {
     innerWidth: width,
     innerHeight: height,
+    location: { search },
+    history: { pushState: (_state, _title, url) => pushed.push(url) },
+    dispatchEvent: (event) => dispatched.push(event && event.type),
     matchMedia: (query) =>
       query === "(pointer: coarse)"
         ? { matches: coarse }
@@ -1004,6 +1080,7 @@ function stubWindow({ width, height, coarse, fine, touch, userAgent }) {
     maxTouchPoints: touch ? 5 : 0,
     userAgent,
   };
+  return { pushed, dispatched };
 }
 
 function clearWindow() {
@@ -1318,13 +1395,20 @@ test("the scaler leaves non-numeric quantities alone and hides when servings is 
     card.shadowRoot.querySelectorAll(".ingredient")[index].querySelector(".qty").textContent;
   assert.equal(qty(0), "125 g");
   assert.equal(qty(1), "a pinch");
-  // A freeform servings string has no clean base to scale from, so
-  // there is no scaler at all.
+  // A freeform servings string WITH a number ("4 servings") now
+  // parses (RECIPE-3: first number anywhere), so the scaler shows.
+  // Only a servings string with NO number has no base to scale from.
   const freeform = lightRecipe("rec-free", "Family Soup", { servings: "4 servings" });
   const second = await loadedCard({ recipes: [freeform], detail: freeform });
   second.card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-free" }));
   await flush();
-  assert.equal(second.card.shadowRoot.querySelector(".scaler"), null);
+  assert.ok(second.card.shadowRoot.querySelector(".scaler"));
+  assert.equal(second.card.shadowRoot.querySelector(".scaler-count").textContent, "4");
+  const noNumber = lightRecipe("rec-none", "Crowd Soup", { servings: "a crowd" });
+  const third = await loadedCard({ recipes: [noNumber], detail: noNumber });
+  third.card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-none" }));
+  await flush();
+  assert.equal(third.card.shadowRoot.querySelector(".scaler"), null);
 });
 
 test("re-opening a recipe resets the scaler to the stored servings", async () => {
@@ -1344,4 +1428,497 @@ test("re-opening a recipe resets the scaler to the stored servings", async () =>
     card.shadowRoot.querySelectorAll(".ingredient")[0].querySelector(".qty").textContent,
     "500 g"
   );
+});
+
+// -- v1.4.0 (RECIPE-1..25, NAV-1, deep link) -------------------------------
+//
+// A fake localStorage for the cook-state tests: a Map-backed store
+// the card reads and writes through the same global it uses in the
+// browser.
+function stubLocalStorage(seed = {}) {
+  const store = new Map(Object.entries(seed));
+  globalThis.localStorage = {
+    getItem: (key) => (store.has(key) ? store.get(key) : null),
+    setItem: (key, value) => store.set(key, String(value)),
+    removeItem: (key) => store.delete(key),
+  };
+  return store;
+}
+
+function clearLocalStorage() {
+  delete globalThis.localStorage;
+}
+
+test("the nav strip renders on list and detail, Recipes active, and navigates without reload (NAV-1)", async () => {
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    const { card } = await loadedCard();
+    const strip = card.shadowRoot.querySelector(".nav-strip");
+    assert.ok(strip);
+    const buttons = [...card.shadowRoot.querySelectorAll(".nav-strip-button")];
+    assert.deepEqual(
+      buttons.map((b) => b.textContent),
+      ["Home", "Timers", "Photos", "Recipes"]
+    );
+    const active = buttons[3];
+    assert.ok(active.classList.contains("active"));
+    assert.equal(active.getAttribute("aria-current"), "page");
+    // DOM-first: the strip is the first child of the screen (tab
+    // order), visually last via flex order.
+    const screen = card.shadowRoot.querySelector(".screen");
+    assert.equal(screen.children[0].classList.contains("nav-strip"), true);
+    // Tap Timers: pushState + location-changed, no reload.
+    card.shadowRoot.dispatchClick(fakeTarget("nav", { path: "/family-hub/timers" }));
+    await flush();
+    assert.deepEqual(nav.pushed, ["/family-hub/timers"]);
+    assert.deepEqual(nav.dispatched, ["location-changed"]);
+    // The strip is still there on the detail view.
+    card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+    await flush();
+    assert.ok(card.shadowRoot.querySelector(".nav-strip"));
+    // Hidden on desktop only: the CSS hides it under dev-desktop.
+    assert.match(card.shadowRoot.innerHTML, /\.screen\.dev-desktop \.nav-strip \{ display: none; \}/);
+    // Phone sizing: 48px buttons, 16px labels, 8px gap, nowrap.
+    assert.match(card.shadowRoot.innerHTML, /\.screen\.dev-mobile \.nav-strip-button \{ min-height: 48px;[^}]*font-size: 16px; white-space: nowrap; \}/);
+  } finally {
+    clearWindow();
+  }
+});
+
+test("a deep link ?recipe=<id>&step=<n> opens the recipe at that step", async () => {
+  stubWindow({ ...HUB_WINDOW, search: "?recipe=rec-pasta&step=2" });
+  try {
+    const { card } = await loadedCard();
+    assert.equal(card.shadowRoot.querySelector(".list-view").hidden, true);
+    assert.match(card.shadowRoot.innerHTML, /Step 2 of 3/);
+    assert.equal(card.shadowRoot.querySelectorAll(".step.current").length, 1);
+  } finally {
+    clearWindow();
+  }
+});
+
+test("the sort select reorders the list (RECIPE-19)", async () => {
+  const { card } = await loadedCard();
+  const names = () =>
+    [...card.shadowRoot.querySelectorAll(".row-name")].map((el) => el.textContent);
+  assert.deepEqual(names(), ["Creamy Tomato Pasta", "Rice Pudding", "Tomato Soup"]);
+  card.shadowRoot.dispatchChange({ dataset: { role: "sort" }, value: "cook" });
+  await flush();
+  assert.deepEqual(names(), ["Creamy Tomato Pasta", "Tomato Soup", "Rice Pudding"]);
+  card.shadowRoot.dispatchChange({ dataset: { role: "sort" }, value: "prep" });
+  await flush();
+  assert.deepEqual(names(), ["Rice Pudding", "Tomato Soup", "Creamy Tomato Pasta"]);
+  card.shadowRoot.dispatchChange({ dataset: { role: "sort" }, value: "rating" });
+  await flush();
+  assert.deepEqual(names(), ["Creamy Tomato Pasta", "Rice Pudding", "Tomato Soup"]);
+});
+
+test("Wake Lock is requested while the Cook tab is open and released on leaving it (RECIPE-8)", async () => {
+  let requested = 0;
+  let released = 0;
+  const sentinel = {
+    addEventListener: () => {},
+    release: () => {
+      released += 1;
+    },
+  };
+  globalThis.navigator = {
+    maxTouchPoints: 0,
+    userAgent: "",
+    wakeLock: {
+      request: async (type) => {
+        requested += 1;
+        assert.equal(type, "screen");
+        return sentinel;
+      },
+    },
+  };
+  try {
+    const { card } = await loadedCard();
+    card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+    await flush();
+    assert.equal(requested, 1);
+    assert.equal(card._wakeLock, sentinel);
+    card.shadowRoot.dispatchClick(fakeTarget("tab", { tab: "notes" }));
+    await flush();
+    assert.equal(released, 1);
+    assert.equal(card._wakeLock, null);
+    card.shadowRoot.dispatchClick(fakeTarget("tab", { tab: "cook" }));
+    await flush();
+    assert.equal(requested, 2);
+    card.disconnectedCallback();
+    assert.equal(released, 2);
+  } finally {
+    delete globalThis.navigator;
+  }
+});
+
+test("check-off and step persist across card instances, the scaler does not (RECIPE-9)", async () => {
+  stubLocalStorage();
+  try {
+    const first = await loadedCard();
+    first.card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+    await flush();
+    first.card.shadowRoot.dispatchClick(fakeTarget("toggle-ingredient", { index: "0" }));
+    first.card.shadowRoot.dispatchClick(fakeTarget("step-next"));
+    first.card.shadowRoot.dispatchClick(fakeTarget("scale-up"));
+    await flush();
+    assert.equal(first.card.shadowRoot.querySelector(".scaler-count").textContent, "5");
+    // A fresh card instance (same device storage) restores the cooking
+    // state but not the transient scaler.
+    const second = await loadedCard();
+    second.card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+    await flush();
+    assert.equal(second.card.shadowRoot.querySelectorAll(".ingredient.checked").length, 1);
+    assert.match(second.card.shadowRoot.innerHTML, /Step 2 of 3/);
+    assert.equal(second.card.shadowRoot.querySelector(".scaler-count").textContent, "4");
+  } finally {
+    clearLocalStorage();
+  }
+});
+
+test("cooking state older than 24h is discarded (RECIPE-9)", async () => {
+  const old = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
+  const store = stubLocalStorage({
+    "family-hub:recipe:rec-pasta:cook-state": JSON.stringify({
+      checked: [0, 1],
+      step: 2,
+      savedAt: old,
+    }),
+  });
+  try {
+    const { card } = await loadedCard();
+    card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+    await flush();
+    assert.equal(card.shadowRoot.querySelectorAll(".ingredient.checked").length, 0);
+    assert.match(card.shadowRoot.innerHTML, /Step 1 of 3/);
+    assert.equal(store.has("family-hub:recipe:rec-pasta:cook-state"), false);
+  } finally {
+    clearLocalStorage();
+  }
+});
+
+test("a failed photo load falls back to the initial-letter tile, list and detail hero (RECIPE-10)", async () => {
+  const { card } = await loadedCard();
+  const img = card.shadowRoot.querySelector(".thumb");
+  assert.ok(img);
+  assert.equal(img.tagName, "IMG");
+  const row = card.shadowRoot.querySelector(".row");
+  card.shadowRoot.dispatchError(img);
+  const tile = card.shadowRoot.querySelector(".thumb.missing");
+  assert.ok(tile);
+  assert.equal(tile.textContent.trim(), "C");
+  assert.equal(row.children[0], tile);
+  assert.equal(card.shadowRoot.querySelector("img"), null);
+  // The detail hero takes the same path.
+  card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+  await flush();
+  card.shadowRoot.dispatchClick(fakeTarget("tab", { tab: "details" }));
+  await flush();
+  const hero = card.shadowRoot.querySelector(".detail-photo");
+  assert.ok(hero);
+  assert.equal(hero.tagName, "IMG");
+  card.shadowRoot.dispatchError(hero);
+  const heroTile = card.shadowRoot.querySelector(".detail-photo.missing");
+  assert.ok(heroTile);
+  assert.equal(heroTile.textContent.trim(), "C");
+});
+
+test("tapping the active collection chip clears the filter (RECIPE-12)", async () => {
+  const { card } = await loadedCard();
+  assert.equal(card.shadowRoot.querySelectorAll(".row").length, 3);
+  card.shadowRoot.dispatchClick(fakeTarget("collection", { collectionId: "col-pasta" }));
+  await flush();
+  assert.equal(card.shadowRoot.querySelectorAll(".row").length, 1);
+  card.shadowRoot.dispatchClick(fakeTarget("collection", { collectionId: "col-pasta" }));
+  await flush();
+  assert.equal(card.shadowRoot.querySelectorAll(".row").length, 3);
+});
+
+test("the running-timer strip shows name + remaining and taps through to Timers (RECIPE-22)", async () => {
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    const states = [
+      {
+        entity_id: "sensor.satellite_timer_pasta",
+        state: "active",
+        attributes: {
+          timer_name: "Pasta",
+          finishes_at: new Date(Date.now() + 452000).toISOString(),
+        },
+      },
+      {
+        entity_id: "sensor.satellite_timer_soup",
+        state: "paused",
+        attributes: {
+          timer_name: "Soup",
+          finishes_at: new Date(Date.now() + 3600000).toISOString(),
+        },
+      },
+    ];
+    const { card } = await loadedCard({ states });
+    card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+    await flush();
+    const strip = card.shadowRoot.querySelector(".timer-strip");
+    assert.ok(strip);
+    const items = card.shadowRoot.querySelectorAll(".timer-strip-item");
+    assert.equal(items.length, 2);
+    assert.match(items[0].textContent, /Pasta/);
+    assert.match(items[0].textContent, /7:3\d/);
+    assert.ok(items[1].classList.contains("paused"));
+    // Tapping a strip item goes to the Timers view.
+    card.shadowRoot.dispatchClick(fakeTarget("goto-timers"));
+    await flush();
+    assert.deepEqual(nav.pushed, ["/family-hub/timers"]);
+    assert.deepEqual(nav.dispatched, ["location-changed"]);
+    card.disconnectedCallback();
+  } finally {
+    clearWindow();
+  }
+});
+
+test("the running-timer strip also works when hass.states is an object keyed by entity_id (RECIPE-22)", async () => {
+  // Live regression: on the rig (HA 2026.2.3) hass.states is a plain
+  // object, not an array — the array-only strip rendered zero items
+  // live while the unit tests (array states) passed.
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    const states = {
+      "sensor.satellite_timer_pasta": {
+        entity_id: "sensor.satellite_timer_pasta",
+        state: "active",
+        attributes: {
+          timer_name: "Pasta",
+          finishes_at: new Date(Date.now() + 452000).toISOString(),
+        },
+      },
+      "sensor.satellite_timer_soup": {
+        entity_id: "sensor.satellite_timer_soup",
+        state: "paused",
+        attributes: {
+          timer_name: "Soup",
+          finishes_at: new Date(Date.now() + 3600000).toISOString(),
+        },
+      },
+      "sensor.other": {
+        entity_id: "sensor.other",
+        state: "active",
+        attributes: {},
+      },
+    };
+    const { card } = await loadedCard({ states });
+    card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+    await flush();
+    const strip = card.shadowRoot.querySelector(".timer-strip");
+    assert.ok(strip);
+    const items = card.shadowRoot.querySelectorAll(".timer-strip-item");
+    assert.equal(items.length, 2);
+    assert.match(items[0].textContent, /Pasta/);
+    assert.match(items[0].textContent, /7:3\d/);
+    assert.ok(items[1].classList.contains("paused"));
+    card.disconnectedCallback();
+  } finally {
+    clearWindow();
+  }
+});
+
+test("the strip tick rewrites remaining times in place, never a full re-render (RECIPE-22)", async () => {
+  const states = [
+    {
+      entity_id: "sensor.satellite_timer_pasta",
+      state: "active",
+      attributes: {
+        timer_name: "Pasta",
+        finishes_at: new Date(Date.now() + 452000).toISOString(),
+      },
+    },
+  ];
+  const { card, hass } = await loadedCard({ states });
+  card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+  await flush();
+  const span = card.shadowRoot.querySelector(
+    '[data-remaining-for="sensor.satellite_timer_pasta"]'
+  );
+  assert.ok(span);
+  assert.match(span.textContent, /7:3\d/);
+  // Move the finish five minutes later and tick: the text changes,
+  // and the span is the SAME node (no re-render replaced it).
+  hass.states[0].attributes.finishes_at = new Date(Date.now() + 752000).toISOString();
+  card._tickStrip();
+  assert.match(span.textContent, /12:3\d/);
+  assert.equal(
+    card.shadowRoot.querySelector('[data-remaining-for="sensor.satellite_timer_pasta"]'),
+    span
+  );
+  card.disconnectedCallback();
+});
+
+test("a duration range is ONE chip starting the upper bound (RECIPE-6)", async () => {
+  const ranged = {
+    ...PASTA_FULL,
+    preparation_steps: ["Simmer for 6 to 8 minutes.", "Rest for 1 hour 30 minutes."],
+  };
+  const { card, hass } = await loadedCard({ detail: ranged });
+  card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+  await flush();
+  const chips = card.shadowRoot.querySelectorAll(".time-chip");
+  assert.equal(chips.length, 3);
+  assert.equal(chips[0].textContent, "6–8 minutes");
+  assert.equal(chips[0].dataset.seconds, "480");
+  card.shadowRoot.dispatchClick(fakeTarget("start-timer", { seconds: "480" }));
+  await flush();
+  assert.deepEqual(hass.calls[1][2], { name: "Creamy Tomato Pasta", duration: 480 });
+});
+
+test("the scaler shows the factor and toggles back to the original amounts (RECIPE-1/2)", async () => {
+  const { card } = await loadedCard();
+  card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+  await flush();
+  const qty = () =>
+    card.shadowRoot.querySelectorAll(".ingredient")[0].querySelector(".qty").textContent;
+  card.shadowRoot.dispatchClick(fakeTarget("scale-up"));
+  card.shadowRoot.dispatchClick(fakeTarget("scale-up"));
+  await flush();
+  // 4 → 6 servings: factor ×1 ½, 500 g penne shows 750 g.
+  assert.match(card.shadowRoot.innerHTML, /×1 ½/);
+  assert.equal(qty(), "750 g");
+  assert.match(card.shadowRoot.innerHTML, /Reset to 4/);
+  // Show original: the stored quantities return, the factor stays shown.
+  card.shadowRoot.dispatchClick(fakeTarget("scale-original"));
+  await flush();
+  assert.equal(qty(), "500 g");
+  assert.match(card.shadowRoot.innerHTML, /×1 ½/);
+  assert.match(card.shadowRoot.innerHTML, /Show scaled/);
+  card.shadowRoot.dispatchClick(fakeTarget("scale-original"));
+  await flush();
+  assert.equal(qty(), "750 g");
+  assert.match(card.shadowRoot.innerHTML, /Show original/);
+});
+
+test("a quantity the scaler cannot parse is flagged, never silently dropped (RECIPE-2)", async () => {
+  const broken = lightRecipe("rec-broken", "Broken Soup", {
+    servings: "4",
+    ingredients: [
+      { name: "Flour", quantity: "1/0 cup", note: "", raw_ingredient: "1/0 cup flour" },
+      { name: "Sugar", quantity: "100 g", note: "", raw_ingredient: "100 g sugar" },
+    ],
+    preparation_steps: ["Mix."],
+  });
+  const { card } = await loadedCard({ recipes: [broken], detail: broken });
+  card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-broken" }));
+  await flush();
+  card.shadowRoot.dispatchClick(fakeTarget("scale-up"));
+  await flush();
+  const rows = card.shadowRoot.querySelectorAll(".ingredient");
+  assert.equal(rows[0].querySelector(".qty").textContent, "1/0 cup");
+  assert.match(rows[0].textContent, /check this one/);
+  assert.equal(rows[1].querySelector(".qty").textContent, "125 g");
+});
+
+test("a scaled count gets a usable instruction (RECIPE-2)", async () => {
+  const eggy = lightRecipe("rec-eggy", "Eggy Pasta", {
+    servings: "4",
+    ingredients: [
+      { name: "Eggs", quantity: "2 eggs", note: "", raw_ingredient: "2 eggs" },
+      { name: "Flour", quantity: "500 g", note: "", raw_ingredient: "500 g flour" },
+    ],
+    preparation_steps: ["Mix."],
+  });
+  const { card } = await loadedCard({ recipes: [eggy], detail: eggy });
+  card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-eggy" }));
+  await flush();
+  const qty = () =>
+    card.shadowRoot.querySelectorAll(".ingredient")[0].querySelector(".qty").textContent;
+  const rowText = () =>
+    card.shadowRoot.querySelectorAll(".ingredient")[0].textContent;
+  // 4 → 2 servings: 2 eggs become 1 egg (whole, no note).
+  card.shadowRoot.dispatchClick(fakeTarget("scale-down"));
+  card.shadowRoot.dispatchClick(fakeTarget("scale-down"));
+  await flush();
+  assert.equal(qty(), "1 egg");
+  assert.doesNotMatch(rowText(), /beat 1 egg/);
+  // 4 → 3 servings: 2 eggs become 1 ½ eggs — beat 2 and use half of them.
+  card.shadowRoot.dispatchClick(fakeTarget("scale-up"));
+  await flush();
+  assert.equal(qty(), "1 ½ eggs");
+  assert.match(rowText(), /beat 2 eggs and use ½ of them/);
+});
+
+test("a servings range moves both ends and resets to the range (RECIPE-3)", async () => {
+  const ranged = lightRecipe("rec-ranged", "Ranged Soup", {
+    servings: "Serves 4–6",
+    ingredients: [{ name: "Stock", quantity: "1 l", note: "", raw_ingredient: "1 l stock" }],
+    preparation_steps: ["Simmer."],
+  });
+  const { card } = await loadedCard({ recipes: [ranged], detail: ranged });
+  card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-ranged" }));
+  await flush();
+  assert.equal(card.shadowRoot.querySelector(".scaler-count").textContent, "4–6");
+  card.shadowRoot.dispatchClick(fakeTarget("scale-up"));
+  await flush();
+  assert.equal(card.shadowRoot.querySelector(".scaler-count").textContent, "5–7");
+  assert.match(card.shadowRoot.innerHTML, /Reset to 4–6/);
+});
+
+test("a flat-string-only recipe shows its ingredients (RECIPE-24)", async () => {
+  const flat = lightRecipe("rec-flat", "Flat Soup", {
+    servings: "4",
+    ingredients: ["1 kg tomatoes", "1 onion, diced", "Salt to taste"],
+    preparation_steps: ["Simmer everything."],
+  });
+  const { card } = await loadedCard({ recipes: [flat], detail: flat });
+  card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-flat" }));
+  await flush();
+  assert.equal(card.shadowRoot.querySelectorAll(".ingredient").length, 3);
+  assert.match(card.shadowRoot.innerHTML, /tomatoes/);
+  assert.doesNotMatch(card.shadowRoot.innerHTML, /No ingredients listed/);
+});
+
+test("chips wrap at every viewport and rows cannot force the grid wide (RECIPE-25, D-RECIPE-2, ORIENT-9)", async () => {
+  const { card } = await loadedCard();
+  const css = card.shadowRoot.querySelector("style").textContent;
+  assert.match(css, /\.chips \{[^}]*flex-wrap: wrap;[^}]*overflow-x: visible;/);
+  assert.match(css, /\.chip \{[^}]*white-space: normal;[^}]*overflow-wrap: break-word;/);
+  assert.match(css, /\.list \{[^}]*grid-template-columns: minmax\(0, 1fr\);/);
+  assert.match(css, /\.row \{[^}]*min-width: 0;/);
+  assert.match(css, /\.mini-pill \{[^}]*white-space: normal;/);
+  assert.doesNotMatch(css, /@media \(min-width: 1200px\)/);
+  // The search field cannot be squeezed out of the toolbar (RECIPE-18).
+  assert.match(css, /\.search \{[^}]*min-width: 0;/);
+  // Time chips are at least 56px on the hub, 48px on the phone (RECIPE-15).
+  assert.match(css, /\.time-chip \{[^}]*min-height: 56px;/);
+  assert.match(css, /\.screen\.dev-mobile \.time-chip \{ min-height: 48px; \}/);
+  // In kiosk mode the step tracker pins at top: 0 (RECIPE-16).
+  assert.match(css, /\.screen\.kiosk \.step-tracker \{ top: 0; \}/);
+  // Non-current steps dim to 0.8, not 0.5 (RECIPE-13).
+  assert.match(css, /\.step \{[^}]*opacity: 0\.8;/);
+});
+
+test("the kiosk URL carries the kiosk class so the tracker pins at top 0 (RECIPE-16)", async () => {
+  stubWindow({ ...HUB_WINDOW, search: "?kiosk" });
+  try {
+    const { card } = await loadedCard();
+    const screen = card.shadowRoot.querySelector(".screen");
+    assert.ok(screen.classList.contains("kiosk"));
+    assert.ok(screen.classList.contains("dev-hub"));
+  } finally {
+    clearWindow();
+  }
+});
+
+test("step text scales with the recipe, time phrases untouched (RECIPE-23)", async () => {
+  const stepped = {
+    ...PASTA_FULL,
+    preparation_steps: ["Add 2 cups of stock and simmer for 9 minutes."],
+  };
+  const { card } = await loadedCard({ detail: stepped });
+  card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+  await flush();
+  card.shadowRoot.dispatchClick(fakeTarget("scale-up"));
+  card.shadowRoot.dispatchClick(fakeTarget("scale-up"));
+  await flush();
+  // 4 → 6 servings: 2 cups become 3 cups; the 9 minutes stay 9 minutes.
+  assert.match(card.shadowRoot.innerHTML, /Add 3 cups of stock/);
+  assert.match(card.shadowRoot.innerHTML, /9 minutes/);
+  assert.equal(card.shadowRoot.querySelectorAll(".time-chip").length, 1);
 });

@@ -6,6 +6,95 @@ and the version numbers follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Releases
 are tagged `vX.Y.Z`.
 
+## [1.4.0] - 2026-11-08
+
+### Added
+
+- Serving scaler rewritten (RECIPE-1/2/3): proper fraction arithmetic
+  with Unicode fractions ("½", "1½"), mixed numbers, rounding to the
+  nearest ⅛ (incl. ⅜, ⅝, ⅞ and ⅓, ⅔) with a "≈" marker, tidy-unit
+  conversion (48 tsp → 1 cup, 3 tsp → 1 tbsp, tbsp → cup at ≥¼ cup),
+  ranges scaled at both ends, compounds piece by piece, unquantified
+  quantities left as written, unparseable quantities flagged "check
+  this one", scaled counts get a usable instruction ("½ egg — beat 1
+  egg and use half"). The scaler bar shows the factor ("×2") and a
+  "Show original" / "Show scaled" toggle. Servings parse by "first
+  number ANYWHERE" ("Serves 4", "Makes 12 muffins", "Yield: 8") and
+  ranges ("4–6") move both ends on the stepper. Quantities in step
+  text scale too (RECIPE-23); time phrases are untouched.
+- Details tab restored (RECIPE-7): photo hero (with the initial-letter
+  fallback), metadata line, and every stored field — prep, cook,
+  total, servings as stored, rating (stars + "4/5"), collections,
+  source (link when a URL). The cooking header shows the total time
+  ("Total 45 min · Prep 15 min · Cook 30 min").
+- Wake Lock (RECIPE-8): requested while the Cook tab is open,
+  released on tab change, back, or disconnect; re-requested when the
+  page becomes visible again. Any rejection is silent.
+- Cooking state persists (RECIPE-9): check-off and current step are
+  saved to localStorage (`family-hub:recipe:<id>:cook-state`) and
+  restored on open, with a 24h expiry. The scaler stays transient by
+  design.
+- Photo fallback (RECIPE-10): a failed photo load (list row or detail
+  hero) is replaced by the initial-letter tile via a capture-phase
+  error listener, instead of the image silently disappearing.
+- Flat-string ingredients now render (RECIPE-24): `ingredients` lists
+  are parsed and merged with `ingredient_entries` (RECIPE-11), entries
+  first, deduped by normalized text across lists only.
+- Running-timer strip (RECIPE-22): every running timer (name +
+  remaining) at the top of the cooking view; tapping one goes to the
+  Timers view. The remaining times tick once a second in place, never
+  by full re-render, so a note draft is never wiped.
+- Sort control (RECIPE-19): name, rating, cook time, prep time.
+- Voice hint (RECIPE-20): "Say 'Okay Nabu, start a 9 minute timer'"
+  sits next to the timer chips.
+- Navigation strip (NAV-1): Home / Timers / Photos / Recipes on every
+  view (list and detail), DOM-first, sticky at the bottom, hidden on
+  desktop only, navigating via history.pushState + location-changed.
+- Deep link (Phase 3 contract): `?recipe=<id>&step=<n>` (and
+  `?from_recipe=<id>&step=<n>`) opens the recipe at the given step.
+- Time-unit resolution (RECIPE-V1): prep/cook times are SECONDS — the
+  card was right, the audit fixture stored minutes. Times now render
+  correctly against live-shaped data.
+
+### Changed
+
+- Timer chips now call the bridge's `start_timer` with
+  `{name, duration}` (duration in seconds) (RECIPE-5). A range ("6 to
+  8 minutes") is ONE chip starting the upper bound (RECIPE-6).
+- Search now searches everywhere — title, ingredients, steps, notes,
+  source — with all query words required and title > ingredient >
+  step ranking (RECIPE-4). Empty state: "Try an ingredient or a dish
+  name."
+- Timer failure text keeps the honest reason and offers the voice
+  alternative (RECIPE-17).
+- Collection chips toggle off when tapped again (RECIPE-12).
+- Non-current steps dim to 0.8 (RECIPE-13). Muted text #57534E, stars
+  #B45309, error #B71C1C (RECIPE-14); time chips ≥56px hub / ≥48px
+  phone (RECIPE-15); step tracker pins at top: 0 in kiosk mode
+  (RECIPE-16); `.search` gets `min-width: 0` (RECIPE-18).
+- Collection chips and row pills wrap at ALL viewports; the list grid
+  uses `minmax(0, 1fr)` tracks and rows carry `min-width: 0` (RECIPE-25,
+  D-RECIPE-2, ORIENT-9). The desktop 3-column breakpoint at 1200px is
+  removed (it spilled 166px past a 1200px-wide portrait viewport).
+- Device detection is the unified rule (spec §3.7, P8-16): the exact
+  1920×1200 panel signature first, then tablet user agents, mobile
+  UA, width <768px, the 768–1024px touch band (tablet), fine pointer
+  + width ≥1024px (desktop — a touchscreen laptop is desktop, OQ-7),
+  coarse with no fine pointer (mobile). The old touch + ≥1600px =
+  hub rule is deleted: only the exact panel signature is the hub, so
+  a 1920×1080 touchscreen laptop no longer reads as the hub (V1080-01).
+
+### Fixed
+
+- The running-timer strip read `hass.states` as an array; the live
+  frontend (HA 2026.10.4) hands cards the states as a plain object
+  keyed by entity_id, so the strip rendered zero timers live
+  (RECIPE-22). It now accepts both shapes.
+- Flat-string-only recipes with a repeated ingredient line rendered
+  the duplicate rows (RECIPE-11): the entries/flat merge now always
+  runs, so a flat-only recipe's internal duplicates collapse
+  ("Garlic 2 cloves" twice renders 3 rows, not 5).
+
 ## [1.3.0] - 2026-11-03
 
 ### Added
