@@ -111,7 +111,8 @@ const RECIPE = [
   ["targets", "target-time-chip-hub-min", (v) => new RegExp(`\\.time-chip \\{[^}]*min-height: ${esc(v)};`)],
   ["targets", "target-time-chip-phone-min", (v) => `.screen.dev-mobile .time-chip { min-height: ${v}; }`],
   ["targets", "target-tablet-min", (v) => `.screen.dev-tablet .tab { min-height: ${v};`],
-  ["targets", "target-hub-min", (v) => new RegExp(`\\.nav-strip-button \\{[^}]*min-height: ${esc(v)};`)],
+  // target-hub-min was the strip button's min-height — the strip
+  // buttons are the full bar height now (D-N1, wave 1); see skipped.
   // Icons: the search SVG carries its intrinsic size in the markup
   // (width='24'%20height='24' — URL-encoded, %20 separators, not
   // spaces); the rendered size is set by background-size (26px hub,
@@ -193,6 +194,7 @@ test("DESIGN-1 Part B: the skipped-token list is explicit and complete", () => {
     "targets.target-desktop-min", // the only 44px desktop declaration is the chip, already asserted as target-chip-desktop
     "targets.target-dial-min-hub", // timer card
     "targets.target-hub-max", // range cap; no 80px declaration in this card
+    "targets.target-hub-min", // wave 1 (D-N1): strip buttons are the full bar height, no min-height
     "targets.target-note-delete-min", // no note-delete control in this card
     "targets.target-phone-max", // range cap; no declaration caps phone targets at 56px (mobile tab/star are 56px minimums, not caps)
     "targets.target-phone-min", // the only 48px mobile declarations are the chip/time-chip, already asserted as target-chip-mobile/target-time-chip-phone-min

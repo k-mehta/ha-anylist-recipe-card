@@ -6,6 +6,26 @@ and the version numbers follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Releases
 are tagged `vX.Y.Z`.
 
+## [1.5.0] - 2026-11-11
+
+Family Hub redo, Recipes wave 1 (R-IMPL-1–60) against the locked design.
+
+### Added
+
+- Picture-in-picture timer notice (PIP): 5 s auto-hide with a 300 ms fade, swipe-collapse to a restore affordance, tap goes to Timers with the timer pinned first and marked "Just started", finished timers return as a PIP that never auto-hides, most-recent timer plus a "+N more running" count, × dismisses without cancelling the timer. Chip taps start a timer in place and never navigate; a voice-started timer shows the PIP via the sensor-set diff on `started_via`.
+- Single horizontally scrollable chip row (the chips wall is gone); first-screen counts hold at the design targets at 390×844, 360×640, 844×390, 667×375, 640×360 and 1920×1080.
+- Sticky detail header (back + tabs) with the step tracker pinned beneath it; sticky one-line running-timer summary; timer strip capped at 3 pills plus "+N more running".
+- Finish flow: the last step's button reads "Finish", a completion card ("All done!") offers "Cook again" and "← Back to recipe", and "Start over" clears checks and resets to step 1.
+- Honest note/rating save: the card only reports "Note saved." / "Rating saved." when the backend returns a usable recipe; otherwise it says "Couldn't save — tap to retry", keeps the draft, and offers a tappable retry.
+- Route split: tap-open pushes one detail history entry, strip Recipes closes to the list top and pushes one list entry, system back re-opens a detail at its saved step, and reload re-opens a detail at its saved step with scroll at the top.
+- Total-time line ("Total 35 min · Prep 15 min · Cook 20 min") — the wire values are seconds (OQ-9, RECIPE-V1).
+
+### Fixed
+
+- Ingredient rows no longer clip at the right edge on 390 px phones (NAV-O4): names wrap.
+- The PIP pin now carries the timer's `timer_id` attribute, which is what the Timers card matches for the pinned-first render and the "Just started" marker (previously it carried the sensor `entity_id`, which never matched).
+- A swipe the compositor claims for scrolling (ending in `touchcancel`, not `touchend`) now collapses the PIP and resumes the auto-hide clock instead of leaving the PIP up indefinitely.
+
 ## [1.4.1] - 2026-11-08
 
 ### Fixed

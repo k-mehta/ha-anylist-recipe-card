@@ -37,11 +37,23 @@
 // so removing it later is deleting the file and its Lovelace resource
 // (see README.md).
 //
-// Version 1.4.0 — see CHANGELOG.md.
+// Version 1.5.0 — see CHANGELOG.md.
 
 // How long to wait after the last keystroke before searching, so one
 // search runs per pause in typing instead of one per letter.
 const SEARCH_DEBOUNCE_MS = 300;
+// PIP (D3, R-IMPL-17–22): the floating timer indicator auto-hides
+// 5 s after it appears, fading out over 300 ms; a finished timer's
+// PIP never auto-hides. A touch on the PIP suspends the 5 s clock
+// until the touch ends. A swipe of ≥40 px in any direction collapses
+// the PIP to its restore affordance.
+const PIP_AUTO_HIDE_MS = 5000;
+const PIP_FADE_MS = 300;
+const PIP_SWIPE_PX = 40;
+// The Timers card's pin key (T-IMPL-20, published by the Timers
+// wave): the recipe card writes {timerId} here when the user taps a
+// PIP; the Timers card reads it once per mount and clears it.
+const TIMERS_PIN_KEY = "family-hub:timers:pin";
 // Tap targets: search field, tabs and row buttons are 64px tall; chips
 // never go below 56px. The pixel values live in the CSS below.
 
@@ -359,20 +371,21 @@ function normalizeRecipe(raw) {
     sourceUrl: asTrimmed(source.source_url),
     servings: asTrimmed(source.servings),
     // Times arrive as plain numbers of SECONDS (protobuf fields 18/19).
-    // RECIPE-V1, resolved Nov 8, 2026: the exporter's canonical JSON
-    // labels these fields "prep_time_minutes", but that label traces
-    // only to the anylist_rs setter docs ("Set prep time in minutes")
-    // — the crate performs NO conversion anywhere: the value goes to
-    // the wire verbatim, and the wire value is seconds. The AnyList
-    // integration agrees: its client reads fields 18/19 raw and its
-    // store/sync name the columns prep_time_seconds /
-    // cook_time_seconds. The live list proved it: a "10 Minute"
-    // recipe arrives as prep_time 300, cook_time 300 — 300 + 300
-    // seconds is 10 minutes; 300 + 300 minutes would be 10 hours.
-    // The audit fixture stores minutes, which is why the rig showed
-    // "Cook 1 min" for a 30-minute cook: the fixture is wrong, not
-    // the card. The model keeps seconds; formatDuration converts at
-    // display time.
+    // OQ-9 (RECIPE-V1) — RESOLVED in the Recipes wave-1 build
+    // (Nov 11, 2026), three independent sources: (a) the AnyList
+    // integration source — client.py:870 reads fields 18/19 raw with
+    // no conversion, sync.py:124 stores them as prep_time_seconds,
+    // store.py:64-65 names the columns prep_time_seconds /
+    // cook_time_seconds, __init__.py:428 serializes them as
+    // "prep_time"; (b) the rig fixture generator's header, "prep_time
+    // / cook_time in SECONDS"; (c) the design's own R4 step 2 expects
+    // "Total 35 min · Prep 15 min · Cook 20 min" for the 900/1200
+    // recipe — true only in seconds. The exporter's canonical-JSON
+    // label "prep_time_minutes" (canonical.rs:82) passes the raw
+    // value through unconverted — the label is the misnomer, not the
+    // value. The total-time line ships on the strength of this.
+    // The model keeps seconds; formatDuration converts at display
+    // time.
     prepTime: asInt(source.prep_time),
     cookTime: asInt(source.cook_time),
     // Rating is a whole number from 1 to 5 (anylist_rs clamps it).
@@ -1222,8 +1235,10 @@ function readDeviceEnv() {
 // prefixes with "kitchen_hub ".
 
 // The voice alternative, word for word (RECIPE-17, RECIPE-20): the
-// hint near the timer chips and the fallback in the timer-failure
-// message are the same sentence.
+// last-resort fallback in the timer-failure message when the chip
+// carries no duration phrase of its own. The hint near the timer
+// chips is computed per step now (voiceHintForStep, N-IMPL-19c) —
+// this constant is NOT the detail hint any more.
 const VOICE_HINT = "Say 'Okay Nabu, start a 9 minute timer'";
 
 // Seconds left as the kitchen reads it: "7:32" under an hour,
@@ -1280,12 +1295,19 @@ function timerName(timer) {
 // one key per entity, NOT an array — the array-only version of this
 // helper silently returned no timers live, RECIPE-22). Both shapes
 // are accepted so the strip works whichever the frontend gives.
+// The timer sensors as a list, whatever shape hass.states arrives
+// in: an array on most setups, a plain object keyed by entity_id on
+// the live rig (HA 2026.2.3) — the array-only strip rendered zero
+// items live while the unit tests (array states) passed. Every
+// sensor iteration in the card goes through here.
+function timerSensorList(states) {
+  if (Array.isArray(states)) return states;
+  if (states && typeof states === "object") return Object.values(states);
+  return [];
+}
+
 function runningTimers(states) {
-  const list = Array.isArray(states)
-    ? states
-    : states && typeof states === "object"
-      ? Object.values(states)
-      : [];
+  const list = timerSensorList(states);
   const timers = list.filter(
     (item) =>
       item &&
@@ -1327,6 +1349,220 @@ function isKioskMode(search) {
   return /(?:^|[?&])kiosk(?:[=&]|$)/.test(query);
 }
 
+// -- shared helpers (wave 1) --------------------------------------------
+//
+// Kiosk as a session property (N-IMPL-10 / ambiguity E): every in-app
+// navigation carries ?kiosk in the URL (primary — a same-tab reload
+// URL already has it); the flag is stored in sessionStorage key
+// family-hub:kiosk (per-tab) as backstop; on load, if the flag is set
+// but the URL lacks ?kiosk, the card does ONE location.replace adding
+// ?kiosk. Card JS cannot hide HA chrome before first paint, so a
+// bare-URL paint may flash chrome once before the re-apply reload —
+// that is the honest bound, not a defect to hide. A fresh tab, browser
+// restart, or second device re-establishes kiosk only via the WIZ-8
+// start URL (http://homeassistant.local:8123/family-hub?kiosk, launcher
+// ~/.local/bin/family-hub-kiosk.sh). The same block is duplicated in
+// the reference strip, the Home card, and the Timers card — the four
+// copies must stay identical; if you change the key, the storage, or
+// the re-apply, change them in the other cards too.
+const KIOSK_SESSION_KEY = "family-hub:kiosk";
+
+function readKioskFlag() {
+  if (typeof sessionStorage === "undefined") return false;
+  try {
+    return sessionStorage.getItem(KIOSK_SESSION_KEY) === "1";
+  } catch (_err) {
+    return false;
+  }
+}
+
+function storeKioskFlag() {
+  if (typeof sessionStorage === "undefined") return;
+  try {
+    sessionStorage.setItem(KIOSK_SESSION_KEY, "1");
+  } catch (_err) {
+    // Storage blocked: kiosk still works for this load (the URL has
+    // ?kiosk); only the same-tab reload re-apply is lost.
+  }
+}
+
+// True when this tab session is a kiosk session: the URL says so, or
+// the stored flag says so.
+function isKioskSession(search) {
+  return isKioskMode(search) || readKioskFlag();
+}
+
+// Append ?kiosk to an in-app path when this tab session is kiosk,
+// preserving any query string already on the path. Never adds a second
+// kiosk param.
+function withKioskQuery(path) {
+  const target = String(path || "/family-hub");
+  if (!isKioskSession(typeof window !== "undefined" && window.location ? window.location.search || "" : "")) return target;
+  const [base, query] = target.split("?");
+  if (!query) return `${base}?kiosk`;
+  const params = query.split("&");
+  if (params.some((part) => part === "kiosk" || part.indexOf("kiosk=") === 0)) return target;
+  return `${base}?${query}&kiosk`;
+}
+
+// Re-apply kiosk on load when the stored flag is set but the URL lacks
+// ?kiosk. Returns true when a re-apply reload was started.
+function reapplyKioskIfNeeded() {
+  if (typeof window === "undefined" || !window.location) return false;
+  if (!readKioskFlag()) return false;
+  if (isKioskMode(window.location.search || "")) return false;
+  const url = withKioskQuery(
+    `${window.location.pathname || "/family-hub"}${window.location.search || ""}${window.location.hash || ""}`
+  );
+  try {
+    window.location.replace(url);
+  } catch (_err) {
+    return false;
+  }
+  return true;
+}
+
+// -- Timers count badge (D-N1 / N-IMPL-5) ---------------------------------
+//
+// The badge counts ACTIVE + PAUSED timers (coordinator decision #25-D:
+// a paused timer still needs the user's attention; excluding it would
+// make the badge lie by omission). Colour is driven by running/finished
+// only: amber = a RUNNING timer in its last 60 s; red = any finished
+// timer. Finished-only reading (recorded, flagged for the implementation
+// review): when active+paused is 0 but a finished timer exists, the
+// badge shows the finished count in red — the only reading under which
+// both "counts ACTIVE + PAUSED" and "red when a timer has finished"
+// hold. Returns null when there is nothing to show (no badge at zero).
+// `timers` is [{state, remaining}] with remaining in live seconds.
+function timerBadgeState(timers) {
+  let count = 0;
+  let finished = 0;
+  let soon = false;
+  for (const timer of timers || []) {
+    if (!timer || typeof timer.state !== "string") continue;
+    if (timer.state === "active" || timer.state === "paused") count += 1;
+    if (timer.state === "finished") finished += 1;
+    // Soon is a RUNNING timer in its last 60 s — a paused timer with
+    // 30 s left is paused, not soon.
+    if (timer.state === "active" && Number(timer.remaining) <= 60) soon = true;
+  }
+  if (count === 0 && finished === 0) return null;
+  const shown = count === 0 ? finished : count;
+  return {
+    count: shown,
+    tone: finished > 0 ? "finished" : soon ? "soon" : "count",
+  };
+}
+
+// Badge input from hass states: the bridge sensors
+// sensor.satellite_timer_* carry state active/paused/finished and a
+// `remaining` attribute in seconds.
+function timerBadgeFromHassStates(states) {
+  if (!states) return null;
+  const timers = [];
+  for (const key of Object.keys(states)) {
+    if (key.indexOf("sensor.satellite_timer_") !== 0) continue;
+    const state = states[key];
+    if (!state) continue;
+    const attrs = state.attributes || {};
+    timers.push({ state: state.state, remaining: Number(attrs.remaining) || 0 });
+  }
+  return timerBadgeState(timers);
+}
+
+// -- Night mode (D-N10 / N-IMPL-24) ---------------------------------------
+//
+// Night mode is a setting with a schedule; the user sets the hours —
+// there are NO default hours. Stored in localStorage
+// family-hub:night-mode = {"start":"HH:MM","end":"HH:MM"}; absent or
+// invalid means night mode is off. The strip stays usable at night
+// (dimmed palette, same targets, same labels, same active state);
+// night mode never changes navigation behaviour. A finished timer
+// still wakes and rings at night; a finished-but-not-ringing timer
+// does NOT suppress firing at night (user ruling §2 item 1) — that
+// half is the screensaver guard's job, not the strip's.
+const NIGHT_SETTING_KEY = "family-hub:night-mode";
+
+function parseNightSetting(raw) {
+  if (typeof raw !== "string" || !raw) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (_err) {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+  const toMinutes = (value) => {
+    if (typeof value !== "string") return null;
+    const m = /^(\d{1,2}):(\d{2})$/.exec(value.trim());
+    if (!m) return null;
+    const h = Number(m[1]);
+    const min = Number(m[2]);
+    if (h < 0 || h > 23 || min < 0 || min > 59) return null;
+    return h * 60 + min;
+  };
+  const start = toMinutes(parsed.start);
+  const end = toMinutes(parsed.end);
+  if (start === null || end === null || start === end) return null;
+  return { start, end };
+}
+
+function readNightSetting() {
+  if (typeof localStorage === "undefined") return null;
+  try {
+    return parseNightSetting(localStorage.getItem(NIGHT_SETTING_KEY));
+  } catch (_err) {
+    return null;
+  }
+}
+
+// Pure: is `date` inside the night schedule? Handles overnight spans
+// (start > end, e.g. 22:00–06:00) and same-day spans (e.g. 00:00–06:00).
+function isNightNow(setting, date) {
+  if (!setting) return false;
+  const now = date instanceof Date ? date : new Date();
+  const minutes = now.getHours() * 60 + now.getMinutes();
+  if (setting.start < setting.end) {
+    return minutes >= setting.start && minutes < setting.end;
+  }
+  return minutes >= setting.start || minutes < setting.end;
+}
+
+// -- Recipe voice hint (N-IMPL-19c) ---------------------------------------
+//
+// The hint is computed from the CURRENT step, never hardcoded: if the
+// step has a time chip, "Say 'Okay Nabu, start a {duration} timer'"
+// with the chip's duration — the upper bound for a range ("6–8
+// minutes" → "8 minute timer"; "60 seconds" → "60 second timer").
+// If the step has NO time chip, there is no hint (null). The first
+// duration phrase in the step wins. The same function reads a timer
+// chip's label for the _startTimer failure message, so the fallback
+// never names a duration the chip does not have.
+function voiceHintForStep(stepText) {
+  const text = asTrimmed(stepText);
+  if (!text) return null;
+  DURATION_RE.lastIndex = 0;
+  const match = DURATION_RE.exec(text);
+  if (!match) return null;
+  let amount = null;
+  let unit = null;
+  if (match[1] !== undefined) {
+    // A range: the upper bound.
+    amount = match[2];
+    unit = match[3];
+  } else if (match[4] !== undefined) {
+    amount = match[4];
+    unit = match[5];
+  } else {
+    amount = "1";
+    unit = match[7];
+  }
+  const n = Number(amount);
+  const amountText = Number.isFinite(n) && Number.isInteger(n) ? String(n) : String(amount).trim();
+  const singular = pluralTimeUnit(unit).replace(/s$/, "");
+  return `Say 'Okay Nabu, start a ${amountText} ${singular} timer'`;
+}
+
 function readLocationSearch() {
   if (typeof window === "undefined" || !window.location) return "";
   return String(window.location.search || "");
@@ -1350,9 +1586,24 @@ function sanitizeRecipeScroll(value) {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
 }
 
+// The session step is 1-based ("Step N of M", the number the cook
+// sees, the same form as ?step= in the URL). Anything else is null
+// (no saved step).
+function sanitizeRecipeStep(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : null;
+}
+
 // Parse a stored session; garbage and wrong shapes become null
 // (nothing saved), a valid object becomes a clean state. An openId
 // that is not a non-empty string becomes null (list view).
+// Fields (R-IMPL-14): openId, step (1-BASED — the "Step N of M" number
+// the cook sees, the same numbering as ?step= in the URL and as the
+// Timers card's readBackRecipeContext passes through; the spec's
+// "0-based" contradicts the merged cross-area contract, so 1-based
+// stands — see the implementation report, resolution #13),
+// listScrollY, detailScrollY (written, NEVER read for a restore —
+// D2d), query, collectionId, sort.
 function parseRecipeSession(raw) {
   if (typeof raw !== "string" || !raw) return null;
   let parsed;
@@ -1363,10 +1614,17 @@ function parseRecipeSession(raw) {
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
   const openId = typeof parsed.openId === "string" && parsed.openId.trim() ? parsed.openId.trim() : null;
+  const query = typeof parsed.query === "string" ? parsed.query : "";
+  const collectionId = typeof parsed.collectionId === "string" ? parsed.collectionId : "";
+  const sort = typeof parsed.sort === "string" && ["name", "rating", "cook", "prep"].includes(parsed.sort) ? parsed.sort : "name";
   return {
     openId,
+    step: sanitizeRecipeStep(parsed.step),
     listScrollY: sanitizeRecipeScroll(parsed.listScrollY),
     detailScrollY: sanitizeRecipeScroll(parsed.detailScrollY),
+    query,
+    collectionId,
+    sort,
   };
 }
 
@@ -1376,8 +1634,17 @@ function serializeRecipeSession(state) {
       state && typeof state.openId === "string" && state.openId.trim()
         ? state.openId.trim()
         : null,
+    step: sanitizeRecipeStep(state && state.step),
     listScrollY: sanitizeRecipeScroll(state && state.listScrollY),
     detailScrollY: sanitizeRecipeScroll(state && state.detailScrollY),
+    query: state && typeof state.query === "string" ? state.query : "",
+    collectionId:
+      state && typeof state.collectionId === "string" ? state.collectionId : "",
+    sort:
+      state && typeof state.sort === "string" &&
+      ["name", "rating", "cook", "prep"].includes(state.sort)
+        ? state.sort
+        : "name",
   });
 }
 
@@ -1395,6 +1662,16 @@ const CARD_CSS = `
     padding: 28px 36px;
     background: #FAF7F4;
     color: #1C1917;
+    /* Sticky-band heights (D2c, R-IMPL-7): the sticky detail header
+       (back row + tabs row) and the step tracker, per device class.
+       The tracker pins directly under the header, so its top is the
+       header height (+ the 56 px HA bar in non-kiosk). Base (hub):
+       header = 16 pad + 72 button + 12 gap + (72 tab + 12 tabbar
+       pad) = 184 px; tracker = 72 button + 24 pad + 2 border = 98 px.
+       Mobile/tablet: 152/82 px; desktop: 144/78 px (52 px buttons
+       and tabs). The per-class rules below override these. */
+    --detail-header-h: 184px;
+    --tracker-h: 98px;
     --accent: #C2410C;
     --ink: #1C1917;
     --muted: #57534E;
@@ -1443,6 +1720,10 @@ const CARD_CSS = `
     flex-direction: column;
     gap: 24px;
   }
+  /* Fixed-strip reserves (N-IMPL-20): content bottom padding is the
+     strip height + 8px, so the last row scrolls clear of the strip. */
+  .screen.dev-hub .list,
+  .screen.dev-hub .detail { padding-bottom: 104px; }
   .title {
     font-size: 36px;
     font-weight: 700;
@@ -1526,17 +1807,18 @@ const CARD_CSS = `
     border-radius: 12px;
   }
   .button:disabled { opacity: 0.5; cursor: default; }
-  /* Collection chips wrap at EVERY viewport (D-RECIPE-2, ORIENT-9):
-     the row never scrolls sideways, and a single chip wider than the
-     container wraps its own text instead of running off the edge —
-     the 43-character collection name that clipped mid-word at
-     390×844 and the 166px overflow at 1200×1920 both come from a
-     chip (or a pill inside a row) that could not wrap. */
+  /* Collection chips are ONE horizontally scrollable row (D1, R-IMPL-1):
+     flex-wrap: nowrap, overflow-x: auto, min-width: 0. The wrap rule
+     (D-RECIPE-2) is DEAD — it produced the chips wall (22 chips, zero
+     recipes on the first screen) and must never be re-applied at any
+     viewport. A cut-off chip at the right edge is the scroll
+     affordance, kept deliberately; the fade below marks it. */
   .chips {
     display: flex;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
     gap: 10px;
-    overflow-x: visible;
+    overflow-x: auto;
+    min-width: 0;
     scrollbar-width: none;
     -ms-overflow-style: none;
     padding: 2px;
@@ -1571,7 +1853,9 @@ const CARD_CSS = `
     color: #fff;
     box-shadow: var(--shadow-accent);
   }
-  .status { font-size: 20px; color: var(--muted); padding: 0; }
+  /* Count line: wraps to two lines; a long query in quotes wraps,
+     never clips (D7). */
+  .status { font-size: 20px; color: var(--muted); padding: 0; overflow-wrap: anywhere; }
   .error { font-size: 22px; color: var(--error); padding: 0; }
   /* The list is a grid that uses the width it is given: one column on
      narrow screens, two from 1000px, three from 1500px. The Recipes
@@ -1679,6 +1963,23 @@ const CARD_CSS = `
      lives only in the list (where it helps you pick a recipe) and
      the metadata does not belong while cooking. So there is no
      .detail-photo and no .detail-meta rule at all. */
+  /* The detail header — back button + tabs — is STICKY (D2c, R-IMPL-7):
+     no scroll position can put back or the tabs off-screen. The title
+     sits below it and scrolls away (a title can wrap to five lines,
+     so it cannot live in a fixed-height sticky band — see the
+     implementation report, resolution #14). The header pins below
+     Home Assistant's 56 px bar in non-kiosk, at top: 0 in kiosk. */
+  .detail-header {
+    position: sticky;
+    top: var(--header-height, 56px);
+    z-index: 3;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    background: #FAF7F4;
+    padding-bottom: 4px;
+  }
+  .screen.kiosk .detail-header { top: 0; }
   .detail-name {
     font-size: 40px;
     font-weight: 700;
@@ -1695,8 +1996,10 @@ const CARD_CSS = `
      failed save never drops the typed note, so the text stays in
      the editor to try again. The rating is five big star buttons
      plus Clear; tapping one saves it at once. The serving scaler
-     lives in the Cook tab, not here. */
-  .note-view { display: flex; flex-direction: column; gap: 24px; }
+     lives in the Cook tab, not here. Bottom padding: the detail
+     already reserves strip + 8 px; the Notes tab adds 16 px more,
+     so the action row clears the strip by ≥ strip + 16 px (D6b). */
+  .note-view { display: flex; flex-direction: column; gap: 24px; padding-bottom: 16px; }
   .note-label,
   .rating-label,
   .scaler-label {
@@ -1731,6 +2034,20 @@ const CARD_CSS = `
        the recipe identity, not for confirmation. Errors stay red
        (see the .error rule below). */
     color: var(--success);
+  }
+  /* An unconfirmed save (R-IMPL-39) renders the status as a tappable
+     retry button: same type as the span, underlined so it reads as a
+     control, no button chrome. */
+  button.note-status,
+  button.rating-status {
+    background: none;
+    border: none;
+    padding: 0;
+    font: inherit;
+    color: var(--error);
+    text-decoration: underline;
+    cursor: pointer;
+    text-align: left;
   }
   .note-status.error,
   .rating-status.error { color: var(--error); }
@@ -1869,7 +2186,9 @@ const CARD_CSS = `
   /* Quantities take the accent colour: they separate from the name at
      a glance, and the colour is the card's single restrained accent. */
   .ingredient .qty { flex: 0 0 auto; font-weight: 700; white-space: nowrap; color: var(--accent); }
-  .ingredient .ing-name { flex: 1; min-width: 0; overflow-wrap: break-word; }
+  /* Ingredient names wrap at word boundaries (D5a); overflow-wrap:
+     anywhere breaks mid-word only for a token longer than the line. */
+  .ingredient .ing-name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
   .ingredient .ing-note { color: var(--muted); font-size: 20px; }
   /* Section headings are set apart from the rows: smaller, uppercase,
      letterspaced, secondary colour — a label, not another ingredient. */
@@ -1884,8 +2203,8 @@ const CARD_CSS = `
   .ingredient-section:first-child { padding-top: 0; }
   /* Steps are a guided walkthrough: one current step, the rest dimmed.
      The current step is a raised card with a filled accent number; the
-     others are plain text at half opacity. Tap any step to make it
-     current. Step numbers are rendered in the markup (span.step-num),
+     others are plain text, dimmed modestly (0.8 — RECIPE-13: 0.75–0.85,
+     never 0.5). Tap any step to make it current. Step numbers are rendered in the markup (span.step-num),
      not a CSS counter, so a headed step list numbers only the
      navigable steps. */
   .steps { display: flex; flex-direction: column; gap: 8px; margin: 0; padding: 0; list-style: none; }
@@ -1893,6 +2212,7 @@ const CARD_CSS = `
     display: flex;
     gap: 18px;
     align-items: flex-start;
+    min-width: 0;
     min-height: 76px;
     padding: 18px 16px;
     font-size: 26px;
@@ -1901,6 +2221,10 @@ const CARD_CSS = `
     border: 1px solid transparent;
     cursor: pointer;
     opacity: 0.8;
+    /* A step change scrolls the step just below the sticky tracker
+       (D2b, R-IMPL-6): the margin is the tracker band + 16 px gap,
+       so the step's top never hides under the tracker. */
+    scroll-margin-top: calc(var(--header-height, 56px) + var(--detail-header-h, 184px) + var(--tracker-h, 98px) + 16px);
   }
   .step.current {
     opacity: 1;
@@ -1926,7 +2250,11 @@ const CARD_CSS = `
     background: var(--accent);
     color: #fff;
   }
-  .step-text { flex: 1; min-width: 0; white-space: pre-wrap; overflow-wrap: break-word; }
+  /* Step text wraps at word boundaries inside the viewport (D4 rule 8):
+     overflow-wrap: anywhere breaks mid-word ONLY when a single token is
+     longer than the line itself — the fallback for a genuinely
+     unbreakable string (ambiguity #7), never the normal path. */
+  .step-text { flex: 1; min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
   .step-header {
     padding: 18px 4px 4px;
     font-size: 24px;
@@ -1962,17 +2290,34 @@ const CARD_CSS = `
     color: var(--accent);
     padding: 4px 4px 8px;
   }
-  /* The cooking view puts ingredients and steps together: two columns
-     on the hub (ingredients left, steps right — the cook needs both
-     at once), one stacked column on a phone (ingredients above steps).
-     The columns align at the top so a short ingredient list does not
-     stretch the steps column. */
+  /* The cooking view puts ingredients and steps together. Whether it
+     is two-column is keyed on VIEWPORT WIDTH and the hub-panel
+     signature, not device class (D9, R-IMPL-49): phone widths (<900 px)
+     are single column always; tablet widths (900–~1100 px) are
+     two-column (ingredients left, tracker + steps right); wider
+     non-hub viewports (>~1100 px) are single column; the hub panel
+     (dev-hub, either orientation) is two-column. The exact ~1100 px
+     boundary is unmeasured (OQ-2) — the media query below is the
+     starting hypothesis, to be re-decided from measurement if it
+     contradicts. The ingredient column is never narrower than ~220 px:
+     in the 900–1100 px band the 5fr share is ≥328 px by construction,
+     so the minimum never binds there; it is stated here as the guard,
+     not a second breakpoint. */
   .cook-grid {
     display: grid;
-    grid-template-columns: minmax(0, 5fr) minmax(0, 7fr);
+    grid-template-columns: minmax(0, 1fr);
     gap: 40px;
     align-items: start;
   }
+  @media (min-width: 900px) and (max-width: 1100px) {
+    .cook-grid { grid-template-columns: minmax(220px, 5fr) minmax(0, 7fr); }
+  }
+  .screen.dev-hub .cook-grid { grid-template-columns: minmax(220px, 5fr) minmax(0, 7fr); }
+  /* Every grid/flex item in the detail chain carries min-width: 0
+     (D4 rule 1), so no item's min-content can force the detail wider
+     than the viewport. */
+  .cook-ingredients, .cook-steps { min-width: 0; }
+  .timer-strip { min-width: 0; }
   .cook-head {
     display: flex;
     align-items: baseline;
@@ -1994,18 +2339,17 @@ const CARD_CSS = `
   /* The step tracker is the "Step N of M" bar with Prev/Next. It is
      sticky, so your place in the steps stays visible while the steps
      scroll — on a phone, where the ingredients sit above the steps,
-     it pins to the top once you reach the steps. It pins BELOW Home
-     Assistant's own header, not at the very top: the header is 56 px
-     tall and stays fixed while the page scrolls, so a top of 0 would
-     slide the tracker underneath it and hide it. HA exposes the
-     header height as --header-height (56 px here); the 56 px fallback
-     covers a Home Assistant that does not define it. It is a card on
-     the screen background, so content scrolling under it stays hidden.
-     In kiosk mode (?kiosk) the HA header is hidden, so the tracker
-     pins at top: 0 (RECIPE-16) — otherwise it leaves a dead 56px gap. */
+     it pins to the top once you reach the steps. It pins directly
+     under the sticky detail header (D2c): below Home Assistant's own
+     header plus the header band in non-kiosk, below the header band
+     alone in kiosk (RECIPE-16's bare top: 0 is the pre-header value —
+     with a sticky header above it the tracker pins at the header's
+     bottom; see the implementation report, resolution #15). It is a
+     card on the screen background, so content scrolling under it
+     stays hidden. */
   .step-tracker {
     position: sticky;
-    top: var(--header-height, 56px);
+    top: calc(var(--header-height, 56px) + var(--detail-header-h, 184px));
     z-index: 2;
     display: flex;
     align-items: center;
@@ -2017,8 +2361,12 @@ const CARD_CSS = `
     border-radius: 16px;
     box-shadow: var(--shadow-card);
   }
+  /* Tracker label: min-width: 0 (D4 rule 7) so the row is Prev + label
+     + Next and fits at 360 px — the label never forces the tracker
+     wider than the viewport. */
   .step-position {
     flex: 1;
+    min-width: 0;
     text-align: center;
     font-size: 22px;
     font-weight: 700;
@@ -2026,43 +2374,79 @@ const CARD_CSS = `
     white-space: nowrap;
   }
   .step-nav { flex: 0 0 auto; }
-  .screen.kiosk .step-tracker { top: 0; }
-  /* -- Navigation strip (NAV-1) ---------------------------------------
+  .screen.kiosk .step-tracker { top: var(--detail-header-h, 184px); }
+  /* In kiosk there is no 56 px HA bar, so the step scroll-margin
+     drops it too. */
+  .screen.kiosk .step { scroll-margin-top: calc(var(--detail-header-h, 184px) + var(--tracker-h, 98px) + 16px); }
+  /* -- Navigation strip (NAV-1, D-N1; wave 1) ---------------------------
      The persistent strip, FIRST in the DOM (tab order) and visually
-     last (flex order 2, sticky to the bottom while scrolling). Noun
-     labels, Home first, the current view (Recipes, on this card) with
-     the accent background, heavier weight, and aria-current. Hidden
-     on DESKTOP only, where HA tabs already exist and work; always
-     shown on hub AND phone. */
+     last (fixed to the viewport bottom). The reference strip
+     (family-hub-nav-strip.js) is the base; this card mirrors it:
+     a solid dark bar, white labels, inactive labels at 70% opacity,
+     the current view with the accent background, heavier weight, and
+     aria-current. Bar heights: hub 96px, tablet 72px, phone 64px +
+     safe-area, desktop 56px (desktop hides the strip — NAV-1 — so
+     no height rule there). Buttons are the full bar height, flush
+     (no gap, no radius, no border, no shadow). The timer-count badge
+     (N-IMPL-5, decision #25-D: ACTIVE + PAUSED; amber = a running
+     timer in its last 60 s, red = any finished timer) sits on the
+     Timers button; it is updated by _updateStripBadge. */
   .nav-strip {
-    order: 2;
-    position: sticky;
+    position: fixed;
     bottom: 0;
-    z-index: 40;
-    padding: 16px 0 4px;
-    background: #FAF7F4;
+    left: 0;
+    width: 100%;
+    height: 96px;
+    z-index: 60;
+    padding: 0;
+    background: #171717;
   }
-  .nav-strip-buttons { display: flex; gap: 16px; }
+  .nav-strip-buttons { display: flex; gap: 0; height: 100%; }
   .nav-strip-button {
     flex: 1;
     min-width: 0;
-    min-height: 64px;
-    padding: 12px 20px;
-    border-radius: 16px;
-    border: 1px solid var(--line);
-    background: var(--card);
-    box-shadow: var(--shadow-card);
-    color: var(--ink);
+    height: 100%;
+    padding: 0;
+    border: none;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+    color: rgba(255, 255, 255, 0.7);
     font-size: 24px;
     font-weight: 700;
     cursor: pointer;
     font-family: inherit;
     overflow-wrap: break-word;
+    position: relative;
+    transition: transform 100ms ease-out;
   }
-  .nav-strip-button:hover { box-shadow: var(--shadow-lift); }
-  .nav-strip-button:active { transform: scale(0.98); }
-  .nav-strip-button.active { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 800; }
-  .nav-strip-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .nav-strip-button:active { transform: scale(0.97); }
+  .nav-strip-button.active { background: var(--accent); color: #fff; font-weight: 800; }
+  .nav-strip-button:focus-visible { outline: 3px solid #fff; outline-offset: 2px; }
+  .nav-strip .timer-badge {
+    position: absolute;
+    top: 8px;
+    right: calc(50% - 44px);
+    min-width: 24px;
+    height: 24px;
+    padding: 0 6px;
+    border-radius: 12px;
+    background: #fff;
+    color: #171717;
+    font-size: 14px;
+    font-weight: 800;
+    line-height: 24px;
+    text-align: center;
+    pointer-events: none;
+  }
+  .nav-strip .timer-badge.soon { background: #B45309; color: #fff; }
+  .nav-strip .timer-badge.finished { background: #B91C1C; color: #fff; }
+  /* Night (N-IMPL-24): the strip stays usable — same targets, dimmed
+     palette. Hours are a defined setting, not a default (see
+     readNightSetting); absent = off. */
+  .screen.night .nav-strip { background: #0A0A0A; }
+  .screen.night .nav-strip-button { color: rgba(255, 255, 255, 0.55); }
+  .screen.night .nav-strip-button.active { background: #7C2D12; }
   /* Total time in the cooking view header (RECIPE-7): prep + cook,
      with the breakdown beside it. Only rendered when at least one
      time exists. */
@@ -2102,7 +2486,11 @@ const CARD_CSS = `
     text-align: left;
   }
   .timer-strip-item:active { transform: scale(0.99); }
-  .timer-strip-name { flex: 1; min-width: 0; overflow-wrap: break-word; }
+  /* Pill names may break anywhere (D4 rule 2: overflow-wrap: anywhere
+     is the only value that reduces min-content, so a 58-char name can
+     never force the layout wider); the countdown never clips — the name
+     takes the ellipsis, the time does not. */
+  .timer-strip-name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
   .timer-strip-remaining {
     flex: 0 0 auto;
     font-variant-numeric: tabular-nums;
@@ -2211,10 +2599,16 @@ const CARD_CSS = `
      desktop, tablet and mobile. A card with no device classes (no
      browser environment) renders the hub layout. */
   /* Desktop: a mouse is precise, so targets shrink and the grid gets
-     denser — three columns from 1200px, four from 1700px. Hover states
-     from the base rules still apply. The cooking view keeps two
-     columns (the desktop is wide), at desktop type sizes. */
+     denser — three columns from 1500px (D1920 = 3 columns, 12 cards;
+     there is no four-column rule — R-IMPL-3 deleted the 1700px one).
+     Hover states from the base rules still apply. The cooking view
+     keeps two columns (the desktop is wide), at desktop type sizes. */
   .screen.dev-desktop { font-size: 18px; padding: 20px 28px; }
+  /* Sticky-band heights, desktop (R-IMPL-7): header 144 px, tracker
+     78 px (52 px buttons and tabs). Kept as a separate rule so the
+     one-line device rule above stays byte-identical for the token
+     tests. */
+  .screen.dev-desktop { --detail-header-h: 144px; --tracker-h: 78px; }
   .screen.dev-desktop .title { font-size: 28px; }
   .screen.dev-desktop .search { min-height: 52px; font-size: 19px; padding: 10px 20px 10px 52px; background-size: 22px 22px; }
   .screen.dev-desktop .button { min-height: 52px; font-size: 18px; padding: 10px 20px; }
@@ -2249,14 +2643,25 @@ const CARD_CSS = `
   .screen.dev-desktop .scaler-btn { min-width: 52px; min-height: 52px; font-size: 22px; padding: 8px 12px; }
   .screen.dev-desktop .cook-grid { gap: 32px; }
   /* Desktop: the nav strip is hidden (HA tabs already exist and work
-     there — NAV-1). The list grid keeps the base breakpoints: three
-     columns from 1500px, four from 1700px. A three-column grid at
-     1200px spilled 166px past a 1200px-wide portrait viewport
-     (RECIPE-25) — the breakpoint is the viewport, the content is
-     narrower, so the grid must not go three-wide until 1500px. */
+     there — NAV-1) ONLY when NOT in kiosk mode: in kiosk mode HA tabs
+     do not exist, so a desktop-class viewport in kiosk mode would have
+     ZERO navigation with the strip hidden (the kiosk-desktop hole,
+     same as the timer card's). The strip therefore shows in kiosk
+     mode at 56px, with the 64px reserve (56 + 8). The list grid keeps
+     the base breakpoints: three columns from 1500px (no four-column
+     rule — R-IMPL-3). A three-column grid at 1200px spilled 166px past
+     a 1200px-wide portrait viewport (RECIPE-25) — the breakpoint is
+     the viewport, the content is narrower, so the grid must not go
+     three-wide until 1500px. */
   .screen.dev-desktop .nav-strip { display: none; }
+  .screen.dev-desktop.kiosk .nav-strip { display: block; height: 56px; }
+  .screen.dev-desktop.kiosk .list,
+  .screen.dev-desktop.kiosk .detail { padding-bottom: 64px; }
   .screen.dev-desktop .sort { min-height: 52px; font-size: 18px; padding: 10px 16px; }
-  @media (min-width: 1700px) { .screen.dev-desktop .list { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+  /* Desktop list grid: three columns from 1500px (D1920 = 3 columns,
+     12 cards — R-IMPL-3). There is no four-column rule: the old
+     1700px four-column grid contradicts the design's first-screen
+     table, so it is deleted, not widened. */
   /* Tablet (DESIGN-9; OQ-4 confirmed by Phase 7): tablet type =
      desktop type (the recipe card has no clock, so OQ-4's clock
      exception does not apply here); targets 56-64px (spec §3.2) —
@@ -2264,12 +2669,14 @@ const CARD_CSS = `
      to 56px here (chips 44->56, tabs 52->56, sort 52->56, stars
      52->56, scaler buttons 52->56, search/buttons 52->56). The nav
      strip is SHOWN on tablet (hidden on desktop only, NAV-1). The
-     strip is sticky to the viewport bottom while the page scrolls,
-     so the list and the detail carry bottom padding equal to the
-     strip height (76px: 16px top pad + 56px button + 4px bottom
-     pad) — otherwise the sticky strip covers the last row's buttons
-     at the viewport's bottom edge (Phase 7 bottom-edge fix). */
+     strip is fixed to the viewport bottom, so the list and the
+     detail carry bottom padding equal to the strip height + 8px
+     (80px for the 72px tablet strip) — otherwise the strip covers
+     the last row's buttons at the viewport's bottom edge. */
   .screen.dev-tablet { font-size: 20px; padding: 20px 28px; }
+  /* Sticky-band heights, tablet (R-IMPL-7): header 152 px, tracker
+     82 px (56 px buttons and tabs). Separate rule, as above. */
+  .screen.dev-tablet { --detail-header-h: 152px; --tracker-h: 82px; }
   .screen.dev-tablet .title { font-size: 28px; }
   .screen.dev-tablet .search { min-height: 56px; font-size: 19px; padding: 10px 20px 10px 52px; background-size: 22px 22px; }
   .screen.dev-tablet .button { min-height: 56px; font-size: 18px; padding: 10px 20px; }
@@ -2279,8 +2686,8 @@ const CARD_CSS = `
   .screen.dev-tablet .skeleton-row { min-height: 88px; }
   .screen.dev-tablet .skeleton-thumb { width: 68px; height: 68px; }
   .screen.dev-tablet .row-name { font-size: 20px; }
-  .screen.dev-tablet .detail { max-width: 1200px; padding-bottom: 76px; }
-  .screen.dev-tablet .list { padding-bottom: 76px; }
+  .screen.dev-tablet .detail { max-width: 1200px; padding-bottom: 80px; }
+  .screen.dev-tablet .list { padding-bottom: 80px; }
   .screen.dev-tablet .detail-name { font-size: 32px; }
   .screen.dev-tablet .tab { min-height: 56px; font-size: 18px; }
   .screen.dev-tablet .ingredient { min-height: 56px; font-size: 19px; padding: 12px 8px; }
@@ -2307,24 +2714,26 @@ const CARD_CSS = `
   .screen.dev-tablet .sort { min-height: 56px; font-size: 18px; padding: 10px 16px; }
   .screen.dev-tablet .time-chip { min-height: 56px; }
   .screen.dev-tablet .timer-strip-item { min-height: 56px; font-size: 19px; padding: 10px 16px; }
-  .screen.dev-tablet .nav-strip-button { min-height: 56px; padding: 10px 16px; font-size: 20px; }
+  .screen.dev-tablet .nav-strip { height: 72px; }
+  .screen.dev-tablet .nav-strip-button { font-size: 20px; }
   /* Mobile: touch targets stay large (a finger is not a mouse), the
      type stays readable, and the grid is one column in portrait so
      nothing overflows or clips. The detail view takes the full width;
      the cooking view stacks (ingredients above steps) with the step
      tracker sticky, so your place stays visible while you scroll. */
   .screen.dev-mobile { font-size: 18px; padding: 16px; }
+  /* Sticky-band heights, mobile (R-IMPL-7): header 152 px, tracker
+     82 px (56 px buttons and tabs). Separate rule, as above. */
+  .screen.dev-mobile { --detail-header-h: 152px; --tracker-h: 82px; }
   .screen.dev-mobile .title { font-size: 26px; }
   .screen.dev-mobile .search { min-height: 56px; font-size: 18px; padding: 10px 16px 10px 48px; background-size: 22px 22px; background-position: 14px center; }
   .screen.dev-mobile .button { min-height: 56px; font-size: 18px; padding: 10px 18px; }
   .screen.dev-mobile .chip { min-height: 48px; font-size: 17px; padding: 6px 16px; }
-  /* On a phone the collection chips wrap onto a second row instead of
-     scrolling sideways: a cut-off chip at the screen edge is too easy
-     to miss, and vertical space is cheap on a scrolling list. The
-     wrap only kicks in when the chips do not fit on one row, so wider
-     mobile screens (tablets) keep a single row. */
-  .screen.dev-mobile .chips { flex-wrap: wrap; overflow-x: visible; }
-  .screen.dev-mobile .chips.scrollable { -webkit-mask-image: none; mask-image: none; }
+  /* On a phone the collection chips are one scrollable row (D1): the
+     wrap override that produced the chips wall is deleted with it —
+     a cut-off chip at the screen edge is the scroll affordance, and
+     the row is exactly one chip tall. */
+  .screen.dev-mobile .chips.scrollable { -webkit-mask-image: linear-gradient(to right, #000 0, #000 calc(100% - 48px), transparent 100%); mask-image: linear-gradient(to right, #000 0, #000 calc(100% - 48px), transparent 100%); }
   .screen.dev-mobile .row { min-height: 88px; padding: 12px 14px; gap: 12px; }
   .screen.dev-mobile .thumb { width: 64px; height: 64px; }
   .screen.dev-mobile .skeleton-row { min-height: 88px; }
@@ -2334,7 +2743,7 @@ const CARD_CSS = `
   .screen.dev-mobile .detail { max-width: none; }
   .screen.dev-mobile .detail-name { font-size: 28px; }
   .screen.dev-mobile .tab { min-height: 56px; font-size: 18px; padding: 8px 6px; }
-  .screen.dev-mobile .cook-grid { grid-template-columns: 1fr; gap: 32px; }
+  .screen.dev-mobile .cook-grid { gap: 32px; }
   .screen.dev-mobile .section-title { font-size: 22px; }
   .screen.dev-mobile .cook-count { font-size: 17px; }
   .screen.dev-mobile .ingredient { min-height: 60px; font-size: 19px; padding: 12px 8px; }
@@ -2361,18 +2770,17 @@ const CARD_CSS = `
   .screen.dev-mobile .sort { min-height: 56px; font-size: 18px; padding: 10px 14px; }
   /* Phone timer chips are at least 48px tall (RECIPE-15). */
   .screen.dev-mobile .time-chip { min-height: 48px; }
-  /* Phone nav strip (NAV-1): 48px buttons, 16px labels, 8px gap,
-     nowrap — four 18px labels wrapped mid-word at 390px ("Timer s" /
-     "Photo s" / "Recip es"), so the strip is 16px + nowrap. */
-  .screen.dev-mobile .nav-strip { padding: 12px 0 0; }
-  .screen.dev-mobile .nav-strip-buttons { gap: 8px; }
-  .screen.dev-mobile .nav-strip-button { min-height: 48px; padding: 8px 6px; font-size: 16px; white-space: nowrap; }
-  /* Phase 7 bottom-edge fix (mobile strip is 60px: 12px top pad +
-     48px button): the list and the detail carry bottom padding
-     equal to the strip height, so the last row can scroll clear of
-     the sticky strip. */
-  .screen.dev-mobile .list { padding-bottom: 60px; }
-  .screen.dev-mobile .detail { padding-bottom: 60px; }
+  /* Phone nav strip (NAV-1, D-N1 wave 1): 64px bar + safe-area,
+     16px labels, nowrap — four 18px labels wrapped mid-word at
+     390px ("Timer s" / "Photo s" / "Recip es"), so the strip is
+     16px + nowrap. */
+  .screen.dev-mobile .nav-strip { height: calc(64px + env(safe-area-inset-bottom, 0px)); }
+  .screen.dev-mobile .nav-strip-button { font-size: 16px; white-space: nowrap; }
+  /* Bottom-edge fix (mobile strip is 64px + safe-area): the list
+     and the detail carry bottom padding equal to the strip height
+     + 8px, so the last row can scroll clear of the fixed strip. */
+  .screen.dev-mobile .list { padding-bottom: 72px; }
+  .screen.dev-mobile .detail { padding-bottom: 72px; }
   .screen.dev-mobile .timer-strip-item { min-height: 56px; font-size: 19px; padding: 10px 16px; }
   .screen.dev-mobile .cook-total { font-size: 20px; }
   .screen.dev-mobile .detail-rows { font-size: 19px; }
@@ -2380,13 +2788,185 @@ const CARD_CSS = `
   .screen.dev-mobile .detail-photo.missing { min-height: 180px; font-size: 72px; }
   /* Landscape phone/tablet: two columns, but only when the viewport is
      wide enough for two readable columns — a narrow landscape phone
-     keeps the single column. */
-  @media (min-width: 640px) { .screen.dev-mobile.orient-landscape .list { grid-template-columns: repeat(2, 1fr); } }
+     keeps the single column. Tracks are minmax(0, 1fr) (D4 rule 1):
+     a bare 1fr is minmax(auto, 1fr) and the auto minimum is the widest
+     item's min-content. */
+  @media (min-width: 640px) { .screen.dev-mobile.orient-landscape .list { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  /* Phone landscape: a single 48 px header row (R-IMPL-2) — the
+     "Recipes" heading is omitted (the strip already says where you
+     are); the search field on the left, the single scrollable chip
+     row filling the middle, and the count ("382 recipes") inlined as
+     compact text at the right end of that same row, never on its own
+     line. Content height = viewport − 56 px top bar − 60 px strip;
+     the 48 px header leaves ≥1 full recipe row at every landscape
+     size. The sort control rides inside the toolbar next to the
+     search field. */
+  .screen.dev-mobile.orient-landscape .title { display: none; }
+  .screen.dev-mobile.orient-landscape .list-view {
+    display: grid;
+    grid-template-columns: minmax(0, 5fr) minmax(0, 7fr) auto;
+    grid-template-areas: "toolbar chips status" "body body body";
+    gap: 8px 12px;
+    align-items: center;
+  }
+  .screen.dev-mobile.orient-landscape .toolbar { grid-area: toolbar; min-width: 0; }
+  .screen.dev-mobile.orient-landscape .chips { grid-area: chips; }
+  .screen.dev-mobile.orient-landscape .status { grid-area: status; white-space: nowrap; font-size: 16px; }
+  .screen.dev-mobile.orient-landscape .body { grid-area: body; min-width: 0; }
+  .screen.dev-mobile.orient-landscape .search { min-height: 48px; }
+  .screen.dev-mobile.orient-landscape .sort { min-height: 48px; }
+  .screen.dev-mobile.orient-landscape .chip { min-height: 48px; }
+  /* -- PIP: the floating timer indicator (D3, R-IMPL-17–22) -----------
+     One floating card: timer name (ellipsised to fit, never clipped
+     mid-word without an ellipsis), remaining time ticking (mm:ss,
+     always fully visible — the time is never the part that gets cut),
+     state, and a "+N more" count when several timers run. Bottom-centre
+     above the nav strip on phones (thumb zone), bottom-right above the
+     strip on wall/desktop, above the safe-area band; never covering
+     the tracker or the current step — steps scroll beneath it. Max
+     width 80% of the viewport on phones (312 px at 390 px), 360 px on
+     wall/desktop. The × is a ≥48 px tap target on phones (56–64 px
+     hub) at the right end, after the remaining time, inside the PIP
+     bounds. */
+  .pip, .pip-affordance {
+    position: fixed;
+    z-index: 70;
+    left: 50%;
+    transform: translateX(-50%);
+    bottom: calc(64px + env(safe-area-inset-bottom, 0px) + 16px);
+  }
+  .pip {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    max-width: 80vw;
+    min-height: 56px;
+    padding: 6px 6px 6px 18px;
+    box-sizing: border-box;
+    border-radius: 999px;
+    border: 1px solid #F3D9C8;
+    background: #FDEFE6;
+    color: var(--ink);
+    box-shadow: var(--shadow-lift);
+    cursor: pointer;
+    font-family: inherit;
+    transition: opacity 300ms ease-out;
+  }
+  .pip.hide { opacity: 0; pointer-events: none; }
+  .pip-icon { flex: 0 0 auto; font-size: 22px; }
+  .pip-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 20px; font-weight: 700; }
+  .pip-time { flex: 0 0 auto; font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--accent); white-space: nowrap; }
+  .pip-more { flex: 0 0 auto; font-size: 18px; font-weight: 700; color: var(--muted); white-space: nowrap; }
+  .pip-dismiss {
+    flex: 0 0 auto;
+    width: 48px;
+    height: 48px;
+    min-width: 48px;
+    padding: 0;
+    border: none;
+    border-radius: 50%;
+    background: transparent;
+    color: var(--muted);
+    font-size: 22px;
+    font-weight: 700;
+    line-height: 1;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .pip-dismiss:active { transform: scale(0.94); }
+  /* Wall/desktop: bottom-right, max 360 px. Tablet: above the 72 px
+     strip. Desktop non-kiosk has no strip, so the PIP sits 16 px
+     above the viewport bottom; desktop kiosk has the 56 px strip. */
+  .screen.dev-hub .pip, .screen.dev-hub .pip-affordance { left: auto; right: 24px; transform: none; bottom: 112px; }
+  .screen.dev-hub .pip { max-width: 360px; }
+  .screen.dev-hub .pip-dismiss, .screen.dev-tablet .pip-dismiss { width: 56px; height: 56px; min-width: 56px; }
+  .screen.dev-tablet .pip, .screen.dev-tablet .pip-affordance { bottom: 88px; }
+  .screen.dev-desktop .pip, .screen.dev-desktop .pip-affordance { left: auto; right: 24px; transform: none; bottom: 16px; }
+  .screen.dev-desktop .pip { max-width: 360px; }
+  .screen.dev-desktop.kiosk .pip, .screen.dev-desktop.kiosk .pip-affordance { bottom: 72px; }
+  /* Minimized restore affordance (R-IMPL-22): a small floating pill
+     showing the timer icon + remaining time (or "Done" for a finished
+     timer), in the same corner as the PIP. Tap it to restore the full
+     PIP; it never navigates and never cancels the timer. */
+  .pip-affordance {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 48px;
+    padding: 6px 18px;
+    box-sizing: border-box;
+    border-radius: 999px;
+    border: 1px solid #F3D9C8;
+    background: #FDEFE6;
+    color: var(--ink);
+    box-shadow: var(--shadow-lift);
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 20px;
+    font-weight: 700;
+  }
+  .pip-affordance .pip-time { font-size: 20px; }
+  /* -- Sticky strip summary (D4 rule 6, R-IMPL-28) ----------------------
+     When the user scrolls past the running-timer strip, it collapses
+     to this one-line sticky summary pinned directly under the sticky
+     tracker ("⏱ 2 running · nearest 12:34"). It sits in the tracker's
+     sticky band, not over content. Tapping it goes to the Timers view
+     (ambiguity #5: "expands in place OR goes to Timers" — this build
+     picks Timers, as RECIPE-22 strip taps do). Hidden
+     until the strip has scrolled past (JS toggles .visible). */
+  .timer-strip-summary {
+    position: sticky;
+    top: calc(var(--header-height, 56px) + var(--detail-header-h, 184px) + var(--tracker-h, 98px));
+    z-index: 2;
+    display: none;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    min-height: 48px;
+    padding: 8px 16px;
+    box-sizing: border-box;
+    border-radius: 12px;
+    border: 1px solid #F3D9C8;
+    background: #FDEFE6;
+    color: var(--ink);
+    font-size: 20px;
+    font-weight: 700;
+    cursor: pointer;
+    font-family: inherit;
+    text-align: left;
+  }
+  .timer-strip-summary.visible { display: flex; }
+  .screen.kiosk .timer-strip-summary { top: calc(var(--detail-header-h, 184px) + var(--tracker-h, 98px)); }
+  /* The completion card (R-IMPL-8): shown after "Finish" at the last
+     step, below the steps. Same card treatment as the rest of the
+     detail; the buttons stack full-width. Its scroll margin matches
+     the steps', so scrolling it into view lands it below the tracker. */
+  .completion-card {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    padding: 24px;
+    border-radius: 16px;
+    border: 1px solid var(--line);
+    background: var(--card);
+    box-shadow: var(--shadow-card);
+    scroll-margin-top: calc(var(--header-height, 56px) + var(--detail-header-h, 184px) + var(--tracker-h, 98px) + 16px);
+  }
+  .screen.kiosk .completion-card { scroll-margin-top: calc(var(--detail-header-h, 184px) + var(--tracker-h, 98px) + 16px); }
+  .completion-title { font-size: 28px; font-weight: 700; }
+  .completion-sub { font-size: 20px; color: var(--muted); }
+  /* A bridge-missing timer error (R-IMPL-25): the same slot as the
+     voice hint, in the error colour — one line, never hint + error. */
+  .timer-error { color: var(--error); }
+  /* The PIP's paused state word (R-IMPL-17): small, muted, after
+     the remaining time. */
+  .pip-state { flex: 0 0 auto; font-size: 18px; font-weight: 600; color: var(--muted); white-space: nowrap; }
   /* Reduced motion (DESIGN-6, WCAG 2.2): the skeleton pulse stops
      (the skeleton rows themselves still show) and press feedback is
      instant (no scale). */
   @media (prefers-reduced-motion: reduce) {
     .skeleton-thumb, .skeleton-line { animation: none; }
+    .nav-strip-button { transition: none; }
     .button:active, .row:active, .star:active, .tab:active,
     .ingredient:active, .time-chip:active, .nav-strip-button:active,
     .timer-strip-item:active { transform: none; }
@@ -2422,16 +3002,21 @@ class AnyListRecipeViewCard extends HTMLElement {
     // survives leaving the tab (or the recipe) and coming back, and
     // so a re-render mid-typing never drops the text. The draft is
     // cleared only by a successful save. The status is the feedback
-    // line under the editor ("Saved." or an honest error); a failed
-    // save keeps the draft, so nothing typed is ever lost.
+    // line under the editor ("Note saved." or an honest error); a
+    // failed save keeps the draft, so nothing typed is ever lost. An
+    // unconfirmed save carries retry:"retry-note", and the status
+    // renders as a tappable retry button (R-IMPL-39).
     this._noteDrafts = new Map();
-    this._noteStatus = null; // { text, error } or null
+    this._noteStatus = null; // { text, error, retry? } or null
     this._savingNote = false;
     // Rating: a tap saves at once (no separate Save button). The
     // status is the feedback line under the stars. _ratingBusy
-    // blocks double-taps while a save is in flight.
-    this._ratingStatus = null; // { text, error } or null
+    // blocks double-taps while a save is in flight. _pendingRating
+    // holds the rating a failed save was trying to set, so the
+    // retry button can re-attempt exactly that value (R-IMPL-39).
+    this._ratingStatus = null; // { text, error, retry? } or null
     this._ratingBusy = false;
+    this._pendingRating = null;
     // Serving scaling is transient by design: the chosen serving
     // count per recipe id, for this cooking session only. It resets
     // when the recipe is opened (see _openRecipe) and never calls
@@ -2453,6 +3038,28 @@ class AnyListRecipeViewCard extends HTMLElement {
     // the strip's remaining times in place (never a full re-render,
     // so it cannot wipe a note draft mid-typing).
     this._stripTick = null;
+    // PIP (D3, R-IMPL-17–22): the floating timer indicator. _pip is
+    // null when hidden, else { timerId, name, state, remaining,
+    // startedAt, finishedAt, more, collapsed }. _pipKnown tracks every
+    // timer sensor the card has seen (entity_id → { state, startedVia,
+    // startedAt }) so a hass push can tell a just-started voice timer
+    // from a pre-existing one. _pipDismissed remembers finished timers
+    // whose notice the user dismissed, so a later hass push does not
+    // re-show them; a NEW finish still shows.
+    this._pip = null;
+    this._pipKnown = new Map();
+    this._pipDismissed = new Set();
+    this._pipHideTimer = null;
+    this._pipFadeTimer = null;
+    this._pipTick = null;
+    this._pipTouch = null; // { x, y } of the active PIP touch, for swipe
+    this._pipHideLeftMs = 0;
+    this._pipHideEndsAt = 0;
+    // Completion card (R-IMPL-8): shown after "Finish" at the last step.
+    this._finishShown = false;
+    // Timer-start error (R-IMPL-25): the bridge-missing error, shown
+    // IN PLACE OF the voice hint (same slot) while it stands.
+    this._timerError = "";
     // Deep link (Phase 3 contract): applied once, after the first
     // load, so opening a recipe from ?recipe=<id>&step=<n> does not
     // yank the cook back on a later re-render.
@@ -2471,10 +3078,24 @@ class AnyListRecipeViewCard extends HTMLElement {
     this._detailEl = null;
     this._device = null; // { category, orientation } from detectDevice, or null outside a browser.
     this._resizeBound = null;
+    this._popstateBound = null;
     this.attachShadow({ mode: "open" });
     this.shadowRoot.addEventListener("click", (event) => this._onClick(event));
     this.shadowRoot.addEventListener("input", (event) => this._onInput(event));
     this.shadowRoot.addEventListener("change", (event) => this._onChange(event));
+    // PIP touch (R-IMPL-19/22): a touch on the PIP suspends its 5 s
+    // auto-hide clock until the touch ends, and a swipe collapses it
+    // to the restore affordance. Delegated on the shadow root like
+    // the click handler; the handlers no-op unless the touch is on
+    // the PIP or its affordance.
+    this.shadowRoot.addEventListener("touchstart", (event) => this._onPipTouchStart(event), { passive: true });
+    this.shadowRoot.addEventListener("touchend", (event) => this._onPipTouchEnd(event), { passive: true });
+    // A swipe the compositor claims for scrolling ends in touchcancel,
+    // not touchend — treat it as an end too. Without this, a cancelled
+    // touch leaves the auto-hide clock suspended (cleared in
+    // _pipTouchStart, resumed only in _pipTouchEnd) and the PIP never
+    // hides, and the swipe itself never collapses it.
+    this.shadowRoot.addEventListener("touchcancel", (event) => this._onPipTouchEnd(event), { passive: true });
     // A failed photo load falls back to the initial-letter tile
     // (RECIPE-10). Image errors do not bubble, but they do travel
     // the capture phase — one capture listener on the shadow root
@@ -2499,7 +3120,14 @@ class AnyListRecipeViewCard extends HTMLElement {
       // the view opens (see connectedCallback), never on every state
       // change, and never by a manual control.
       this._loadAll();
+      // Seed the known-sensor set: timers already running when the
+      // card first loads are pre-existing, not "just started by
+      // voice" — the diff must not show a PIP for them.
+      this._pipSeedKnown();
     } else {
+      // Every later hass push diffs the timer sensors (a voice-started
+      // timer or a finish shows the PIP) before the re-render.
+      this._pipOnHassPush();
       this._render();
     }
   }
@@ -2516,10 +3144,23 @@ class AnyListRecipeViewCard extends HTMLElement {
     this._render();
     // A deep link opened on an already-loaded list applies here; the
     // _loadAll path applies it when the load finishes.
+    // Kiosk re-apply (N-IMPL-10d): a same-tab reload whose URL lost
+    // ?kiosk gets it back with one replace (the flag is the backstop).
+    reapplyKioskIfNeeded();
     if (this._loaded) this._applyDeepLink();
     // Session restore (DESIGN-7): re-open the recipe that was open
-    // and restore the scroll, unless a deep link owns the state.
+    // and restore the scroll; a deep link owns recipe+step, the
+    // session owns the scroll (N-IMPL-21b).
     if (this._loaded) this._restoreSession();
+    // System-back / forward within Recipes (decision F).
+    if (
+      typeof window !== "undefined" &&
+      typeof window.addEventListener === "function" &&
+      !this._popstateBound
+    ) {
+      this._popstateBound = (event) => this._onPopState(event);
+      window.addEventListener("popstate", this._popstateBound);
+    }
     // The layout follows the viewport: a resize or an orientation
     // change re-detects the device and re-applies the classes. The
     // classes drive the CSS, so no re-render is needed.
@@ -2541,6 +3182,9 @@ class AnyListRecipeViewCard extends HTMLElement {
       this._windowScrollBound = () => {
         this._interacted = true;
         this._scheduleSessionSave();
+        // The sticky strip summary appears once the strip scrolls
+        // past the tracker (R-IMPL-28).
+        this._syncStripSummary();
       };
       window.addEventListener("scroll", this._windowScrollBound, { passive: true });
     }
@@ -2582,6 +3226,14 @@ class AnyListRecipeViewCard extends HTMLElement {
       window.removeEventListener("scroll", this._windowScrollBound);
       this._windowScrollBound = null;
     }
+    if (
+      typeof window !== "undefined" &&
+      this._popstateBound &&
+      typeof window.removeEventListener === "function"
+    ) {
+      window.removeEventListener("popstate", this._popstateBound);
+      this._popstateBound = null;
+    }
     if (this._scrollSaveTimer !== null) {
       clearTimeout(this._scrollSaveTimer);
       this._scrollSaveTimer = null;
@@ -2590,11 +3242,36 @@ class AnyListRecipeViewCard extends HTMLElement {
     this._interacted = false;
     this._releaseWakeLock();
     this._clearStripTick();
+    // The PIP's timers (auto-hide, fade, 1 s tick) stop with the card;
+    // a hidden PIP never fires after disconnect.
+    this._pipClearHideTimers();
+    this._clearPipTick();
   }
 
   _onResize() {
     this._applyDevice();
     this._updateChipsFade();
+    this._syncSortLabels();
+  }
+
+  // The sort labels (R-IMPL-4): at ≤390 px the sort control is
+  // compact — "⇅ Name", "⇅ Rating", "⇅ Cook time", "⇅ Prep time" —
+  // so the toolbar fits beside the search field. Above 390 px the
+  // plain labels return. The values never change, only the text.
+  _syncSortLabels() {
+    const sortEl = this._shell ? this._shell.querySelector('[data-role="sort"]') : null;
+    if (!sortEl || !sortEl.options) return;
+    const narrow =
+      typeof window !== "undefined" &&
+      typeof window.innerWidth === "number" &&
+      window.innerWidth <= 390;
+    const labels = narrow
+      ? { name: "⇅ Name", rating: "⇅ Rating", cook: "⇅ Cook time", prep: "⇅ Prep time" }
+      : { name: "Name", rating: "Rating", cook: "Cook time", prep: "Prep time" };
+    for (const option of sortEl.options) {
+      const label = labels[option.value];
+      if (label && option.textContent !== label) option.textContent = label;
+    }
   }
 
   // Detect the device and carry it as classes on the screen element:
@@ -2627,7 +3304,14 @@ class AnyListRecipeViewCard extends HTMLElement {
       `dev-${device.category}`,
       `orient-${device.orientation}`
     );
-    if (isKioskMode(readLocationSearch())) this._shell.classList.add("kiosk");
+    if (isKioskMode(readLocationSearch())) {
+      this._shell.classList.add("kiosk");
+      // Kiosk as a session property (N-IMPL-10): remember the flag so
+      // a same-tab reload can re-apply ?kiosk (N-IMPL-10d).
+      storeKioskFlag();
+    }
+    // Night mode (N-IMPL-24): dimmed strip, same targets.
+    this._shell.classList.toggle("night", isNightNow(readNightSetting()));
     if (changed) this._updateChipsFade();
   }
 
@@ -2700,16 +3384,44 @@ class AnyListRecipeViewCard extends HTMLElement {
       // Empty query means browse: back to the full list.
       this._searchResults = null;
       this._render();
+      this._saveSession();
       return;
     }
     this._searchResults = searchRecipes(this._recipes, trimmed);
     this._render();
+    this._saveSession();
   }
 
   // Detail reads from the loaded list: the view-open download already
   // brought ingredients and steps, so opening a recipe makes no
   // server call and needs no cache.
-  _openRecipe(recipeId) {
+  // options.pushHistory: a tap-open pushes ONE history entry
+  // {fhNav:"detail", openId} at the same URL (decision F), so
+  // system-back from the list returns to the detail exactly once.
+  // Restore and deep-link opens do NOT push — they are already at a
+  // history position.
+  // Scroll the current step into view (D2b, R-IMPL-6): its top sits
+  // just below the sticky tracker (scroll-margin-top on .step), its
+  // full text visible. No-op when the detail is not open or the step
+  // element is not in the DOM (the DOM tests). The page scrolls as a
+  // unit — the steps column does not scroll independently (see the
+  // implementation report); the observable contract (current step
+  // visible below the tracker, tracker agreeing) holds either way.
+  _scrollCurrentStepIntoView() {
+    if (!this._detailEl || !this._selected) return;
+    const steps = this._navigableSteps(this._selected);
+    if (steps.length === 0) return;
+    const current = this._currentStepIndex(this._selected.id, steps.length);
+    const el = this._detailEl.querySelector(`[data-step-index="${current}"]`);
+    if (!el || typeof el.scrollIntoView !== "function") return;
+    try {
+      el.scrollIntoView({ block: "start", behavior: "auto" });
+    } catch (_err) {
+      // A scroll failure never breaks the step change.
+    }
+  }
+
+  _openRecipe(recipeId, options) {
     const id = asTrimmed(recipeId);
     if (!id) return;
     const recipe = this._recipes.find((item) => item.id === id);
@@ -2727,12 +3439,147 @@ class AnyListRecipeViewCard extends HTMLElement {
     this._ratingStatus = null;
     this._savingNote = false;
     this._ratingBusy = false;
+    this._finishShown = false;
+    this._timerError = "";
     // Cooking state survives a reload (RECIPE-9): restore the saved
     // check-off and step when they are younger than 24h.
     this._loadCookState(id);
     this._render();
+    // M1 (N-IMPL-29): a detail ALWAYS opens at the top — the list's
+    // scroll is never inherited by the detail, and "← All recipes"
+    // is visible on open at every viewport.
+    if (typeof window !== "undefined" && typeof window.scrollTo === "function") {
+      try {
+        window.scrollTo(0, 0);
+      } catch (_err) {
+        // A scroll failure never breaks the open.
+      }
+    }
     // Session persistence (DESIGN-7): remember the open recipe.
     this._saveSession();
+    if (options && options.pushHistory) this._pushDetailHistory(id);
+  }
+
+  // ONE history entry for a tap-opened detail (decision F): a
+  // state-carrying push at the same URL, never a bare same-URL push.
+  _pushDetailHistory(recipeId) {
+    if (typeof window === "undefined" || !window.history) return;
+    if (typeof window.history.pushState !== "function") return;
+    try {
+      const url = `${window.location.pathname || "/family-hub/recipes"}${window.location.search || ""}`;
+      window.history.pushState({ fhNav: "detail", openId: recipeId }, "", url);
+    } catch (_err) {
+      // A pushState failure never breaks the open.
+    }
+  }
+
+  // -- detail close + history (N-IMPL-7/9, decision F) ----------------------
+  //
+  // Strip Recipes from a detail is list intent: close the detail, show
+  // the list at scrollY 0, clear the saved open detail (openId + step
+  // + both scroll buckets — the next restore starts at list top), and
+  // push exactly ONE history entry ({fhNav:"list", openId:null}) so
+  // system-back from the list returns to the detail exactly once.
+  // A reload is restore intent and keeps the saved detail; an explicit
+  // Recipes tap from a detail is list intent and clears it — the two
+  // intents are distinguished by the action, not the URL.
+  _closeDetailToListTop() {
+    this._selected = null;
+    this._hidePip();
+    this._render();
+    if (typeof window !== "undefined" && typeof window.scrollTo === "function") {
+      try {
+        window.scrollTo(0, 0);
+      } catch (_err) {
+        // A scroll failure never breaks the close.
+      }
+    }
+    this._clearRecipeSession();
+    if (typeof window !== "undefined" && window.history && typeof window.history.pushState === "function") {
+      try {
+        window.history.pushState(
+          { fhNav: "list", openId: null },
+          "",
+          withKioskQuery("/family-hub/recipes")
+        );
+      } catch (_err) {
+        // A pushState failure never breaks the close.
+      }
+    }
+  }
+
+  // Write the clean list-top session state (no open detail, no step,
+  // both scroll buckets zero). The search query, filter and sort are
+  // KEPT — a strip-Recipes tap clears the open detail, not the
+  // list the user was browsing.
+  _clearRecipeSession() {
+    if (typeof sessionStorage === "undefined") return;
+    try {
+      sessionStorage.setItem(
+        RECIPE_SESSION_KEY,
+        serializeRecipeSession({
+          openId: null,
+          step: null,
+          listScrollY: 0,
+          detailScrollY: 0,
+          query: this._query || "",
+          collectionId: this._collectionId || "",
+          sort: this._sort || "name",
+        })
+      );
+    } catch (_err) {
+      // Storage full or blocked: the view still works, it just is
+      // not remembered. Never throw from a cosmetic feature.
+    }
+  }
+
+  // System-back / forward while this card is mounted (decision F):
+  // the card keys rendering off history.state + the session store,
+  // not the URL alone. A detail entry re-opens that detail at the
+  // saved step and scrolls the current step into view (D2b —
+  // ambiguity #3 resolution (a): "restores the saved step + scroll"
+  // means the step + a scroll TO the current step, never the raw
+  // detailScrollY, which D2d forbids restoring ever); a list entry
+  // (or an entry with no Navigation state, e.g. the initial list
+  // entry) shows the list at the saved list scroll. No history entry
+  // is pushed here — the entries already exist.
+  _onPopState(event) {
+    if (!this._loaded) return;
+    const state =
+      (event && event.state) ||
+      (typeof window !== "undefined" && window.history ? window.history.state : null);
+    const saved = this._readSavedSession();
+    if (state && typeof state === "object" && state.fhNav === "detail" && typeof state.openId === "string" && state.openId) {
+      if (this._selected && this._selected.id === state.openId) return;
+      const recipe = this._recipes.find((item) => item.id === state.openId);
+      if (!recipe) return;
+      this._openRecipe(state.openId);
+      if (saved && saved.openId === state.openId && typeof saved.step === "number" && saved.step > 0) {
+        const steps = this._navigableSteps(recipe);
+        if (steps.length > 0) {
+          this._currentStep.set(state.openId, Math.min(saved.step - 1, steps.length - 1));
+          this._saveCookState(state.openId);
+          this._render();
+        }
+      }
+      this._saveSession();
+      this._scrollCurrentStepIntoView();
+      return;
+    }
+    // List entry (or no Navigation state): the list, at the saved
+    // list scroll (N-IMPL-9).
+    if (this._selected) {
+      this._selected = null;
+      this._render();
+      if (typeof window !== "undefined" && typeof window.scrollTo === "function") {
+        try {
+          window.scrollTo(0, saved ? saved.listScrollY : 0);
+        } catch (_err) {
+          // A scroll failure never breaks the return.
+        }
+      }
+      this._saveSession();
+    }
   }
 
   // -- deep link (Phase 3 contract) --------------------------------------
@@ -2757,6 +3604,10 @@ class AnyListRecipeViewCard extends HTMLElement {
     if (!recipeId) return;
     const recipe = this._recipes.find((item) => item.id === recipeId);
     if (!recipe) return;
+    // Compose (N-IMPL-21b): the deep link owns the recipe + step; the
+    // session owns nothing here — the open saves the session, and the
+    // arrival scrolls to the current step (D2b). The saved
+    // detailScrollY is NEVER restored (D2d).
     this._openRecipe(recipeId);
     const step = Number(params.get("step"));
     if (Number.isFinite(step) && step > 0) {
@@ -2765,19 +3616,39 @@ class AnyListRecipeViewCard extends HTMLElement {
         this._currentStep.set(recipeId, Math.min(step - 1, steps.length - 1));
         this._saveCookState(recipeId);
         this._render();
+        // The session step follows the URL step, so the PIP contract
+        // and the next restore agree with the deep link.
+        this._saveSession();
       }
     }
+    // A deep-link arrival (including the Timers "← Back to recipe"
+    // return) restores the saved step + a scroll TO the current step
+    // (D2b — ambiguity #3 resolution (a)). The saved detailScrollY
+    // is NEVER restored (D2d).
+    this._scrollCurrentStepIntoView();
   }
 
   // -- session persistence (DESIGN-7) --------------------------------------
   //
   // Restore once per mount, after the list loads (or immediately when
-  // the list is already loaded). A deep link owns the state and wins:
-  // when the URL carries ?recipe= or ?from_recipe=, the session is
-  // ignored entirely. If the user has already scrolled, tapped or
-  // typed before the restore runs, their state wins instead. A saved
-  // recipe id that is no longer in the list is ignored (the list
-  // scroll is still restored).
+  // the list is already loaded). A deep link owns the recipe + step:
+  // when the URL carries ?recipe= or ?from_recipe=, _applyDeepLink
+  // (which runs first) owns the open, and the session's scroll is
+  // applied there (N-IMPL-21b) — the session is no longer ignored
+  // wholesale. If the user has already scrolled, tapped or typed
+  // before the restore runs, their state wins instead. A saved recipe
+  // id that is no longer in the list is ignored (the list scroll is
+  // still restored).
+  // Reload restore (N-IMPL-21a). A deep link wins over the session
+  // (so "← Back to recipe" and fresh loads with ?recipe= never
+  // re-open the previous detail). The list state — the search query,
+  // the active filter, the sort — restores alongside the detail
+  // (R-IMPL-14b/43): the list re-opens as the user left it, and the
+  // search field keeps the query for editing. A reload re-opens a
+  // saved detail at scrollY 0 with the saved step + checks restored
+  // (D2d, R-IMPL-15) — the saved detailScrollY is NEVER restored.
+  // No open detail: with a filter/search active the list re-opens
+  // at the top (R2 step 7); otherwise at the saved list scroll.
   _restoreSession() {
     if (this._sessionRestored || !this._loaded) return;
     this._sessionRestored = true;
@@ -2790,18 +3661,40 @@ class AnyListRecipeViewCard extends HTMLElement {
     }
     const state = this._readSavedSession();
     if (!state) return;
+    if (state.query || state.collectionId || state.sort !== "name") {
+      this._query = state.query || "";
+      this._collectionId = state.collectionId || "";
+      this._sort = state.sort || "name";
+      this._searchResults = this._query ? searchRecipes(this._recipes, this._query) : null;
+      const input = this.shadowRoot.querySelector('[data-role="search"]');
+      if (input) input.value = this._query;
+      this._render();
+    }
     if (state.openId) {
       const recipe = this._recipes.find((item) => item.id === state.openId);
       if (recipe) {
         this._openRecipe(state.openId);
-        if (typeof window !== "undefined" && state.detailScrollY > 0) {
-          window.scrollTo(0, state.detailScrollY);
-          this._saveSession();
+        // The session step (N-IMPL-21a, N-IMPL-8): the detail re-opens
+        // at the saved step. The session is the newer publication —
+        // it wins over the per-recipe cook-state step on disagreement
+        // (both are updated on every step change, so they agree in
+        // practice).
+        if (typeof state.step === "number" && state.step > 0) {
+          const steps = this._navigableSteps(recipe);
+          if (steps.length > 0) {
+            this._currentStep.set(state.openId, Math.min(state.step - 1, steps.length - 1));
+            this._saveCookState(state.openId);
+            this._render();
+            this._saveSession();
+          }
         }
+        // Reload heals: the detail re-opens at scrollY 0 (_openRecipe
+        // scrolled there) with the saved step + checks restored. The
+        // saved detailScrollY is NEVER read for a restore.
         return;
       }
     }
-    if (typeof window !== "undefined" && state.listScrollY > 0) {
+    if (typeof window !== "undefined" && state.listScrollY > 0 && !state.query && !state.collectionId) {
       window.scrollTo(0, state.listScrollY);
       this._saveSession();
     }
@@ -2816,16 +3709,27 @@ class AnyListRecipeViewCard extends HTMLElement {
     }
   }
 
-  // Save the open recipe + the current scroll into its own bucket
-  // (list or detail), keeping the other bucket's saved value.
+  // Save the open recipe + the current step + the current scroll
+  // into its own bucket (list or detail), keeping the other bucket's
+  // saved value. The step is 1-based, updated on every step change,
+  // and cleared (null) when the detail closes (N-IMPL-21a). The
+  // search query, the active filter and the sort persist alongside
+  // (R-IMPL-14b) so a reload re-opens the list as the user left it.
   _saveSession() {
     if (typeof sessionStorage === "undefined" || typeof window === "undefined") return;
-    const prev = this._readSavedSession() || { openId: null, listScrollY: 0, detailScrollY: 0 };
+    const prev = this._readSavedSession() || { openId: null, step: null, listScrollY: 0, detailScrollY: 0, query: "", collectionId: "", sort: "name" };
     const scrollY = sanitizeRecipeScroll(window.scrollY);
+    const step = this._selected
+      ? this._currentStepIndex(this._selected.id, this._navigableSteps(this._selected).length) + 1
+      : null;
     const state = {
       openId: this._selected ? this._selected.id : null,
+      step,
       listScrollY: this._selected ? prev.listScrollY : scrollY,
       detailScrollY: this._selected ? scrollY : prev.detailScrollY,
+      query: this._query || "",
+      collectionId: this._collectionId || "",
+      sort: this._sort || "name",
     };
     try {
       sessionStorage.setItem(RECIPE_SESSION_KEY, serializeRecipeSession(state));
@@ -2959,6 +3863,40 @@ class AnyListRecipeViewCard extends HTMLElement {
     if (document.visibilityState === "visible") this._syncWakeLock();
   }
 
+  // -- nav-strip timer badge (N-IMPL-5) --------------------------------------
+  //
+  // The Timers button carries the count badge (ACTIVE + PAUSED;
+  // amber last-60 s, red finished — decision #25-D). The strip is
+  // built once, so the badge is updated in place on every render
+  // from the live hass states.
+  _updateStripBadge() {
+    if (!this._shell) return;
+    // Exactly one badge exists in this card (on the Timers button),
+    // so the plain class selector is the lookup — no compound
+    // selector, which the DOM test harness cannot match.
+    const badge = this._shell.querySelector(".timer-badge");
+    if (!badge) return;
+    const states = this._hass && this._hass.states;
+    // hass.states may be an array (classic) or an object keyed by
+    // entity id (HA 2026.2+) — the badge helper takes the object form.
+    const badgeState = timerBadgeFromHassStates(
+      Array.isArray(states)
+        ? Object.fromEntries(states.map((s) => [s.entity_id, s]))
+        : states || null
+    );
+    if (!badgeState) {
+      badge.hidden = true;
+      badge.textContent = "";
+      badge.className = "timer-badge";
+      return;
+    }
+    badge.hidden = false;
+    badge.textContent = String(badgeState.count);
+    badge.className =
+      "timer-badge" + (badgeState.tone === "count" ? "" : ` ${badgeState.tone}`);
+    badge.setAttribute("aria-label", `${badgeState.count} timers`);
+  }
+
   // -- running-timer strip tick (RECIPE-22) ------------------------------
   //
   // Once a second, refresh the strip's remaining times in place from
@@ -2985,7 +3923,7 @@ class AnyListRecipeViewCard extends HTMLElement {
       return;
     }
     const now = Date.now();
-    const timers = this._runningTimers();
+    const timers = this._shownStripTimers();
     if (timers.length === 0) {
       this._clearStripTick();
       return;
@@ -2996,6 +3934,8 @@ class AnyListRecipeViewCard extends HTMLElement {
       const remaining = timerRemainingSeconds(timer, now);
       el.textContent = remaining === null ? "" : formatRemaining(remaining);
     }
+    // The sticky summary's "nearest" time ticks with the strip.
+    this._syncStripSummary();
   }
 
   // The running timers for the strip, from the hass states.
@@ -3004,15 +3944,477 @@ class AnyListRecipeViewCard extends HTMLElement {
     return runningTimers(this._hass.states || []);
   }
 
+  // The timers the strip actually shows (R-IMPL-26): at most 3,
+  // most-recently-started first. The 1s tick and the strip share
+  // this list, so the tick updates only shown pills.
+  _shownStripTimers() {
+    return this._runningTimers()
+      .slice()
+      .sort((a, b) => {
+        const aStart =
+          a.attributes && a.attributes.started_at
+            ? Date.parse(a.attributes.started_at)
+            : NaN;
+        const bStart =
+          b.attributes && b.attributes.started_at
+            ? Date.parse(b.attributes.started_at)
+            : NaN;
+        if (Number.isFinite(aStart) && Number.isFinite(bStart)) return bStart - aStart;
+        if (Number.isFinite(aStart)) return -1;
+        if (Number.isFinite(bStart)) return 1;
+        return 0;
+      })
+      .slice(0, 3);
+  }
+
+  // -- floating timer PIP (D3, R-IMPL-17–23) -----------------------------
+  //
+  // One floating card confirming the timer that just started (chip or
+  // voice), with the timer name, the ticking remaining time, and the
+  // state. It auto-hides after 5 s with a 300 ms fade; a finished
+  // timer's PIP NEVER auto-hides (the return never silently drops
+  // away). Tapping the PIP pins the timer and goes to the Timers
+  // view; the × dismisses it without cancelling the timer; swiping
+  // it collapses it to a small restore affordance, and tapping the
+  // affordance restores the full PIP. A finished timer that arrives
+  // while the PIP is collapsed comes back as the full PIP.
+  //
+  // Voice detection (ambiguity #4): on every hass push, the card
+  // diffs the timer sensor set against what it has seen before. A
+  // sensor that appears with started_via == "voice" while a detail
+  // is open shows the PIP (the cook is cooking and just asked for a
+  // timer by voice). A chip-started timer (started_via == "service")
+  // is shown by the chip-tap path directly and is ignored by the
+  // diff, so the same timer never double-shows. A sensor whose state
+  // becomes "finished" shows the finished PIP (unless the user
+  // dismissed that timer's notice). started_at is available for a
+  // freshness check, but the sensor-set diff is the mechanism.
+  //
+  // OQ-7 hard gate: the PIP does NOT navigate until the step field
+  // is published + verified. The step field IS published (Navigation
+  // N-IMPL-21: the session state carries openId + step, and Timers
+  // reads it back verbatim into &step=). The gate closes only when
+  // the re-match verifies PIP tap → Timers pinned + back → same step
+  // at phone portrait AND wall landscape, with the real PIP.
+
+  // The PIP's current timer, as a live sensor (or null when the
+  // sensor has not appeared yet — the chip-tap path shows the PIP
+  // optimistically, and the sensor binds on the next hass push).
+  _pipSensor() {
+    if (!this._pip || !this._pip.entityId || !this._hass) return null;
+    const states = timerSensorList(this._hass.states);
+    for (const sensor of states) {
+      if (sensor && sensor.entity_id === this._pip.entityId) return sensor;
+    }
+    return null;
+  }
+
+  // Bind an optimistic PIP (no entityId yet) to the sensor the chip
+  // tap just created: the sensor whose name matches, started by the
+  // service, within 15 s of the tap. Returns the entity_id, or null.
+  // The sensor for the optimistic PIP (chip tap): the most recent
+  // service-started sensor with the PIP's name, started within 15 s.
+  // Returns the sensor object, or null.
+  _pipResolveSensor() {
+    if (!this._pip || this._pip.entityId || !this._hass) return null;
+    const states = timerSensorList(this._hass.states);
+    const cutoff = Date.now() - 15000;
+    for (const sensor of states) {
+      if (!sensor || typeof sensor.entity_id !== "string") continue;
+      if (sensor.entity_id.indexOf("sensor.satellite_timer_") !== 0) continue;
+      if (timerName(sensor) !== this._pip.name) continue;
+      const attrs = sensor.attributes || {};
+      const startedAt = attrs.started_at ? Date.parse(attrs.started_at) : NaN;
+      if (Number.isFinite(startedAt) && startedAt < cutoff) continue;
+      if (attrs.started_via && attrs.started_via !== "service") continue;
+      return sensor;
+    }
+    return null;
+  }
+
+  _pipResolveEntityId() {
+    const sensor = this._pipResolveSensor();
+    return sensor ? sensor.entity_id : null;
+  }
+
+  // How many OTHER timers are running besides the PIP's own timer
+  // (for the "+N more" count). Finished timers do not count.
+  _pipMoreCount(excludeId) {
+    let count = 0;
+    for (const timer of this._runningTimers()) {
+      if (timer.entity_id !== excludeId) count += 1;
+    }
+    return count;
+  }
+
+  // Show the PIP for a timer. source is either a sensor object or an
+  // optimistic { entityId, name, remaining, state } from a chip tap.
+  // opts.finished marks the finished return (never auto-hides).
+  _pipShow(source, opts) {
+    const finished = !!(opts && opts.finished);
+    const entityId = source && typeof source.entity_id === "string" ? source.entity_id : null;
+    const name = source ? timerName(source) || (source.name || "") : "";
+    const remaining =
+      source && typeof source.remaining === "number"
+        ? source.remaining
+        : source
+          ? timerRemainingSeconds(source)
+          : null;
+    const state = finished ? "finished" : (source && source.state) || "active";
+    this._pip = {
+      entityId,
+      name,
+      state,
+      remaining,
+      shownAt: Date.now(),
+      collapsed: false,
+      hidden: false,
+      finished,
+      more: this._pipMoreCount(entityId),
+    };
+    this._pipClearHideTimers();
+    if (!finished) {
+      // 5 s auto-hide, 300 ms fade. Touch suspends the clock (the
+      // touch handlers clear the timer and re-arm it with the time
+      // left when the touch ends).
+      this._pipHideLeftMs = PIP_AUTO_HIDE_MS;
+      this._pipHideEndsAt = Date.now() + PIP_AUTO_HIDE_MS;
+      this._pipHideTimer = setTimeout(() => this._pipFadeOut(), PIP_AUTO_HIDE_MS);
+    }
+    this._ensurePipTick();
+    this._render();
+  }
+
+  // The 300 ms fade, then remove from the DOM.
+  _pipFadeOut() {
+    if (!this._pip || this._pip.finished) return;
+    this._pip.hidden = true;
+    this._pipHideTimer = null;
+    this._render();
+    this._pipFadeTimer = setTimeout(() => this._hidePip(), PIP_FADE_MS);
+  }
+
+  _pipClearHideTimers() {
+    if (this._pipHideTimer !== null) {
+      if (typeof clearTimeout === "function") clearTimeout(this._pipHideTimer);
+      this._pipHideTimer = null;
+    }
+    if (this._pipFadeTimer !== null) {
+      if (typeof clearTimeout === "function") clearTimeout(this._pipFadeTimer);
+      this._pipFadeTimer = null;
+    }
+  }
+
+  // Hide the PIP outright (detail closed, × dismissed, fade done).
+  // Does NOT cancel the timer — dismissal is a notice action only.
+  _hidePip() {
+    this._pipClearHideTimers();
+    this._clearPipTick();
+    this._pip = null;
+    this._pipTouch = null;
+    if (this._shell) this._renderPip();
+  }
+
+  // The 1 s tick that refreshes the PIP's remaining time in place
+  // (never a full re-render, so it cannot steal focus or wipe a
+  // note draft). The strip has its own tick; the two are independent.
+  _ensurePipTick() {
+    if (this._pipTick !== null) return;
+    if (typeof window === "undefined" || typeof setInterval !== "function") return;
+    this._pipTick = setInterval(() => this._pipTickUpdate(), 1000);
+  }
+
+  _clearPipTick() {
+    if (this._pipTick === null) return;
+    if (typeof clearInterval === "function") clearInterval(this._pipTick);
+    this._pipTick = null;
+  }
+
+  _pipTickUpdate() {
+    if (!this._pip) {
+      this._clearPipTick();
+      return;
+    }
+    // A finished PIP never ticks away; its time reads "Done".
+    if (this._pip.finished) return;
+    const sensor = this._pipSensor();
+    let remaining = null;
+    let state = this._pip.state;
+    if (sensor) {
+      remaining = timerRemainingSeconds(sensor);
+      state = sensor.state;
+      if (sensor.state === "finished" && !this._pipDismissed.has(sensor.entity_id)) {
+        // The timer finished between hass pushes: return as the full
+        // finished PIP (never auto-hides), even from collapsed.
+        this._pipShow(sensor, { finished: true });
+        return;
+      }
+    } else if (this._pip.entityId === null) {
+      // Optimistic countdown until the sensor binds.
+      const elapsed = Math.floor((Date.now() - this._pip.shownAt) / 1000);
+      remaining = this._pip.remaining === null ? null : Math.max(0, this._pip.remaining - elapsed);
+      // Try to bind the sensor now (it usually appears ~1 s after
+      // the chip tap).
+      const resolved = this._pipResolveEntityId();
+      if (resolved) {
+        this._pip.entityId = resolved;
+        this._pip.more = this._pipMoreCount(resolved);
+      }
+    }
+    const host = this._shell ? this._shell.querySelector(".pip-host") : null;
+    if (!host) return;
+    const timeEl = host.querySelector('[data-role="pip-time"]');
+    if (timeEl) {
+      timeEl.textContent =
+        state === "finished" ? "Done" : remaining === null ? "" : formatRemaining(remaining);
+    }
+    const stateEl = host.querySelector('[data-role="pip-state"]');
+    if (stateEl) stateEl.textContent = state === "paused" ? "Paused" : "";
+  }
+
+  // Render the PIP (or its collapsed affordance) into the shell host.
+  // Called from _render on every pass; the host is stable, so the
+  // PIP survives list/detail re-renders.
+  _renderPip() {
+    const host = this._shell ? this._shell.querySelector(".pip-host") : null;
+    if (!host) return;
+    if (!this._pip || !this._selected) {
+      if (host.innerHTML !== "") host.innerHTML = "";
+      return;
+    }
+    const pip = this._pip;
+    const sensor = this._pipSensor();
+    const state = sensor ? sensor.state : pip.state;
+    const remaining =
+      sensor
+        ? timerRemainingSeconds(sensor)
+        : pip.entityId === null && pip.remaining !== null
+          ? Math.max(0, pip.remaining - Math.floor((Date.now() - pip.shownAt) / 1000))
+          : pip.remaining;
+    const timeText = state === "finished" ? "Done" : remaining === null ? "" : formatRemaining(remaining);
+    const moreText = pip.more > 0 ? `+${pip.more} more` : "";
+    if (pip.collapsed) {
+      // The minimized restore affordance (R-IMPL-22): timer icon +
+      // remaining time (or "Done"). Tap restores the full PIP; it
+      // never navigates and never cancels the timer. A finished timer
+      // that arrives while collapsed comes back as the full PIP (the
+      // hass diff shows it with collapsed:false).
+      host.innerHTML = `<button type="button" class="pip-affordance" data-action="pip-restore" aria-label="Show timer ${escapeHtml(pip.name)}"><span class="pip-icon" aria-hidden="true">⏱</span><span class="pip-time" data-role="pip-time">${escapeHtml(timeText)}</span></button>`;
+      return;
+    }
+    host.innerHTML = `<div class="pip${pip.finished ? " finished" : ""}${pip.hidden ? " hide" : ""}" data-action="pip-tap" role="button" tabindex="0" aria-label="Timer ${escapeHtml(pip.name)}, ${escapeHtml(timeText)}${moreText ? `, ${escapeHtml(moreText)}` : ""}. Tap to open Timers."><span class="pip-icon" aria-hidden="true">⏱</span><span class="pip-name">${escapeHtml(pip.name)}</span><span class="pip-time" data-role="pip-time">${escapeHtml(timeText)}</span>${state === "paused" ? `<span class="pip-state" data-role="pip-state">Paused</span>` : `<span class="pip-state" data-role="pip-state"></span>`}${moreText ? `<span class="pip-more">${escapeHtml(moreText)}</span>` : ""}<button type="button" class="pip-dismiss" data-action="pip-dismiss" aria-label="Dismiss timer notice">×</button></div>`;
+  }
+
+  // Seed the known-sensor set on first hass (pre-existing timers are
+  // not "just started by voice" — the diff must not show a PIP for
+  // them).
+  _pipSeedKnown() {
+    if (!this._hass) return;
+    const states = timerSensorList(this._hass.states);
+    for (const sensor of states) {
+      if (!sensor || typeof sensor.entity_id !== "string") continue;
+      if (sensor.entity_id.indexOf("sensor.satellite_timer_") !== 0) continue;
+      const attrs = sensor.attributes || {};
+      this._pipKnown.set(sensor.entity_id, {
+        state: sensor.state,
+        startedVia: attrs.started_via || null,
+        startedAt: attrs.started_at || null,
+      });
+    }
+  }
+
+  // The hass-push diff (ambiguity #4): a newly-appearing sensor with
+  // started_via == "voice" while a detail is open shows the PIP; a
+  // sensor whose state becomes "finished" shows the finished PIP
+  // (unless dismissed). Chip-started timers (started_via ==
+  // "service") are shown by the chip-tap path and ignored here.
+  _pipOnHassPush() {
+    if (!this._hass) return;
+    const states = timerSensorList(this._hass.states);
+    const seen = new Set();
+    for (const sensor of states) {
+      if (!sensor || typeof sensor.entity_id !== "string") continue;
+      if (sensor.entity_id.indexOf("sensor.satellite_timer_") !== 0) continue;
+      seen.add(sensor.entity_id);
+      const attrs = sensor.attributes || {};
+      const prev = this._pipKnown.get(sensor.entity_id);
+      this._pipKnown.set(sensor.entity_id, {
+        state: sensor.state,
+        startedVia: attrs.started_via || null,
+        startedAt: attrs.started_at || null,
+      });
+      if (!this._selected) continue;
+      if (!prev) {
+        // A sensor that appears with started_via == "voice" while a
+        // detail is open is a voice-started timer: show the PIP.
+        // A "service" sensor is the chip-tap path's timer (already
+        // shown optimistically, or bound by the tick) — ignore it.
+        // A sensor that appears already finished (e.g. a timer that
+        // finished while the card was on the list) shows the finished
+        // PIP only if it was not dismissed.
+        if (sensor.state === "finished") {
+          if (!this._pipDismissed.has(sensor.entity_id)) this._pipShow(sensor, { finished: true });
+        } else if (attrs.started_via === "voice") {
+          this._pipShow(sensor, {});
+        }
+        continue;
+      }
+      if (prev.state !== sensor.state && sensor.state === "finished") {
+        if (!this._pipDismissed.has(sensor.entity_id)) {
+          // Finished (incl. the ringing → finished transition): the
+          // return comes back as the full PIP, even from collapsed.
+          this._pipShow(sensor, { finished: true });
+        }
+      }
+    }
+    // Prune sensors that no longer exist (a finished timer's sensor
+    // is removed by the bridge once it is dismissed there).
+    for (const id of Array.from(this._pipKnown.keys())) {
+      if (!seen.has(id)) this._pipKnown.delete(id);
+    }
+  }
+
+  // PIP tap → pin the timer + go to Timers (OQ-7: the step field is
+  // published — the session already carries openId + step, and
+  // Timers reads it back verbatim into &step= — so the return lands
+  // on the same step. The gate closes only when the re-match
+  // verifies this round-trip at phone portrait AND wall landscape).
+  _pipTap() {
+    if (!this._pip || !this._selected) return;
+    // Bind the sensor now if it has appeared since the chip tap. The
+    // pin carries the sensor's timer_id ATTRIBUTE (the ULID), which is
+    // what the Timers card matches (timer.timer_id) for the pinned-first
+    // render and the "Just started" marker — NOT the entity_id. A tap
+    // in the first ~1 s, before the sensor exists, navigates unpinned
+    // — the timer still appears in Timers as the most recent.
+    let sensor = null;
+    if (this._pip.entityId && this._hass) {
+      sensor = timerSensorList(this._hass.states).find(
+        (s) => s && s.entity_id === this._pip.entityId
+      ) || null;
+    }
+    if (!sensor) {
+      sensor = this._pipResolveSensor();
+      if (sensor) this._pip.entityId = sensor.entity_id;
+    }
+    const timerId = sensor && sensor.attributes
+      ? sensor.attributes.timer_id
+      : null;
+    if (typeof timerId === "string" && timerId && typeof sessionStorage !== "undefined") {
+      try {
+        sessionStorage.setItem(TIMERS_PIN_KEY, JSON.stringify({ timerId }));
+      } catch (_err) {
+        // A pin failure never blocks the navigation; Timers still
+        // opens, just without the "Just started" marker.
+      }
+    }
+    this._hidePip();
+    this._navigate("/family-hub/timers");
+  }
+
+  // The × dismisses the notice WITHOUT cancelling the timer. A
+  // finished timer's dismissal is remembered, so a later hass push
+  // does not re-show it; a NEW finish still shows.
+  _pipDismiss() {
+    if (!this._pip) return;
+    if (this._pip.finished && this._pip.entityId) this._pipDismissed.add(this._pip.entityId);
+    this._hidePip();
+  }
+
+  // Swipe-collapse (R-IMPL-22): the PIP collapses to the restore
+  // affordance; the timer keeps running. The auto-hide clock is
+  // cleared while collapsed (the affordance stays until tapped or
+  // until a finish returns the full PIP).
+  _pipCollapse() {
+    if (!this._pip) return;
+    this._pip.collapsed = true;
+    this._pip.hidden = false;
+    this._pipClearHideTimers();
+    this._render();
+  }
+
+  // Tap the affordance: restore the full PIP (with a fresh 5 s
+  // auto-hide for a running timer; a finished PIP never auto-hides).
+  _pipRestore() {
+    if (!this._pip) return;
+    this._pip.collapsed = false;
+    this._pip.hidden = false;
+    this._pipClearHideTimers();
+    if (!this._pip.finished) {
+      this._pipHideLeftMs = PIP_AUTO_HIDE_MS;
+      this._pipHideEndsAt = Date.now() + PIP_AUTO_HIDE_MS;
+      this._pipHideTimer = setTimeout(() => this._pipFadeOut(), PIP_AUTO_HIDE_MS);
+    }
+    this._render();
+  }
+
+  // Shadow-root touch delegation for the PIP: only touches that start
+  // on the PIP or its affordance suspend the clock / collapse it.
+  _onPipTouchStart(event) {
+    const target = event && event.target;
+    if (!target || typeof target.closest !== "function") return;
+    if (!target.closest(".pip, .pip-affordance")) return;
+    this._pipTouchStart(event);
+  }
+
+  _onPipTouchEnd(event) {
+    if (!this._pipTouch) return;
+    this._pipTouchEnd(event);
+  }
+
+  // Touch on the PIP suspends the 5 s auto-hide clock until the
+  // touch ends (R-IMPL-19); a swipe of ≥40 px collapses the PIP.
+  _pipTouchStart(event) {
+    if (!this._pip || this._pip.finished) return;
+    const touch = event && event.touches && event.touches[0];
+    if (!touch) return;
+    this._pipTouch = { x: touch.clientX, y: touch.clientY };
+    if (this._pipHideTimer !== null) {
+      if (typeof clearTimeout === "function") clearTimeout(this._pipHideTimer);
+      this._pipHideTimer = null;
+      this._pipHideLeftMs = Math.max(0, this._pipHideEndsAt - Date.now());
+    }
+  }
+
+  _pipTouchEnd(event) {
+    if (!this._pip) return;
+    const touch = this._pipTouch;
+    this._pipTouch = null;
+    if (!touch) return;
+    const end = event && event.changedTouches && event.changedTouches[0];
+    if (!end) return;
+    const dx = end.clientX - touch.x;
+    const dy = end.clientY - touch.y;
+    if (Math.abs(dx) >= PIP_SWIPE_PX || Math.abs(dy) >= PIP_SWIPE_PX) {
+      this._pipCollapse();
+      return;
+    }
+    // A plain tap (no swipe): resume the auto-hide clock with the
+    // time left. The tap itself is handled by the click handler.
+    if (!this._pip.finished && this._pipHideTimer === null && this._pipHideLeftMs > 0) {
+      this._pipHideEndsAt = Date.now() + this._pipHideLeftMs;
+      this._pipHideTimer = setTimeout(() => this._pipFadeOut(), this._pipHideLeftMs);
+    }
+  }
+
   // -- navigation (NAV-1) -------------------------------------------------
   //
   // history.pushState + a location-changed dispatch — no reload. The
   // same mechanism the standalone nav strip and the home card use.
   _navigate(path) {
     if (typeof window === "undefined") return;
+    const target = String(path || "/family-hub");
+    // Active-tab no-op (N-IMPL-6): tapping the Recipes strip button
+    // while the list is showing does nothing — no pushState, no
+    // location-changed, no re-render. Recipes-from-detail never
+    // reaches here (the nav action branch closes the detail first,
+    // N-IMPL-7).
+    const targetPath = target.split("?")[0];
+    if (targetPath === "/family-hub/recipes" || targetPath.endsWith("/recipes")) return;
+    const url = withKioskQuery(target);
     try {
       if (window.history && typeof window.history.pushState === "function") {
-        window.history.pushState(null, "", path);
+        window.history.pushState(null, "", url);
       }
     } catch (_err) {
       // A pushState failure (a test stub, a file URL) never breaks
@@ -3125,6 +4527,7 @@ class AnyListRecipeViewCard extends HTMLElement {
     const total = Number(seconds);
     if (!Number.isFinite(total) || total <= 0) return;
     this._timerStatus = "";
+    this._timerError = "";
     this._render();
     try {
       await this._hass.callWS({
@@ -3138,12 +4541,35 @@ class AnyListRecipeViewCard extends HTMLElement {
         return_response: false,
       });
       this._timerStatus = `Timer started: ${label}.`;
+      // T7-NJ1: the chip tap starts the timer and does NOT navigate
+      // away — the PIP confirms it in place (optimistic: the sensor
+      // binds on the next hass push, ~1 s later).
+      this._pipShow(
+        {
+          entityId: null,
+          name: this._selected ? this._selected.name : "Recipe timer",
+          remaining: total,
+          state: "active",
+        },
+        {}
+      );
     } catch (err) {
       const message = String((err && err.message) || err || "");
       const missing = /not found|unknown|no such|service/i.test(message);
-      this._timerStatus = missing
-        ? `Couldn't start the timer — the timer bridge doesn't offer a start action yet. ${VOICE_HINT} instead.`
-        : `Couldn't start the timer — ${message || "something went wrong"}. ${VOICE_HINT} instead.`;
+      // R-IMPL-25: a bridge-missing error REPLACES the voice hint in
+      // place (the same slot — the cook reads one line, not a hint
+      // plus an error) and names the chip's own duration. The
+      // hardcoded 9-minute sentence is only the last resort, when
+      // the chip carries no duration phrase at all. The label is the
+      // chip's duration phrase; when it is missing (a bare
+      // programmatic call), derive it from the seconds so the error
+      // never reads "Couldn't start the timer" with no duration.
+      const durationLabel = asTrimmed(label) || formatDuration(total) || `${total} seconds`;
+      const hint = voiceHintForStep(durationLabel) || VOICE_HINT;
+      this._timerError = missing
+        ? `Couldn't start the ${durationLabel} timer. ${hint} instead.`
+        : `Couldn't start the ${durationLabel} timer — ${message || "something went wrong"}. ${hint} instead.`;
+      this._timerStatus = "";
     }
     this._render();
   }
@@ -3224,13 +4650,27 @@ class AnyListRecipeViewCard extends HTMLElement {
         recipe_id: recipe.id,
         note,
       });
-      this._applyUpdatedRecipe(result, { note });
-      this._noteDrafts.delete(recipe.id);
-      this._noteStatus = { text: "Saved.", error: false };
+      // R-IMPL-39 (honest save): "Note saved." only when the
+      // response carries a usable recipe. A non-throwing response
+      // with no usable recipe (the rig stub's update_recipe returns
+      // {}) is NOT a confirmed save — the draft is kept and the
+      // status says so, with a tappable retry.
+      const applied = this._applyUpdatedRecipe(result);
+      if (applied) {
+        this._noteDrafts.delete(recipe.id);
+        this._noteStatus = { text: "Note saved.", error: false };
+      } else {
+        this._noteStatus = {
+          text: "Couldn't save — tap to retry",
+          error: true,
+          retry: "retry-note",
+        };
+      }
     } catch (err) {
       this._noteStatus = {
         text: "Couldn't save the note — your text is still here, try again.",
         error: true,
+        retry: "retry-note",
       };
     } finally {
       this._savingNote = false;
@@ -3257,12 +4697,27 @@ class AnyListRecipeViewCard extends HTMLElement {
         recipe_id: recipe.id,
         rating,
       });
-      this._applyUpdatedRecipe(result, { rating });
-      this._ratingStatus = { text: "Saved.", error: false };
+      // R-IMPL-39 (honest save): "Rating saved." only when the
+      // response carries a usable recipe; a response with no usable
+      // recipe keeps the old rating and offers a tappable retry.
+      const applied = this._applyUpdatedRecipe(result);
+      if (applied) {
+        this._pendingRating = null;
+        this._ratingStatus = { text: "Rating saved.", error: false };
+      } else {
+        this._pendingRating = rating;
+        this._ratingStatus = {
+          text: "Couldn't save — tap to retry",
+          error: true,
+          retry: "retry-rating",
+        };
+      }
     } catch (err) {
+      this._pendingRating = rating;
       this._ratingStatus = {
         text: "Couldn't save the rating — try again.",
         error: true,
+        retry: "retry-rating",
       };
     } finally {
       this._ratingBusy = false;
@@ -3274,22 +4729,24 @@ class AnyListRecipeViewCard extends HTMLElement {
   // response. Only the note and rating are taken from the server —
   // the save changed nothing else, and the response's ingredient list
   // may not carry the heading-aware entries, so the local
-  // ingredients, entries and steps stay exactly as they were. When
-  // there is no usable response (an older integration, a bare
-  // response), fall back to the value that was just saved: the call
-  // succeeding means the server accepted it. Either way the list row
-  // stays in sync too.
-  _applyUpdatedRecipe(result, fallback) {
+  // ingredients, entries and steps stay exactly as they were. Returns
+  // true when a usable server recipe was applied, false otherwise.
+  // R-IMPL-39 (honest save): when the response carries no usable
+  // recipe — the rig stub's update_recipe returns {} — the save is
+  // NOT certified. The local copy is NOT updated from the just-saved
+  // value, the draft is kept, and the status says so with a retry.
+  // (The old code fell back to the just-saved value on any
+  // non-throwing response, which certified a save on the rig stub.)
+  _applyUpdatedRecipe(result) {
     const recipe = this._selected;
-    if (!recipe) return;
+    if (!recipe) return false;
     const updated = result && result.recipe ? normalizeRecipe(result.recipe) : null;
-    const next =
-      updated && updated.id === recipe.id
-        ? { ...recipe, note: updated.note, rating: updated.rating }
-        : { ...recipe, ...fallback };
+    if (!updated || updated.id !== recipe.id) return false;
+    const next = { ...recipe, note: updated.note, rating: updated.rating };
     const index = this._recipes.findIndex((item) => item.id === recipe.id);
     if (index >= 0) this._recipes[index] = next;
     this._selected = next;
+    return true;
   }
 
   // Saving a note or a rating calls the fork's update_recipe with
@@ -3310,10 +4767,12 @@ class AnyListRecipeViewCard extends HTMLElement {
     if (/not found/i.test(message) && /service/i.test(message)) {
       return "The AnyList integration is not available on this Home Assistant.";
     }
-    if (/timeout/i.test(message)) {
-      return "AnyList took too long to answer — check the connection and try again.";
-    }
-    return "Could not load recipes from AnyList — try again.";
+    // Load failure (N-IMPL-27): the design's verbatim text, for every
+    // connection-flavoured failure — the old timeout/generic strings
+    // differed from it. The error branch renders this beside the
+    // "Try again" button; the search box + sort dropdown stay visible
+    // (they live in the toolbar, outside the replaced body).
+    return "Couldn't load recipes — check the connection and try again.";
   }
 
   // -- events ---------------------------------------------------------------
@@ -3357,6 +4816,7 @@ class AnyListRecipeViewCard extends HTMLElement {
     if (target.dataset.role !== "sort") return;
     this._sort = target.value || "name";
     this._render();
+    this._saveSession();
   }
 
   _onClick(event) {
@@ -3382,19 +4842,77 @@ class AnyListRecipeViewCard extends HTMLElement {
       const input = this.shadowRoot.querySelector('[data-role="search"]');
       if (input) input.value = "";
       this._render();
+      // The result set changed wholesale (filtered → all 382/2500),
+      // so the list re-opens at the top.
+      if (typeof window !== "undefined" && typeof window.scrollTo === "function") {
+        try {
+          window.scrollTo(0, 0);
+        } catch (_err) {
+          // A scroll failure never breaks the clear.
+        }
+      }
+      this._saveSession();
       return;
     }
     if (action === "back") {
+      // N-IMPL-9: ← All recipes restores the SAVED listScrollY — never
+      // list top. The old code saved the session after closing, which
+      // overwrote the saved list scroll with the detail scroll.
+      // R-IMPL-11: push ONE list entry ({fhNav:"list", openId:null}) —
+      // pushState, NOT replaceState. The spec's Change text says
+      // replaceState, but its own Validate line requires "one
+      // system-back press returns to the detail once", which only a
+      // push delivers: replaceState would erase the detail entry, so
+      // system-back would land on the pre-detail view instead of the
+      // detail. The merged Navigation decision F (rig-verified dn2-5
+      // 32/32) stands; see the implementation report, resolution #3.
+      const saved = this._readSavedSession();
+      const listScrollY = saved ? saved.listScrollY : 0;
       this._selected = null;
+      this._hidePip();
       this._render();
-      // Session persistence (DESIGN-7): the list is open again, at
-      // the current scroll (the page does not jump on back).
+      if (typeof window !== "undefined" && typeof window.scrollTo === "function") {
+        try {
+          window.scrollTo(0, listScrollY);
+        } catch (_err) {
+          // A scroll failure never breaks the return.
+        }
+      }
       this._saveSession();
+      if (typeof window !== "undefined" && window.history && typeof window.history.pushState === "function") {
+        try {
+          window.history.pushState(
+            { fhNav: "list", openId: null },
+            "",
+            withKioskQuery("/family-hub/recipes")
+          );
+        } catch (_err) {
+          // A pushState failure never breaks the return.
+        }
+      }
       return;
     }
     if (action === "tab") {
       this._detailTab = target.dataset.tab || "cook";
       this._render();
+      // R-IMPL-37: opening the Notes tab puts the caret in the
+      // editor, at the end of the existing note — the cook starts
+      // typing, not tapping. (No character counter: there is no limit
+      // on the note, so no counter is required.)
+      if (this._detailTab === "notes") {
+        const note = this._detailEl ? this._detailEl.querySelector('[data-role="note"]') : null;
+        if (note && typeof note.focus === "function") {
+          note.focus();
+          if (typeof note.setSelectionRange === "function") {
+            try {
+              const len = typeof note.value === "string" ? note.value.length : 0;
+              note.setSelectionRange(len, len);
+            } catch (_err) {
+              // Caret placement is best-effort.
+            }
+          }
+        }
+      }
       return;
     }
     if (action === "collection") {
@@ -3403,18 +4921,56 @@ class AnyListRecipeViewCard extends HTMLElement {
       const id = target.dataset.collectionId || "";
       this._collectionId = this._collectionId === id ? "" : id;
       this._render();
+      // R-IMPL-45: tapping All (or toggling the active filter off)
+      // returns the list to the top — the count changes, and the user
+      // should not land mid-list at a stale scroll position. Tapping
+      // a NEW filter keeps the scroll (the list re-sorts in place).
+      if (!this._collectionId && typeof window !== "undefined" && typeof window.scrollTo === "function") {
+        try {
+          window.scrollTo(0, 0);
+        } catch (_err) {
+          // A scroll failure never breaks the filter.
+        }
+      }
+      this._saveSession();
       return;
     }
     if (action === "nav") {
-      this._navigate(target.dataset.path || "/family-hub");
+      const path = target.dataset.path || "/family-hub";
+      // N-IMPL-7: strip Recipes tap while a detail is open is list
+      // intent — close the detail, show the LIST at scrollY 0, clear
+      // the saved open detail, one history entry. Every other strip
+      // tap navigates normally and must NOT clear the saved detail
+      // (N-IMPL-9b), so a later strip-Recipes tap from Home/Timers
+      // still session-restores (N-IMPL-8).
+      if (this._selected && (path === "/family-hub/recipes" || path.endsWith("/recipes"))) {
+        this._closeDetailToListTop();
+        return;
+      }
+      this._navigate(path);
       return;
     }
     if (action === "goto-timers") {
       this._navigate("/family-hub/timers");
       return;
     }
+    if (action === "pip-tap") {
+      // Tap the PIP: pin the timer + go to Timers (OQ-7 gate leg).
+      this._pipTap();
+      return;
+    }
+    if (action === "pip-dismiss") {
+      // The × dismisses the notice WITHOUT cancelling the timer.
+      this._pipDismiss();
+      return;
+    }
+    if (action === "pip-restore") {
+      // Tap the collapsed affordance: restore the full PIP.
+      this._pipRestore();
+      return;
+    }
     if (action === "open") {
-      this._openRecipe(target.dataset.recipeId);
+      this._openRecipe(target.dataset.recipeId, { pushHistory: true });
       return;
     }
     // -- cooking mode ---------------------------------------------------
@@ -3431,9 +4987,18 @@ class AnyListRecipeViewCard extends HTMLElement {
     }
     if (action === "clear-checks") {
       if (!this._selected) return;
+      // "Start over" (R-IMPL-34; OQ-5 stays open — the user has not
+      // ruled on what "Start over" means yet, so this build takes the
+      // plain reading): clears the checks AND resets the step to 1 —
+      // a fresh cook-through, not un-checked ingredients with the
+      // tracker still sitting at step 12.
       this._checked.delete(this._selected.id);
+      this._currentStep.set(this._selected.id, 0);
+      this._finishShown = false;
       this._saveCookState(this._selected.id);
+      this._saveSession();
       this._render();
+      this._scrollCurrentStepIntoView();
       return;
     }
     if (action === "step") {
@@ -3441,8 +5006,14 @@ class AnyListRecipeViewCard extends HTMLElement {
       const index = Number(target.dataset.stepIndex);
       if (!Number.isFinite(index)) return;
       this._currentStep.set(this._selected.id, index);
+      this._finishShown = false;
       this._saveCookState(this._selected.id);
+      this._saveSession();
       this._render();
+      // R-IMPL-6: tapping a step moves the current step AND scrolls
+      // it into view (its top just below the sticky tracker, full
+      // text visible). Scroll margin lives on .step.
+      this._scrollCurrentStepIntoView();
       return;
     }
     if (action === "step-prev" || action === "step-next") {
@@ -3455,7 +5026,49 @@ class AnyListRecipeViewCard extends HTMLElement {
           ? Math.max(0, current - 1)
           : Math.min(steps.length - 1, current + 1);
       this._currentStep.set(this._selected.id, next);
+      this._finishShown = false;
       this._saveCookState(this._selected.id);
+      this._saveSession();
+      this._render();
+      // R-IMPL-6: every step change scrolls the new current step
+      // into view below the tracker.
+      this._scrollCurrentStepIntoView();
+      return;
+    }
+    if (action === "finish") {
+      // R-IMPL-8: "Finish" at the last step shows the completion
+      // card below the steps. The tracker stays at "Step N of N".
+      if (!this._selected) return;
+      this._finishShown = true;
+      this._render();
+      const el = this._detailEl ? this._detailEl.querySelector('[data-role="completion"]') : null;
+      if (el && typeof el.scrollIntoView === "function") {
+        try {
+          el.scrollIntoView({ block: "start", behavior: "auto" });
+        } catch (_err) {
+          // A scroll failure never breaks the finish.
+        }
+      }
+      return;
+    }
+    if (action === "cook-again") {
+      // The completion card's "Cook again" IS the Start over action
+      // (R-IMPL-8): fresh cook-through — checks cleared, step back
+      // to 1, completion card hidden.
+      if (!this._selected) return;
+      this._checked.delete(this._selected.id);
+      this._currentStep.set(this._selected.id, 0);
+      this._finishShown = false;
+      this._saveCookState(this._selected.id);
+      this._saveSession();
+      this._render();
+      this._scrollCurrentStepIntoView();
+      return;
+    }
+    if (action === "finish-dismiss") {
+      // "← Back to recipe" hides the completion card and stays at
+      // the last step.
+      this._finishShown = false;
       this._render();
       return;
     }
@@ -3469,6 +5082,18 @@ class AnyListRecipeViewCard extends HTMLElement {
     // -- note, rating, serving scaling --------------------------------
     if (action === "save-note") {
       this._saveNote();
+      return;
+    }
+    if (action === "retry-note") {
+      // The tappable retry (R-IMPL-39): re-attempt the save with the
+      // kept draft.
+      this._saveNote();
+      return;
+    }
+    if (action === "retry-rating") {
+      // The tappable retry (R-IMPL-39): re-attempt exactly the
+      // rating the failed save was trying to set.
+      if (this._pendingRating !== null) this._rate(this._pendingRating);
       return;
     }
     if (action === "rate") {
@@ -3550,7 +5175,11 @@ class AnyListRecipeViewCard extends HTMLElement {
         <div class="nav-strip-buttons">
           ${NAV_STRIP_VIEWS.map((view) => {
             const active = view.key === "recipes";
-            return `<button type="button" class="nav-strip-button${active ? " active" : ""}" data-action="nav" data-path="${view.path}"${active ? ' aria-current="page"' : ""}>${view.label}</button>`;
+            const badge =
+              view.key === "timers"
+                ? '<span class="timer-badge" hidden></span>'
+                : "";
+            return `<button type="button" class="nav-strip-button${active ? " active" : ""}" data-action="nav" data-path="${view.path}"${active ? ' aria-current="page"' : ""}>${view.label}${badge}</button>`;
           }).join("")}
         </div>
       </nav>
@@ -3569,7 +5198,8 @@ class AnyListRecipeViewCard extends HTMLElement {
         <div class="status"></div>
         <div class="body"></div>
       </div>
-      <div class="detail-view" hidden></div>`;
+      <div class="detail-view" hidden></div>
+      <div class="pip-host"></div>`;
     this.shadowRoot.appendChild(this._shell);
     this._detailEl = this._shell.querySelector(".detail-view");
   }
@@ -3578,6 +5208,11 @@ class AnyListRecipeViewCard extends HTMLElement {
     if (!this.shadowRoot) return;
     this._ensureShell();
     this._applyDevice();
+    this._updateStripBadge();
+    this._syncSortLabels();
+    // The PIP (D3): rendered into its host on every pass, so it
+    // survives list/detail re-renders. Hidden when no detail is open.
+    this._renderPip();
     // If the cook is typing a note, a re-render (a Home Assistant
     // state update rebuilds the detail view) would destroy the
     // textarea mid-typing — and with it the focus and the caret. The
@@ -3626,6 +5261,8 @@ class AnyListRecipeViewCard extends HTMLElement {
       } else {
         this._clearStripTick();
       }
+      // A re-render drops the summary's .visible class; restore it.
+      this._syncStripSummary();
       return;
     }
     this._detailEl.hidden = true;
@@ -3729,8 +5366,10 @@ class AnyListRecipeViewCard extends HTMLElement {
     let title;
     let sub;
     if (this._query) {
-      title = `No recipes match “${escapeHtml(this._query)}”.`;
-      sub = "Try an ingredient or a dish name.";
+      // R-IMPL-42: the zero-result line is one exact sentence —
+      // "No recipes match 'X' — try an ingredient or a dish name".
+      title = `No recipes match '${escapeHtml(this._query)}' — try an ingredient or a dish name`;
+      sub = "";
     } else if (this._collectionId) {
       const collection = this._collections.find(
         (item) => item.id === this._collectionId
@@ -3746,7 +5385,7 @@ class AnyListRecipeViewCard extends HTMLElement {
       this._query || this._collectionId
         ? `<button class="button primary" data-action="clear-search">Show all recipes</button>`
         : "";
-    return `<div class="empty"><div class="empty-title">${title}</div><div class="empty-sub">${sub}</div>${showAll}</div>`;
+    return `<div class="empty"><div class="empty-title">${title}</div>${sub ? `<div class="empty-sub">${sub}</div>` : ""}${showAll}</div>`;
   }
 
   _rowHtml(recipe) {
@@ -3799,12 +5438,14 @@ class AnyListRecipeViewCard extends HTMLElement {
       .join("")}</div>`;
     return `
       <div class="detail">
-        <div class="toolbar">
-          <button class="button ghost" data-action="back">← All recipes</button>
+        <div class="detail-header">
+          <div class="toolbar">
+            <button class="button ghost" data-action="back">← All recipes</button>
+          </div>
+          ${tabBar}
         </div>
         ${this._error ? `<div class="error">${escapeHtml(this._error)}</div><button class="button primary" data-action="retry">Try again</button>` : ""}
         <h1 class="detail-name">${escapeHtml(recipe.name)}</h1>
-        ${tabBar}
         <div class="tab-panel">${this._detailTabHtml(recipe)}</div>
       </div>`;
   }
@@ -3838,14 +5479,19 @@ class AnyListRecipeViewCard extends HTMLElement {
     return `<div class="cook-total">${label} ${formatDuration(prep !== null ? prep : cook)}</div>`;
   }
 
-  // The running-timer strip (RECIPE-22): every running timer, name +
-  // remaining, above the steps. Tapping one goes to the Timers view.
-  // The remaining span carries data-remaining-for so the 1s tick can
-  // rewrite it in place without a full re-render.
+  // The running-timer strip (RECIPE-22): at most 3 pills (R-IMPL-26),
+  // most-recently-started first, then one "+N more running" pill when
+  // more timers run. Tapping any pill goes to the Timers view. The
+  // remaining span carries data-remaining-for so the 1s tick can
+  // rewrite it in place without a full re-render. The cap is a
+  // layout rule, not a data rule: the "+N more" pill says exactly
+  // how many timers the strip is hiding.
   _timerStripHtml() {
     const timers = this._runningTimers();
     if (timers.length === 0) return "";
-    return `<div class="timer-strip" aria-label="Running timers">${timers
+    const shown = this._shownStripTimers();
+    const extra = timers.length - shown.length;
+    return `<div class="timer-strip" aria-label="Running timers">${shown
       .map((timer) => {
         const remaining = timerRemainingSeconds(timer);
         return `<button class="timer-strip-item${timer.state === "paused" ? " paused" : ""}" data-action="goto-timers" aria-label="Go to ${escapeHtml(timerName(timer))} timer">
@@ -3853,7 +5499,52 @@ class AnyListRecipeViewCard extends HTMLElement {
           <span class="timer-strip-remaining" data-remaining-for="${escapeHtml(timer.entity_id)}">${remaining === null ? "" : escapeHtml(formatRemaining(remaining))}</span>
         </button>`;
       })
-      .join("")}</div>`;
+      .join("")}${extra > 0 ? `<button class="timer-strip-item timer-strip-more" data-action="goto-timers" aria-label="Go to Timers, ${extra} more running timer${extra === 1 ? "" : "s"}">+${extra} more running</button>` : ""}</div>`;
+  }
+
+  // The sticky strip summary (D4 rule 6, R-IMPL-28): a one-line
+  // summary shown only once the strip has scrolled past ("⏱ 2
+  // running · nearest 12:34"). Hidden by default; the scroll handler
+  // toggles .visible, and _syncStripSummary refreshes the "nearest"
+  // time in place. Tapping it goes to Timers (ambiguity #5: "expands
+  // in place OR goes to Timers" — this build picks Timers, matching
+  // RECIPE-22 strip-tap behaviour).
+  _timerStripSummaryHtml() {
+    const timers = this._runningTimers();
+    if (timers.length === 0) return "";
+    const nearest = timerRemainingSeconds(timers[0]);
+    return `<button type="button" class="timer-strip-summary" data-action="goto-timers" data-role="strip-summary" aria-label="Go to Timers, ${timers.length} running timer${timers.length === 1 ? "" : "s"}">⏱ ${timers.length} running · nearest <span data-role="strip-summary-time">${nearest === null ? "" : escapeHtml(formatRemaining(nearest))}</span></button>`;
+  }
+
+  // Show the sticky strip summary only once the strip has scrolled
+  // past the tracker (R-IMPL-28); hide it again when the strip is
+  // back in view. Also refreshes the "nearest" time in place. Called
+  // from the window scroll handler, from _render (a re-render drops
+  // the .visible class), and from the strip tick.
+  _syncStripSummary() {
+    if (!this._detailEl || !this._selected || this._detailTab !== "cook") return;
+    const summary = this._detailEl.querySelector('[data-role="strip-summary"]');
+    const strip = this._detailEl.querySelector(".timer-strip");
+    const tracker = this._detailEl.querySelector(".step-tracker");
+    if (!summary || !strip || !tracker) return;
+    let show = false;
+    if (
+      typeof strip.getBoundingClientRect === "function" &&
+      typeof tracker.getBoundingClientRect === "function"
+    ) {
+      const stripRect = strip.getBoundingClientRect();
+      const trackerRect = tracker.getBoundingClientRect();
+      show = stripRect.bottom < trackerRect.bottom;
+    }
+    if (summary.classList && typeof summary.classList.toggle === "function") {
+      summary.classList.toggle("visible", show);
+    }
+    const timeEl = summary.querySelector('[data-role="strip-summary-time"]');
+    if (timeEl) {
+      const timers = this._runningTimers();
+      const nearest = timers.length > 0 ? timerRemainingSeconds(timers[0]) : null;
+      timeEl.textContent = nearest === null ? "" : formatRemaining(nearest);
+    }
   }
 
   // The cooking view: ingredients (checkable) and steps (guided
@@ -3889,7 +5580,7 @@ class AnyListRecipeViewCard extends HTMLElement {
           <button class="button scaler-btn" data-action="scale-up" aria-label="More servings">+</button>
           ${isScaled ? `<span class="scaler-factor" aria-label="Scaled by factor ${factor}">×${escapeHtml(formatAmount(factor).text)}</span>` : ""}
           ${isScaled ? `<button class="button small ghost" data-action="scale-original">${showingOriginal ? "Show scaled" : "Show original"}</button>` : ""}
-          ${isScaled ? `<button class="button small ghost" data-action="scale-reset">Reset to ${escapeHtml(formatServingsRange(baseServings))}</button>` : ""}
+          ${isScaled ? `<button class="button small ghost" data-action="scale-reset">Reset servings</button>` : ""}
         </div>`
       : "";
     // Headed recipes interleave section sub-headings with ingredient
@@ -3914,12 +5605,33 @@ class AnyListRecipeViewCard extends HTMLElement {
           .join("");
     const steps = this._navigableSteps(recipe);
     const current = this._currentStepIndex(recipe.id, steps.length);
+    // The voice hint is computed from the CURRENT step (N-IMPL-19c):
+    // a step with a time chip names that chip's duration; a step
+    // without one shows NO hint. It sits directly under the sticky
+    // step navigator and above the step card, so it is visible on
+    // detail open at every size (M1 detail-opens-at-top). A
+    // bridge-missing timer error REPLACES the hint in the same slot
+    // (R-IMPL-25) — the cook reads one line, not a hint plus an error.
+    const currentStepText =
+      steps.length > 0 ? recipe.steps[steps[current].index] : null;
+    const hintStepText =
+      currentStepText != null && factor && factor !== 1 && !showingOriginal
+        ? scaleStepText(currentStepText, factor)
+        : currentStepText;
+    const voiceHint = hintStepText != null ? voiceHintForStep(hintStepText) : null;
+    const hintHtml = this._timerError
+      ? `<div class="voice-hint timer-error" role="alert">${escapeHtml(this._timerError)}</div>`
+      : voiceHint
+        ? `<div class="voice-hint">${escapeHtml(voiceHint)}</div>`
+        : "";
     const stepNav =
       steps.length > 0
         ? `<div class="step-tracker">
             <button class="button step-nav" data-action="step-prev" ${current === 0 ? "disabled" : ""} aria-label="Previous step">← Prev</button>
             <span class="step-position" aria-live="polite">Step ${current + 1} of ${steps.length}</span>
-            <button class="button step-nav" data-action="step-next" ${current === steps.length - 1 ? "disabled" : ""} aria-label="Next step">Next →</button>
+            ${current === steps.length - 1
+              ? `<button class="button step-nav" data-action="finish" aria-label="Finish cooking">Finish</button>`
+              : `<button class="button step-nav" data-action="step-next" aria-label="Next step">Next →</button>`}
           </div>`
         : "";
     // Steps render in full order (headers interleaved as section
@@ -3948,6 +5660,19 @@ class AnyListRecipeViewCard extends HTMLElement {
     const timerStatus = this._timerStatus
       ? `<div class="timer-status" role="status">${escapeHtml(this._timerStatus)}</div>`
       : "";
+    // The completion card (R-IMPL-8): shown after "Finish" at the
+    // last step. "Cook again" is the Start over action (checks
+    // cleared, step back to 1); "← Back to recipe" hides the card
+    // and stays at the last step. The card copy is the build's own
+    // wording — the design specifies the card, not its text.
+    const completionHtml = this._finishShown
+      ? `<div class="completion-card" data-role="completion" role="status">
+          <div class="completion-title">All done!</div>
+          <div class="completion-sub">You've finished all ${steps.length} steps.</div>
+          <button class="button primary" data-action="cook-again">Cook again</button>
+          <button class="button ghost" data-action="finish-dismiss">← Back to recipe</button>
+        </div>`
+      : "";
     return `
       <div class="cook-grid">
         <section class="cook-ingredients" aria-label="Ingredients">
@@ -3965,10 +5690,12 @@ class AnyListRecipeViewCard extends HTMLElement {
             <h2 class="section-title">Steps</h2>
           </div>
           ${stepNav}
-          ${this._timerStripHtml()}
-          <div class="voice-hint">${escapeHtml(VOICE_HINT)}</div>
           ${timerStatus}
-          ${stepsHtml ? `<ol class="steps">${stepsHtml}</ol>` : `<div class="status">No steps listed.</div>`}
+          ${hintHtml}
+          ${this._timerStripHtml()}
+          ${this._timerStripSummaryHtml()}
+          ${stepsHtml ? `<ol class="steps">${stepsHtml}</ol>` : `<div class="status">No steps for this recipe.</div>`}
+          ${completionHtml}
         </section>
       </div>`;
   }
@@ -4056,7 +5783,9 @@ class AnyListRecipeViewCard extends HTMLElement {
       : recipe.note;
     const hasChanges = asTrimmed(draft) !== asTrimmed(recipe.note);
     const noteStatus = this._noteStatus
-      ? `<span class="note-status${this._noteStatus.error ? " error" : ""}" role="status">${escapeHtml(this._noteStatus.text)}</span>`
+      ? this._noteStatus.retry
+        ? `<button type="button" class="note-status error" data-action="${this._noteStatus.retry}" role="status">${escapeHtml(this._noteStatus.text)}</button>`
+        : `<span class="note-status${this._noteStatus.error ? " error" : ""}" role="status">${escapeHtml(this._noteStatus.text)}</span>`
       : "";
     const rating = recipe.rating || 0;
     const stars = [1, 2, 3, 4, 5]
@@ -4066,7 +5795,9 @@ class AnyListRecipeViewCard extends HTMLElement {
       )
       .join("");
     const ratingStatus = this._ratingStatus
-      ? `<span class="rating-status${this._ratingStatus.error ? " error" : ""}" role="status">${escapeHtml(this._ratingStatus.text)}</span>`
+      ? this._ratingStatus.retry
+        ? `<button type="button" class="rating-status error" data-action="${this._ratingStatus.retry}" role="status">${escapeHtml(this._ratingStatus.text)}</button>`
+        : `<span class="rating-status${this._ratingStatus.error ? " error" : ""}" role="status">${escapeHtml(this._ratingStatus.text)}</span>`
       : "";
     return `
       <div class="note-view">
@@ -4124,6 +5855,7 @@ if (typeof module !== "undefined" && module.exports) {
     isKioskMode,
     pluralTimeUnit,
     timerName,
+    timerSensorList,
     timerRemainingSeconds,
     formatRemaining,
     runningTimers,
@@ -4134,6 +5866,20 @@ if (typeof module !== "undefined" && module.exports) {
     RECIPE_SESSION_KEY,
     parseRecipeSession,
     serializeRecipeSession,
+    sanitizeRecipeStep,
+    voiceHintForStep,
+    KIOSK_SESSION_KEY,
+    readKioskFlag,
+    storeKioskFlag,
+    isKioskSession,
+    withKioskQuery,
+    reapplyKioskIfNeeded,
+    timerBadgeState,
+    timerBadgeFromHassStates,
+    NIGHT_SETTING_KEY,
+    parseNightSetting,
+    readNightSetting,
+    isNightNow,
   };
 }
 

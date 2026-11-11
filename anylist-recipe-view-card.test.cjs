@@ -48,6 +48,12 @@ const {
   RECIPE_SESSION_KEY,
   parseRecipeSession,
   serializeRecipeSession,
+  sanitizeRecipeStep,
+  voiceHintForStep,
+  timerBadgeState,
+  timerBadgeFromHassStates,
+  parseNightSetting,
+  isNightNow,
 } = require("./anylist-recipe-view-card.js");
 
 // A recipe exactly as the AnyList integration serializes it
@@ -1370,13 +1376,19 @@ test("Phase 7 CSS: tablet rules, bottom-edge padding, reduced motion", () => {
   assert.match(CARD_CSS, /\.screen\.dev-tablet \.tab \{ min-height: 56px;/);
   assert.match(CARD_CSS, /\.screen\.dev-tablet \.time-chip \{ min-height: 56px; \}/);
   assert.match(CARD_CSS, /\.screen\.dev-tablet \.star \{ min-width: 56px; min-height: 56px;/);
-  assert.match(CARD_CSS, /\.screen\.dev-tablet \.nav-strip-button \{ min-height: 56px;/);
-  // Bottom-edge fix: list + detail padding equals the sticky strip
-  // height (mobile 60px, tablet 76px).
-  assert.match(CARD_CSS, /\.screen\.dev-mobile \.list \{ padding-bottom: 60px; \}/);
-  assert.match(CARD_CSS, /\.screen\.dev-mobile \.detail \{ padding-bottom: 60px; \}/);
-  assert.match(CARD_CSS, /\.screen\.dev-tablet \.list \{ padding-bottom: 76px; \}/);
-  assert.match(CARD_CSS, /\.screen\.dev-tablet \.detail \{[^}]*padding-bottom: 76px;/s);
+  // Wave 1 (D-N1): the strip buttons are the full bar height — no
+  // min-height on .nav-strip-button any more; the bar heights are
+  // hub 96px, tablet 72px, phone 64px + safe-area.
+  assert.match(CARD_CSS, /\.nav-strip \{[^}]*height: 96px;/s);
+  assert.match(CARD_CSS, /\.screen\.dev-tablet \.nav-strip \{ height: 72px; \}/);
+  assert.doesNotMatch(CARD_CSS, /\.nav-strip-button \{[^}]*min-height:/s);
+  // Bottom-edge fix: list + detail padding equals the fixed strip
+  // height + 8px (mobile 72px, tablet 80px, hub 104px).
+  assert.match(CARD_CSS, /\.screen\.dev-mobile \.list \{ padding-bottom: 72px; \}/);
+  assert.match(CARD_CSS, /\.screen\.dev-mobile \.detail \{ padding-bottom: 72px; \}/);
+  assert.match(CARD_CSS, /\.screen\.dev-tablet \.list \{ padding-bottom: 80px; \}/);
+  assert.match(CARD_CSS, /\.screen\.dev-tablet \.detail \{[^}]*padding-bottom: 80px;/s);
+  assert.match(CARD_CSS, /\.screen\.dev-hub \.list,\s*\.screen\.dev-hub \.detail \{ padding-bottom: 104px; \}/);
   // Reduced motion (DESIGN-6, WCAG 2.2): the skeleton pulse stops.
   assert.ok(CARD_CSS.includes("@media (prefers-reduced-motion: reduce)"));
   assert.match(
@@ -1393,7 +1405,9 @@ test("Phase 7 CSS: tablet rules, bottom-edge padding, reduced motion", () => {
 
 test("parseRecipeSession/serializeRecipeSession: round-trip, garbage -> null, bad id -> null", () => {
   assert.equal(RECIPE_SESSION_KEY, "family-hub:recipe:state");
-  const state = { openId: "abc123", listScrollY: 400, detailScrollY: 120 };
+  // R-IMPL-14b: the session carries the list state too — query,
+  // collectionId, sort — so a reload re-opens the list as left.
+  const state = { openId: "abc123", step: 2, listScrollY: 400, detailScrollY: 120, query: "pasta", collectionId: "col-x", sort: "cook" };
   assert.deepEqual(parseRecipeSession(serializeRecipeSession(state)), state);
   assert.equal(parseRecipeSession(null), null);
   assert.equal(parseRecipeSession(""), null);
@@ -1401,16 +1415,27 @@ test("parseRecipeSession/serializeRecipeSession: round-trip, garbage -> null, ba
   assert.equal(parseRecipeSession("[1,2]"), null);
   assert.deepEqual(parseRecipeSession("{}"), {
     openId: null,
+    step: null,
     listScrollY: 0,
     detailScrollY: 0,
+    query: "",
+    collectionId: "",
+    sort: "name",
   });
   // A blank or non-string id means list view; scrolls sanitise.
   assert.deepEqual(parseRecipeSession('{"openId": "  ", "listScrollY": -5, "detailScrollY": 12.9}'), {
     openId: null,
+    step: null,
     listScrollY: 0,
     detailScrollY: 12,
+    query: "",
+    collectionId: "",
+    sort: "name",
   });
   assert.deepEqual(parseRecipeSession('{"openId": 42}').openId, null);
+  // An unknown sort key falls back to "name"; a bad one never sticks.
+  assert.equal(parseRecipeSession('{"sort": "bogus"}').sort, "name");
+  assert.equal(parseRecipeSession('{"sort": "prep"}').sort, "prep");
 });
 
 // -- Phase 7: success green (OQ-1) -----------------------------------------
@@ -1425,4 +1450,120 @@ test("Phase 7 CSS: the Saved status lines use the success green, errors stay red
     CARD_CSS,
     /\.note-status\.error,\s*\.rating-status\.error \{ color: var\(--error\); \}/s
   );
+});
+
+// -- Wave 1 (Navigation N-IMPL-5/19/21/24) ---------------------------------
+
+test("Wave 1: voiceHintForStep computes the hint from the current step (N-IMPL-19c)", () => {
+  // Range: the upper bound, singular unit.
+  assert.equal(
+    voiceHintForStep("Simmer for 6 to 8 minutes."),
+    "Say 'Okay Nabu, start a 8 minute timer'"
+  );
+  assert.equal(
+    voiceHintForStep("Boil the pasta for 10 minutes."),
+    "Say 'Okay Nabu, start a 10 minute timer'"
+  );
+  assert.equal(
+    voiceHintForStep("Rest for 60 seconds."),
+    "Say 'Okay Nabu, start a 60 second timer'"
+  );
+  // Combined durations: the first phrase wins.
+  assert.equal(
+    voiceHintForStep("Rest for 1 hour 30 minutes."),
+    "Say 'Okay Nabu, start a 1 hour timer'"
+  );
+  // "a minute" reads as 1 minute.
+  assert.equal(
+    voiceHintForStep("Leave for a minute."),
+    "Say 'Okay Nabu, start a 1 minute timer'"
+  );
+  // No time chip, no hint.
+  assert.equal(voiceHintForStep("Mix."), null);
+  assert.equal(voiceHintForStep(""), null);
+  assert.equal(voiceHintForStep(null), null);
+});
+
+test("Wave 1: sanitizeRecipeStep keeps 1-based steps, nothing else (N-IMPL-21)", () => {
+  assert.equal(sanitizeRecipeStep(2), 2);
+  assert.equal(sanitizeRecipeStep("3"), 3);
+  assert.equal(sanitizeRecipeStep(2.9), 2);
+  assert.equal(sanitizeRecipeStep(0), null);
+  assert.equal(sanitizeRecipeStep(-1), null);
+  assert.equal(sanitizeRecipeStep(null), null);
+  assert.equal(sanitizeRecipeStep("nope"), null);
+});
+
+test("Wave 1: timerBadgeState counts ACTIVE + PAUSED, colours by running/finished (#25-D)", () => {
+  assert.equal(timerBadgeState([]), null);
+  assert.equal(timerBadgeState(null), null);
+  assert.deepEqual(timerBadgeState([{ state: "active", remaining: 600 }]), {
+    count: 1,
+    tone: "count",
+  });
+  assert.deepEqual(timerBadgeState([{ state: "paused", remaining: 30 }]), {
+    count: 1,
+    tone: "count",
+  });
+  // A RUNNING timer in its last 60 s is amber — a paused one is not.
+  assert.deepEqual(timerBadgeState([{ state: "active", remaining: 30 }]), {
+    count: 1,
+    tone: "soon",
+  });
+  assert.deepEqual(
+    timerBadgeState([
+      { state: "active", remaining: 600 },
+      { state: "paused", remaining: 30 },
+    ]),
+    { count: 2, tone: "count" }
+  );
+  // A finished timer turns the badge red — and shows alone when
+  // nothing is active or paused (the finished-only reading).
+  assert.deepEqual(timerBadgeState([{ state: "finished", remaining: 0 }]), {
+    count: 1,
+    tone: "finished",
+  });
+  assert.deepEqual(
+    timerBadgeState([
+      { state: "active", remaining: 600 },
+      { state: "finished", remaining: 0 },
+    ]),
+    { count: 1, tone: "finished" }
+  );
+});
+
+test("Wave 1: timerBadgeFromHassStates reads the bridge sensors", () => {
+  assert.equal(timerBadgeFromHassStates(null), null);
+  const states = {
+    "sensor.satellite_timer_pasta": {
+      state: "active",
+      attributes: { remaining: 600 },
+    },
+    "sensor.satellite_timer_soup": {
+      state: "paused",
+      attributes: { remaining: 30 },
+    },
+    "light.kitchen": { state: "on", attributes: {} },
+  };
+  assert.deepEqual(timerBadgeFromHassStates(states), { count: 2, tone: "count" });
+});
+
+test("Wave 1: night mode has no default hours; overnight spans work (N-IMPL-24)", () => {
+  assert.equal(parseNightSetting(null), null);
+  assert.equal(parseNightSetting(""), null);
+  assert.equal(parseNightSetting("not json"), null);
+  assert.equal(parseNightSetting('{"start":"22:00"}'), null);
+  assert.equal(parseNightSetting('{"start":"22:00","end":"22:00"}'), null);
+  assert.deepEqual(parseNightSetting('{"start":"22:00","end":"06:00"}'), {
+    start: 1320,
+    end: 360,
+  });
+  const night = { start: 1320, end: 360 };
+  assert.equal(isNightNow(null, new Date(2026, 0, 1, 23, 0)), false);
+  assert.equal(isNightNow(night, new Date(2026, 0, 1, 23, 0)), true);
+  assert.equal(isNightNow(night, new Date(2026, 0, 1, 3, 0)), true);
+  assert.equal(isNightNow(night, new Date(2026, 0, 1, 12, 0)), false);
+  const day = { start: 0, end: 360 };
+  assert.equal(isNightNow(day, new Date(2026, 0, 1, 3, 0)), true);
+  assert.equal(isNightNow(day, new Date(2026, 0, 1, 12, 0)), false);
 });
