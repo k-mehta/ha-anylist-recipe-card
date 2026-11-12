@@ -1,98 +1,101 @@
 # Adaptive layout
 
-Both dashboard cards — the AnyList recipe card
-(`k-mehta/ha-anylist-recipe-card`) and the Satellite Timers card
-(`k-mehta/ha-satellite-timers`) — use **one** device-detection
-mechanism and the same three device categories. This file is identical
-in both repos; if you change the detection or the layout rules, change
-them in both places.
+All four dashboard cards — the AnyList recipe card
+(`k-mehta/ha-anylist-recipe-card`), the Satellite Timers card
+(`k-mehta/ha-satellite-timers`), the home card and the nav strip in
+`k-mehta/pi-family-hub` — use **one** identity mechanism and the same
+four device categories. The mechanism lives in one module,
+`installer/dashboard/family-hub-core.js` in pi-family-hub, which the
+cards import; there are no per-card copies (enforced by the
+no-copies test, `installer/dashboard/no-copies.test.cjs`). This file
+is identical in both card repos; if you change the identity or the
+layout rules, change them in both places.
 
 ## Device categories
 
 | Category | What it is | How it is recognised |
 | --- | --- | --- |
-| `hub` | The kitchen kiosk: a Chromium kiosk on Raspberry Pi OS, 1920×1200 touch display, landscape | Touch screen, landscape, at least 1600 px wide |
-| `desktop` | A large screen with a mouse or trackpad | Fine pointer (mouse), or a wide screen with no pointer information |
-| `mobile` | A phone or tablet, portrait or landscape | Mobile user agent, or a narrow viewport, or a touch screen that is not hub-sized |
+| `hub` | The kitchen kiosk: the Chromium kiosk on Raspberry Pi OS | The browser's registered Browser Mod id matches the hub id — identity, never size |
+| `desktop` | A large screen with a mouse or trackpad | Fine pointer at 1024 px or wider, or a wide screen with no pointer information |
+| `tablet` | A touch tablet, either orientation | Touch screen 768–1024 px wide with the shorter side at least 600 px |
+| `mobile` | A phone, portrait or landscape | A narrow viewport, or a coarse pointer with no fine pointer |
 
 Orientation is separate from category: **landscape** is width ≥
 height, **portrait** is width < height. The category picks the control
 sizes and the base layout; orientation picks the grid (for example one
 column in portrait, two in landscape on mobile).
 
-## How detection works
+## How identity works
 
-Each card reads four signals from the browser it is running in:
+Identity is the registered Browser Mod browser id — never a screen
+size, never the `?kiosk` launch parameter alone. `identify(hass, env)`
+in core.js resolves the browser's id (`resolveBrowserModId`: the id
+stored by Browser Mod in local storage, or the exactly-one-match
+`browser_path` sensor) and compares it with the hub id registered
+in the core (`HUB_BROWSER_ID`, substituted at deploy time by the
+wizard). A match is `kind: "wall"`; anything else is `kind:
+"unknown"` and runs desktop-safe. A mismatch on a `?kiosk` launch
+shows the identity-mismatch banner; a mismatch without `?kiosk`
+logs a console warning and shows full Home Assistant chrome. With
+no hub id registered at all (deploy, or a no-browser wizard run) the
+card runs desktop-safe with no banner.
 
-- **Viewport width/height** — the strongest signal. The layout
-  follows the viewport, not the device name, so a narrow desktop
-  window gets the single-column layout too.
-- **Pointer type** — `matchMedia("(pointer: coarse)")` is a
-  finger/touch screen; `"(pointer: fine)"` is a mouse/trackpad.
-- **Touch** — `"ontouchstart" in window`, or
-  `navigator.maxTouchPoints > 0`.
-- **User agent** — only as a tiebreaker for phones/tablets, never
-  alone: a desktop browser can spoof it, and a kiosk can strip it.
+`?kiosk` is launch-only: it tells the card the kiosk was launched
+from the kiosk URL (so the nav strip shows even on desktop, where
+Home Assistant's own tabs would otherwise be the navigation). It
+never confers hub identity — a desktop tab opened with `?kiosk`
+still reads as a desktop.
 
-Precedence (first match wins) — the unified rule (spec §3.7):
+## How the layout category is picked
 
-1. The exact 1920×1200 panel signature, either orientation, is the
-   hub — FIRST, before any pointer check, so a hub with a mouse
-   attached (or a bench test with mouse only) still reads as the hub.
-   The same panel rotated (1200×1920) is the hub in portrait (O2-01).
-   A bare "width ≥ 1600 + landscape → hub" rule is FORBIDDEN: it
-   classifies every 1920×1080 desktop monitor as a hub.
-2. A phone/tablet user agent (`Mobi`, `Android`, `iPhone`, `iPad`,
-   `iPod`) is mobile.
-3. A viewport narrower than 768 px is mobile.
-4. A coarse pointer on anything but a huge landscape screen is
-   mobile (phones and tablets).
-5. A touch screen that is hub-sized (at least 1600 px wide) and
-   landscape is the hub — even when a mouse is also attached. The
-   kiosk has a mouse, so a fine pointer is present too; checking fine
-   first would mis-detect the hub as a desktop. Touch + hub size
-   wins over fine pointer.
-6. A coarse pointer on a huge landscape screen is the hub (a touch
-   screen whose touch signal is missing but whose pointer is coarse).
-7. A fine pointer is desktop.
-8. With no pointer information: a viewport at least 1024 px wide is
-   desktop; anything else is mobile.
+`deviceFromIdentity(identity, widthPx, heightPx)` in core.js maps an
+`identify()` result plus the live viewport to a category. The wall
+identity is checked FIRST: a wall is `hub` at any size, in either
+orientation — if the kiosk display changes size, nothing here needs
+to change. For everything else the mapping uses only viewport width
+and pointer/touch signals, in this order:
 
-The detection is a pure function, `detectDevice(env)`, that takes
-`{ width, height, coarsePointer, finePointer, touch, userAgent }` and
-returns `{ category, orientation }`. It has no browser access, so it
-is unit-testable in node. `readDeviceEnv()` reads the live browser
-and returns `null` outside a browser, where the card keeps its base
-layout. The card applies the result as classes on its root element —
-`dev-hub`, `dev-desktop` or `dev-mobile`, plus `orient-landscape` or
-`orient-portrait` — and the CSS keys the adaptive layout off them. It
-re-detects on resize, so rotating a phone or resizing a window swaps
-the layout live.
+1. The wall (`kind: "wall"`) is `hub`.
+2. A viewport narrower than 768 px is `mobile`.
+3. A touch screen 768–1024 px wide with the shorter side at least
+   600 px is `tablet`.
+4. A fine pointer at 1024 px or wider is `desktop`.
+5. A coarse pointer with no fine pointer is `mobile`.
+6. A fine pointer is `desktop`.
+7. With no pointer information: a viewport at least 1024 px wide is
+   `desktop`; anything else is `mobile`.
+
+There is no user-agent sniffing anywhere in the mechanism, and no
+exact-size check: a 1920×1080 desktop monitor is `desktop`, a
+1920×1200 laptop is `desktop`, and the 1920×1200 wall is `hub`
+because its browser id matches, not because of its size. The card
+applies the result as classes on its root element — `dev-hub`,
+`dev-desktop`, `dev-tablet` or `dev-mobile`, plus `orient-landscape`
+or `orient-portrait` — and the CSS keys the adaptive layout off
+them. It re-detects on resize, so rotating a phone or resizing a
+window swaps the layout live.
 
 Known limits (every fallback still renders a usable layout, never a
 broken one):
 
-- A 1920×1200 laptop reads as the hub: the panel signature is the
-  only discriminator, and a laptop that size is indistinguishable
-  from the wall panel by size alone. That is fine: the hub layout is
-  just big targets on a wide screen.
-- A phone in desktop mode (no mobile user agent) still reads as
-  mobile by width (rule 3).
-- The hub is recognised by size + touch + landscape, not by name: if
-  the kiosk display changes size, the thresholds above (1600 px hub
-  minimum, 768 px mobile maximum, 1024 px desktop minimum) are the
-  place to adjust.
+- A browser whose id is not registered (for example a fresh kiosk
+  before the wizard runs, or any other browser) runs desktop-safe:
+  usable, but without the wall-only behaviour.
+- A phone in desktop mode still reads as mobile by width (rule 2).
+- A touchscreen laptop with no fine pointer outside the tablet band
+  reads as mobile — it is indistinguishable from a touch-only
+  screen by these signals alone.
 
-## One mechanism, two copies
+## One mechanism, one copy
 
-Each card is a single standalone file with no imports, so the
-detection code cannot be shared by import. The block marked
-`Device detection (SHARED MECHANISM)` is copied verbatim into each
-card file — same code, same comments — and the two copies must stay
-byte-identical. If you change the signals, the precedence, or the
-category names in one card, change them in the other too, and update
-this file. The tests in each repo cover the detection for that repo's
-card.
+The identity and layout code lives in exactly one place:
+`installer/dashboard/family-hub-core.js`. Each card imports it
+(`_loadCore` / the core-injection harness in the tests) and calls
+`identify()` and `deviceFromIdentity()` — no card carries its own
+detection. The old per-card `detectDevice` copies, the exact
+1920×1200 panel signature, and the kiosk session flag are deleted;
+the no-copies test fails the build if any of them reappears outside
+core.js.
 
 ## Layout per category
 
@@ -163,12 +166,19 @@ expected.
 
 ## How it is verified
 
-- **Node tests in each repo** cover `detectDevice` for every category
-  and orientation (including the edge cases: desktop touchscreen
-  reading as hub, the hub with a mouse attached still reading as hub,
-  narrow desktop window reading as mobile, phone in desktop mode,
-  no-pointer-info fallbacks) and the layout classes being applied to
-  the card root, plus a resize re-detection test.
+- **Node tests in pi-family-hub** cover `identify()` and
+  `deviceFromIdentity()` for every category and orientation
+  (including the edge cases: a 1920×1080 desktop monitor reading as
+  desktop, the wall reading as hub at any size, a narrow desktop
+  window reading as mobile, no-pointer-info fallbacks, an
+  unregistered browser running desktop-safe) and the layout classes
+  being applied to the card root, plus a resize re-detection test.
+  The per-card DOM suites inject the real core and cover the same
+  mapping through each card.
+- **The no-copies test** (`installer/dashboard/no-copies.test.cjs`)
+  fails the build if a per-card `detectDevice`, an exact-size
+  signature constant, or any kiosk session-flag machinery reappears
+  outside core.js.
 - **Screenshots in a real Chromium** at all six sizes above, viewed
   before release: recipe list, cooking view (Cook tab with
   ingredients + steps, and the Notes tab), a search, and a long-name

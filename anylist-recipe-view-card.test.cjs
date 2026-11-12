@@ -37,9 +37,11 @@ const {
   renderIngredientRow,
   sortRecipes,
   filterByCollection,
-  detectDevice,
-  readDeviceEnv,
-  isKioskMode,
+  CORE_RESOURCE_PATH,
+  CORE_LOOKUP_RETRY_THROTTLE_MS,
+  CORE_LOOKUP_INTERVAL_MS,
+  REQUIRED_CORE,
+  _setCoreForTests,
   timerName,
   timerRemainingSeconds,
   formatRemaining,
@@ -55,6 +57,61 @@ const {
   parseNightSetting,
   isNightNow,
 } = require("./anylist-recipe-view-card.js");
+const recipeModule = require("./anylist-recipe-view-card.js");
+
+// core.js is an ES module in the pi-family-hub repo — node loads it
+// through a byte-identical .mjs copy (same pattern as the core suite).
+// The recipe card imports core for identity, so its tests load the
+// real core rather than a stub.
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+// FAMILY_HUB_CORE_PATH overrides the core location (default: the
+// shared pi-family-hub worktree's dashboard core).
+const corePath =
+  process.env.FAMILY_HUB_CORE_PATH ||
+  path.join(
+    __dirname,
+    "../goals/diy-family-hub-raspberry-pi/files/local-git/pi-family-hub/installer/dashboard/family-hub-core.js"
+  );
+assert.ok(
+  fs.existsSync(corePath),
+  `family-hub-core.js missing at ${corePath} — the recipe card imports it for identity`
+);
+const coreTmp = fs.mkdtempSync(path.join(os.tmpdir(), "family-hub-recipe-test-"));
+const coreMjs = path.join(coreTmp, "family-hub-core.mjs");
+fs.copyFileSync(corePath, coreMjs);
+const core = require(coreMjs);
+// The core the tests load must be the R1-3-or-later core: a stale
+// pre-R1-3 core (no deviceFromIdentity) used to fail ~30 tests with
+// "deviceFromIdentity is not a function". Fail once, naming the cause
+// and the override, instead of failing every identity test cryptically.
+assert.equal(
+  typeof core.deviceFromIdentity,
+  "function",
+  `family-hub-core.js at ${corePath} predates deviceFromIdentity — ` +
+    `the pi-family-hub worktree is on a pre-R1-3 branch; switch it to ` +
+    `rebuild/r1, or point FAMILY_HUB_CORE_PATH at a core that exports it`
+);
+assert.equal(
+  typeof core.checkBridgeContract,
+  "function",
+  `family-hub-core.js at ${corePath} predates checkBridgeContract — ` +
+    `the pi-family-hub worktree is on a pre-R1-5 core; switch it to ` +
+    `rebuild/r1, or point FAMILY_HUB_CORE_PATH at a core that exports it`
+);
+const { deviceFromIdentity, identify, checkCoreVersion } = core;
+
+// Identity helpers for the mapping tests: deviceFromIdentity takes an
+// identify() result + viewport. Wall identities are hub at ANY size
+// (§4 — no size check, ever); unknown identities fall to the viewport
+// + pointer mapping (core's deviceFromIdentity, one copy).
+function wallIdentity() {
+  return { kind: "wall", layout: {} };
+}
+function unknownIdentity(layout) {
+  return { kind: "unknown", layout: layout || {} };
+}
 
 // A recipe exactly as the AnyList integration serializes it
 // (_serialize_recipe in custom_components/anylist/__init__.py).
@@ -594,319 +651,183 @@ const IPHONE_UA =
 const IPAD_UA =
   "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
 
-test("detectDevice: the hub is a huge landscape touch screen", () => {
-  assert.deepEqual(
-    detectDevice({
-      width: 1920,
-      height: 1200,
-      coarsePointer: true,
-      finePointer: false,
-      touch: true,
-      userAgent: HUB_UA,
-    }),
-    { category: "hub", orientation: "landscape" }
-  );
-  // No user agent at all: size + touch + landscape is enough.
-  assert.deepEqual(
-    detectDevice({
-      width: 1920,
-      height: 1200,
-      coarsePointer: true,
-      finePointer: false,
-      touch: true,
-      userAgent: "",
-    }),
-    { category: "hub", orientation: "landscape" }
-  );
+test("identity: the wall is hub at any size (§4)", () => {
+  // Kind, not size: the registered wall reads hub whatever its
+  // viewport or pointer — a huge landscape touch screen, with or
+  // without a user agent, with or without a mouse attached.
+  const touch = { coarsePointer: true, touchPoints: 1 };
+  assert.deepEqual(deviceFromIdentity(wallIdentity(), 1920, 1200), {
+    category: "hub",
+    orientation: "landscape",
+  });
+  assert.deepEqual(deviceFromIdentity(wallIdentity(), 1200, 1920), {
+    category: "hub",
+    orientation: "portrait",
+  });
+  // The same viewport WITHOUT the wall identity is not the hub.
+  assert.deepEqual(deviceFromIdentity(unknownIdentity(touch), 1920, 1200), {
+    category: "mobile",
+    orientation: "landscape",
+  });
 });
 
-test("detectDevice: a hub-sized touch-only screen is mobile, not the hub (P8-16)", () => {
-  // Rule 8 (touch + >=1600px landscape = hub) is deleted: a
-  // touch-only screen at 1920x1080 is not the hub — only the exact
-  // panel signature (either orientation, rule 1) is. Coarse with no
-  // fine pointer is mobile.
-  assert.deepEqual(
-    detectDevice({
-      width: 1920,
-      height: 1080,
-      coarsePointer: true,
-      finePointer: false,
-      touch: true,
-      userAgent: DESKTOP_UA,
-    }),
-    { category: "mobile", orientation: "landscape" }
-  );
+test("identity: a hub-sized touch-only screen is mobile, not the hub (P8-16)", () => {
+  // A touch-only screen at 1920x1080 is not the hub — there is no
+  // size rule left that could call it the wall. Coarse with no fine
+  // pointer is mobile.
+  const touch = { coarsePointer: true, touchPoints: 1 };
+  assert.deepEqual(deviceFromIdentity(unknownIdentity(touch), 1920, 1080), {
+    category: "mobile",
+    orientation: "landscape",
+  });
   // The same screen WITH a mouse (a touchscreen laptop, V1080-01)
   // is desktop: fine + width >=1024 wins over coarse.
   assert.deepEqual(
-    detectDevice({
-      width: 1920,
-      height: 1080,
-      coarsePointer: true,
-      finePointer: true,
-      touch: true,
-      userAgent: DESKTOP_UA,
-    }),
+    deviceFromIdentity(
+      unknownIdentity({ coarsePointer: true, finePointer: true, touchPoints: 1 }),
+      1920,
+      1080
+    ),
     { category: "desktop", orientation: "landscape" }
   );
 });
 
-test("detectDevice: the hub with a mouse attached still reads as the hub", () => {
+test("identity: the wall with a mouse attached still reads as the hub", () => {
   // The kiosk has a mouse attached, so it reports a fine pointer too.
-  // A hub-sized landscape touch screen is the hub regardless of the
-  // mouse — the mouse is for setup, not for cooking. Checking fine
-  // first would mis-detect the hub as a desktop (the audit's finding).
+  // Kind wins over the pointer: the wall is the hub regardless of
+  // the mouse — the mouse is for setup, not for cooking.
+  assert.deepEqual(deviceFromIdentity(wallIdentity(), 1920, 1200), {
+    category: "hub",
+    orientation: "landscape",
+  });
+  // The same viewport WITHOUT the wall identity is a desktop.
   assert.deepEqual(
-    detectDevice({
-      width: 1920,
-      height: 1200,
-      coarsePointer: true,
-      finePointer: true,
-      touch: true,
-      userAgent: HUB_UA,
-    }),
-    { category: "hub", orientation: "landscape" }
-  );
-  // Even when only the fine pointer is reported (no coarse), touch +
-  // hub size + landscape still wins.
-  assert.deepEqual(
-    detectDevice({
-      width: 1920,
-      height: 1200,
-      coarsePointer: false,
-      finePointer: true,
-      touch: true,
-      userAgent: HUB_UA,
-    }),
-    { category: "hub", orientation: "landscape" }
-  );
-});
-
-test("detectDevice: a mouse is desktop", () => {
-  assert.deepEqual(
-    detectDevice({
-      width: 1440,
-      height: 900,
-      coarsePointer: false,
-      finePointer: true,
-      touch: false,
-      userAgent: DESKTOP_UA,
-    }),
-    { category: "desktop", orientation: "landscape" }
-  );
-  assert.deepEqual(
-    detectDevice({
-      width: 1280,
-      height: 800,
-      coarsePointer: false,
-      finePointer: true,
-      touch: false,
-      userAgent: DESKTOP_UA,
-    }),
+    deviceFromIdentity(
+      unknownIdentity({ finePointer: true, touchPoints: 1 }),
+      1920,
+      1200
+    ),
     { category: "desktop", orientation: "landscape" }
   );
 });
 
-test("detectDevice: a narrow desktop window gets the mobile layout (the layout follows the viewport)", () => {
+test("identity: a mouse is desktop", () => {
   assert.deepEqual(
-    detectDevice({
-      width: 700,
-      height: 900,
-      coarsePointer: false,
-      finePointer: true,
-      touch: false,
-      userAgent: DESKTOP_UA,
-    }),
+    deviceFromIdentity(unknownIdentity({ finePointer: true }), 1440, 900),
+    { category: "desktop", orientation: "landscape" }
+  );
+  assert.deepEqual(
+    deviceFromIdentity(unknownIdentity({ finePointer: true }), 1280, 800),
+    { category: "desktop", orientation: "landscape" }
+  );
+});
+
+test("identity: a narrow desktop window gets the mobile layout (the layout follows the viewport)", () => {
+  assert.deepEqual(
+    deviceFromIdentity(unknownIdentity({ finePointer: true }), 700, 900),
     { category: "mobile", orientation: "portrait" }
   );
 });
 
-test("detectDevice: phones are mobile in both orientations", () => {
-  assert.deepEqual(
-    detectDevice({
-      width: 390,
-      height: 844,
-      coarsePointer: true,
-      finePointer: false,
-      touch: true,
-      userAgent: IPHONE_UA,
-    }),
-    { category: "mobile", orientation: "portrait" }
-  );
-  assert.deepEqual(
-    detectDevice({
-      width: 844,
-      height: 390,
-      coarsePointer: true,
-      finePointer: false,
-      touch: true,
-      userAgent: IPHONE_UA,
-    }),
-    { category: "mobile", orientation: "landscape" }
-  );
+test("identity: phones are mobile in both orientations", () => {
+  const touch = { coarsePointer: true, touchPoints: 1 };
+  assert.deepEqual(deviceFromIdentity(unknownIdentity(touch), 390, 844), {
+    category: "mobile",
+    orientation: "portrait",
+  });
+  assert.deepEqual(deviceFromIdentity(unknownIdentity(touch), 844, 390), {
+    category: "mobile",
+    orientation: "landscape",
+  });
 });
 
-test("detectDevice: a mobile user agent wins over a desktop-sized viewport", () => {
+test("identity: no user-agent sniffing — a wide viewport is desktop, not mobile", () => {
+  // The old "iPhone UA wins over a desktop-sized viewport" rule is
+  // gone with the UA sniffing: a 1440px viewport with a fine pointer
+  // is a desktop, whatever the UA string used to say. A phone reads
+  // mobile by its width (<768px), not its UA.
   assert.deepEqual(
-    detectDevice({
-      width: 1440,
-      height: 900,
-      coarsePointer: false,
-      finePointer: true,
-      touch: false,
-      userAgent: IPHONE_UA,
-    }),
-    { category: "mobile", orientation: "landscape" }
+    deviceFromIdentity(unknownIdentity({ finePointer: true }), 1440, 900),
+    { category: "desktop", orientation: "landscape" }
   );
+  assert.equal(deviceFromIdentity(unknownIdentity({}), 390, 844).category, "mobile");
 });
 
-test("detectDevice: tablets are tablets in both orientations (DESIGN-9)", () => {
-  assert.deepEqual(
-    detectDevice({
-      width: 768,
-      height: 1024,
-      coarsePointer: true,
-      finePointer: false,
-      touch: true,
-      userAgent: IPAD_UA,
-    }),
-    { category: "tablet", orientation: "portrait" }
-  );
-  assert.deepEqual(
-    detectDevice({
-      width: 1024,
-      height: 768,
-      coarsePointer: true,
-      finePointer: false,
-      touch: true,
-      userAgent: IPAD_UA,
-    }),
-    { category: "tablet", orientation: "landscape" }
-  );
+test("identity: tablets are tablets in both orientations (DESIGN-9)", () => {
+  const touch = { coarsePointer: true, touchPoints: 1 };
+  assert.deepEqual(deviceFromIdentity(unknownIdentity(touch), 768, 1024), {
+    category: "tablet",
+    orientation: "portrait",
+  });
+  assert.deepEqual(deviceFromIdentity(unknownIdentity(touch), 1024, 768), {
+    category: "tablet",
+    orientation: "landscape",
+  });
 });
 
-test("detectDevice: the rotated panel (1200x1920) is the portrait hub (O2-01)", () => {
-  // The wall rotated is the SAME panel, so rule 1 catches it in
-  // either orientation — it gets the hub layout (with the portrait
-  // reflow), not the phone layout. Without this, Home would read hub
-  // at 1200x1920 while Recipes read mobile, and the O2-01 portrait
+test("identity: the rotated wall is the portrait hub (O2-01)", () => {
+  // The wall rotated is the SAME wall, so kind wins in either
+  // orientation — it gets the hub layout (with the portrait reflow),
+  // not the phone layout. Without this, Home would read hub at
+  // 1200x1920 while Recipes read mobile, and the O2-01 portrait
   // layout would never trigger in the recipe card.
-  assert.deepEqual(
-    detectDevice({
-      width: 1200,
-      height: 1920,
-      coarsePointer: true,
-      finePointer: false,
-      touch: true,
-      userAgent: HUB_UA,
-    }),
-    { category: "hub", orientation: "portrait" }
-  );
-  // No user agent at all: size + touch + portrait is enough.
-  assert.deepEqual(
-    detectDevice({
-      width: 1200,
-      height: 1920,
-      coarsePointer: true,
-      finePointer: false,
-      touch: true,
-      userAgent: "",
-    }),
-    { category: "hub", orientation: "portrait" }
-  );
-  // A mouse attached does not demote it: rule 1 fires before any
-  // pointer check.
-  assert.deepEqual(
-    detectDevice({
-      width: 1200,
-      height: 1920,
-      coarsePointer: false,
-      finePointer: true,
-      touch: true,
-      userAgent: HUB_UA,
-    }),
-    { category: "hub", orientation: "portrait" }
-  );
-  // 1080x1920 is NOT the panel: a fine pointer is a desktop, and a
+  assert.deepEqual(deviceFromIdentity(wallIdentity(), 1200, 1920), {
+    category: "hub",
+    orientation: "portrait",
+  });
+  // 1080x1920 is NOT the wall: a fine pointer is a desktop, and a
   // coarse-only touch screen outside the tablet band is mobile.
   assert.deepEqual(
-    detectDevice({
-      width: 1080,
-      height: 1920,
-      coarsePointer: false,
-      finePointer: true,
-      touch: false,
-      userAgent: "",
-    }),
+    deviceFromIdentity(unknownIdentity({ finePointer: true }), 1080, 1920),
     { category: "desktop", orientation: "portrait" }
   );
   assert.deepEqual(
-    detectDevice({
-      width: 1080,
-      height: 1920,
-      coarsePointer: true,
-      finePointer: false,
-      touch: true,
-      userAgent: "",
-    }),
+    deviceFromIdentity(
+      unknownIdentity({ coarsePointer: true, touchPoints: 1 }),
+      1080,
+      1920
+    ),
     { category: "mobile", orientation: "portrait" }
   );
 });
 
-test("detectDevice: a huge portrait touch screen that is not the panel signature is mobile", () => {
+test("identity: a huge portrait touch screen that is not the wall is mobile", () => {
   // 1200x1600 is big and portrait and touch — but it is not the
-  // panel, so rule 1 does not fire and it falls through to mobile.
+  // wall, so it falls through to mobile.
   assert.deepEqual(
-    detectDevice({
-      width: 1200,
-      height: 1600,
-      coarsePointer: true,
-      finePointer: false,
-      touch: true,
-      userAgent: "",
-    }),
+    deviceFromIdentity(
+      unknownIdentity({ coarsePointer: true, touchPoints: 1 }),
+      1200,
+      1600
+    ),
     { category: "mobile", orientation: "portrait" }
   );
 });
 
-test("detectDevice: with no pointer information, touch + huge landscape is the hub and a wide viewport is desktop", () => {
-  assert.deepEqual(
-    detectDevice({
-      width: 1920,
-      height: 1200,
-      coarsePointer: false,
-      finePointer: false,
-      touch: true,
-      userAgent: "",
-    }),
-    { category: "hub", orientation: "landscape" }
-  );
-  assert.deepEqual(
-    detectDevice({
-      width: 1440,
-      height: 900,
-      coarsePointer: false,
-      finePointer: false,
-      touch: false,
-      userAgent: "",
-    }),
-    { category: "desktop", orientation: "landscape" }
-  );
-  assert.deepEqual(
-    detectDevice({
-      width: 800,
-      height: 600,
-      coarsePointer: false,
-      finePointer: false,
-      touch: false,
-      userAgent: "",
-    }),
-    { category: "mobile", orientation: "landscape" }
-  );
+test("identity: with no pointer information, a huge landscape is desktop, not hub", () => {
+  // The old size paths are both gone: no pointer info + a huge
+  // viewport is a desktop by the width rule.
+  assert.deepEqual(deviceFromIdentity(unknownIdentity({}), 1920, 1200), {
+    category: "desktop",
+    orientation: "landscape",
+  });
+  assert.deepEqual(deviceFromIdentity(unknownIdentity({}), 1440, 900), {
+    category: "desktop",
+    orientation: "landscape",
+  });
+  assert.deepEqual(deviceFromIdentity(unknownIdentity({}), 800, 600), {
+    category: "mobile",
+    orientation: "landscape",
+  });
 });
 
-test("readDeviceEnv returns null outside a browser", () => {
-  assert.equal(readDeviceEnv(), null);
+test("R1: no environment reader — the card keeps its base layout with no window", () => {
+  // readDeviceEnv is deleted; the no-window early return in
+  // _applyDevice is what keeps node tests on the base layout. A card
+  // mounted with no window carries no device classes (see the dom
+  // test "with no browser environment the screen carries no device
+  // classes").
+  assert.equal(typeof recipeModule._setCoreForTests, "function");
 });
 
 test("formatAmount rounds to the nearest eighth, third or whole, with ≈ when rounded (RECIPE-1)", () => {
@@ -1178,32 +1099,61 @@ test("sortRecipes sorts by rating, cook and prep, nulls last (RECIPE-19)", () =>
   );
 });
 
-test("detectDevice: the exact panel signature is the hub FIRST, in either orientation, even with a mouse and no touch (spec §3.7, O2-01)", () => {
-  assert.deepEqual(
-    detectDevice({ width: 1920, height: 1200, finePointer: true, coarsePointer: false, touch: false, userAgent: "" }),
-    { category: "hub", orientation: "landscape" }
-  );
+test("identity: wall kind is the hub FIRST, in either orientation, even with a mouse and no touch (spec §3.7, O2-01)", () => {
+  assert.deepEqual(deviceFromIdentity(wallIdentity(), 1920, 1200), {
+    category: "hub",
+    orientation: "landscape",
+  });
   // A bare wide landscape desktop monitor is NOT the hub.
   assert.deepEqual(
-    detectDevice({ width: 1920, height: 1080, finePointer: true, coarsePointer: false, touch: false, userAgent: "" }),
+    deviceFromIdentity(unknownIdentity({ finePointer: true }), 1920, 1080),
     { category: "desktop", orientation: "landscape" }
   );
-  // The portrait panel IS the hub signature too (O2-01): rule 1
-  // catches the panel in either orientation, before any pointer
-  // check.
-  assert.deepEqual(
-    detectDevice({ width: 1200, height: 1920, finePointer: false, coarsePointer: true, touch: true, userAgent: "" }),
-    { category: "hub", orientation: "portrait" }
-  );
+  // The portrait wall IS the hub too (O2-01): kind wins in either
+  // orientation, before any pointer check.
+  assert.deepEqual(deviceFromIdentity(wallIdentity(), 1200, 1920), {
+    category: "hub",
+    orientation: "portrait",
+  });
 });
 
-test("isKioskMode reads the ?kiosk URL (RECIPE-16)", () => {
-  assert.equal(isKioskMode("?kiosk"), true);
-  assert.equal(isKioskMode("?kiosk=1"), true);
-  assert.equal(isKioskMode("?recipe=abc&kiosk"), true);
-  assert.equal(isKioskMode(""), false);
-  assert.equal(isKioskMode("?recipe=abc"), false);
-  assert.equal(isKioskMode(null), false);
+test("R1: the deleted machinery is gone from the recipe exports (§19)", () => {
+  for (const name of [
+    "detectDevice",
+    "readDeviceEnv",
+    "isKioskMode",
+    "KIOSK_SESSION_KEY",
+    "readKioskFlag",
+    "storeKioskFlag",
+    "isKioskSession",
+    "withKioskQuery",
+    "reapplyKioskIfNeeded",
+  ]) {
+    assert.equal(recipeModule[name], undefined, `${name} must not be exported`);
+  }
+  // The core lookup surface is there instead: the Lovelace resource
+  // path, the throttle/interval mirrors of core's constants, the
+  // 2.0.0 gate, and the test seam accepts a core module (and null)
+  // without throwing.
+  assert.equal(CORE_RESOURCE_PATH, "/local/family-hub-core.js");
+  assert.equal(CORE_LOOKUP_RETRY_THROTTLE_MS, 10 * 1000);
+  assert.equal(CORE_LOOKUP_INTERVAL_MS, 30 * 1000);
+  assert.equal(REQUIRED_CORE, "2.0.0");
+  assert.equal(typeof _setCoreForTests, "function");
+  assert.doesNotThrow(() => _setCoreForTests(null));
+  assert.doesNotThrow(() =>
+    _setCoreForTests({ identify, deviceFromIdentity, checkCoreVersion })
+  );
+  _setCoreForTests(null);
+});
+
+test("R1: identity banner + core-mismatch CSS exist (§4/§9)", () => {
+  // The re-register banner (kiosk launch, mismatched id) and the
+  // timer-strip version-mismatch error are styled, dark red on white.
+  assert.ok(CARD_CSS.includes(".fh-identity-banner {"));
+  assert.ok(CARD_CSS.includes("background: #7f1d1d;"));
+  assert.ok(CARD_CSS.includes(".fh-identity-banner[hidden] { display: none; }"));
+  assert.ok(CARD_CSS.includes(".fh-core-mismatch {"));
 });
 
 test("timer helpers: name, remaining, formatting (RECIPE-22)", () => {
@@ -1276,95 +1226,51 @@ test("timer helpers: name, remaining, formatting (RECIPE-22)", () => {
 // tablet band is a touch screen 768-1024px wide, either orientation,
 // plus the tablet user agents (iPad; Android without a "Mobi" token).
 
-test("detectDevice: tablet category — band, iPad, Android tablet (DESIGN-9)", () => {
+test("identity: tablet category — band only, no UA (DESIGN-9)", () => {
+  const touch = { coarsePointer: true, touchPoints: 1 };
   // The spec viewports: 1024x768 landscape and 768x1024 portrait.
-  assert.equal(
-    detectDevice({ width: 1024, height: 768, coarsePointer: true, touch: true }).category,
-    "tablet"
-  );
-  assert.equal(
-    detectDevice({ width: 768, height: 1024, coarsePointer: true, touch: true }).category,
-    "tablet"
-  );
+  assert.equal(deviceFromIdentity(unknownIdentity(touch), 1024, 768).category, "tablet");
+  assert.equal(deviceFromIdentity(unknownIdentity(touch), 768, 1024).category, "tablet");
   // The other spec tablet viewports: 900x1440, 768x1366.
-  assert.equal(
-    detectDevice({ width: 900, height: 1440, coarsePointer: true, touch: true }).category,
-    "tablet"
-  );
-  assert.equal(
-    detectDevice({ width: 768, height: 1366, coarsePointer: true, touch: true }).category,
-    "tablet"
-  );
-  // iPad user agent is a tablet whatever the viewport (even a wide
-  // one — the UA wins over size, as the mobile UA does for phones).
-  assert.equal(
-    detectDevice({
-      width: 1440,
-      height: 900,
-      userAgent:
-        "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-    }).category,
-    "tablet"
-  );
-  // Android tablet: "Android" with no "Mobi"/"Mobile" token.
-  assert.equal(
-    detectDevice({
-      width: 1280,
-      height: 800,
-      coarsePointer: true,
-      touch: true,
-      userAgent:
-        "Mozilla/5.0 (Linux; Android 13; SM-X710) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    }).category,
-    "tablet"
-  );
-  // Android phone: the same OS string WITH the "Mobile" token.
-  assert.equal(
-    detectDevice({
-      width: 1280,
-      height: 800,
-      coarsePointer: true,
-      touch: true,
-      userAgent:
-        "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
-    }).category,
-    "mobile"
-  );
+  assert.equal(deviceFromIdentity(unknownIdentity(touch), 900, 1440).category, "tablet");
+  assert.equal(deviceFromIdentity(unknownIdentity(touch), 768, 1366).category, "tablet");
   // Boundaries of the band: 767px wide is mobile, 1025px wide with a
-  // coarse pointer (and no hub-size landscape) is mobile too.
-  assert.equal(
-    detectDevice({ width: 767, height: 1024, coarsePointer: true, touch: true }).category,
-    "mobile"
-  );
-  assert.equal(
-    detectDevice({ width: 1025, height: 768, coarsePointer: true, touch: true }).category,
-    "mobile"
-  );
+  // coarse pointer is mobile too.
+  assert.equal(deviceFromIdentity(unknownIdentity(touch), 767, 1024).category, "mobile");
+  assert.equal(deviceFromIdentity(unknownIdentity(touch), 1025, 768).category, "mobile");
+  // Short side under 600px is a phone, not a tablet (844x390).
+  assert.equal(deviceFromIdentity(unknownIdentity(touch), 844, 390).category, "mobile");
   // OQ-7 DECIDED (review 3 §4): a touchscreen laptop at 1366x768
   // reads as DESKTOP, not mobile — it has a fine pointer. Without
   // the fine pointer it is a touch-only device and stays mobile.
+  assert.equal(deviceFromIdentity(unknownIdentity(touch), 1366, 768).category, "mobile");
   assert.equal(
-    detectDevice({ width: 1366, height: 768, coarsePointer: true, touch: true }).category,
-    "mobile"
-  );
-  assert.equal(
-    detectDevice({ width: 1366, height: 768, coarsePointer: true, finePointer: true, touch: true }).category,
+    deviceFromIdentity(
+      unknownIdentity({ coarsePointer: true, finePointer: true, touchPoints: 1 }),
+      1366,
+      768
+    ).category,
     "desktop"
   );
   // The portrait touch laptop (1080x1920) with a mouse is desktop
   // too (P8-16 §5 decided mapping).
   assert.equal(
-    detectDevice({ width: 1080, height: 1920, coarsePointer: true, finePointer: true, touch: true }).category,
+    deviceFromIdentity(
+      unknownIdentity({ coarsePointer: true, finePointer: true, touchPoints: 1 }),
+      1080,
+      1920
+    ).category,
     "desktop"
   );
-  // A huge portrait touch screen that is NOT the panel signature is
-  // mobile, not the hub — and not a tablet either (1200px is outside
-  // the band). The panel itself (1200x1920) IS the hub; see the
-  // O2-01 rotated-panel test above.
+  // A huge portrait touch screen that is NOT the wall is mobile, not
+  // the hub — and not a tablet either (1200px is outside the band).
+  // The wall itself (1200x1920) IS the hub; see the O2-01
+  // rotated-wall test above.
   assert.equal(
-    detectDevice({ width: 1200, height: 1600, coarsePointer: true, touch: true }).category,
+    deviceFromIdentity(unknownIdentity(touch), 1200, 1600).category,
     "mobile"
   );
+  assert.equal(deviceFromIdentity(wallIdentity(), 1200, 1920).category, "hub");
 });
 
 // -- Phase 7 CSS: tablet rules, bottom-edge fix, reduced motion ----------

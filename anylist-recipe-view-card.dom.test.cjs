@@ -285,7 +285,7 @@ globalThis.HTMLElement = FakeHTMLElement;
 globalThis.customElements = { define: () => {} };
 globalThis.document = { createElement: (tag) => new FakeElement(tag) };
 
-const { AnyListRecipeViewCard } = require("./anylist-recipe-view-card.js");
+const { AnyListRecipeViewCard, _setCoreForTests } = require("./anylist-recipe-view-card.js");
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function flush() {
@@ -376,6 +376,12 @@ function fakeHass(options = {}) {
     calls,
     states,
     callWS: async (message) => {
+      // The core lookup (R1) asks for the Lovelace resource list —
+      // the real HA answers it; in tests core is never registered,
+      // so the list is empty. It is infrastructure, not a service
+      // call, so it is not recorded in `calls` (exact-calls
+      // assertions elsewhere in this file would otherwise break).
+      if (message && message.type === "lovelace/resources/list") return [];
       calls.push([message.domain, message.service, message.service_data]);
       // The Phase 3 bridge offers start_timer {name, duration} —
       // the card calls it from the timer chips. It succeeds unless
@@ -418,6 +424,68 @@ async function loadedCard(options) {
   card.hass = hass;
   await flush();
   return { card, hass };
+}
+
+// core.js is an ES module in the pi-family-hub repo — node loads it
+// through a byte-identical .mjs copy (same pattern as the core suite).
+// The recipe card imports core for identity, so its DOM tests load
+// the real core rather than a stub.
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+// FAMILY_HUB_CORE_PATH overrides the core location (default: the
+// shared pi-family-hub worktree's dashboard core).
+const corePath =
+  process.env.FAMILY_HUB_CORE_PATH ||
+  path.join(
+    __dirname,
+    "../goals/diy-family-hub-raspberry-pi/files/local-git/pi-family-hub/installer/dashboard/family-hub-core.js"
+  );
+assert.ok(
+  fs.existsSync(corePath),
+  `family-hub-core.js missing at ${corePath} — the recipe card imports it for identity`
+);
+const coreTmp = fs.mkdtempSync(path.join(os.tmpdir(), "family-hub-recipe-dom-test-"));
+const coreMjs = path.join(coreTmp, "family-hub-core.mjs");
+fs.copyFileSync(corePath, coreMjs);
+const core = require(coreMjs);
+// The core the tests load must be the R1-3-or-later core: a stale
+// pre-R1-3 core (no deviceFromIdentity) used to fail ~30 tests with
+// "deviceFromIdentity is not a function". Fail once, naming the cause
+// and the override, instead of failing every identity test cryptically.
+assert.equal(
+  typeof core.deviceFromIdentity,
+  "function",
+  `family-hub-core.js at ${corePath} predates deviceFromIdentity — ` +
+    `the pi-family-hub worktree is on a pre-R1-3 branch; switch it to ` +
+    `rebuild/r1, or point FAMILY_HUB_CORE_PATH at a core that exports it`
+);
+assert.equal(
+  typeof core.checkBridgeContract,
+  "function",
+  `family-hub-core.js at ${corePath} predates checkBridgeContract — ` +
+    `the pi-family-hub worktree is on a pre-R1-5 core; switch it to ` +
+    `rebuild/r1, or point FAMILY_HUB_CORE_PATH at a core that exports it`
+);
+const { HUB_BROWSER_ID } = core;
+
+// Inject the real core into the card under test. The wall DOM tests
+// register the wall's id via the sensor leg: the shipped core still
+// carries the unsubstituted __HUB_BROWSER_ID__ placeholder, so the
+// tests register THAT id (the wizard substitutes a real id at deploy;
+// the mechanism — exact match → wall — is what's under test).
+function injectCore() {
+  _setCoreForTests(core);
+}
+function resetCore() {
+  _setCoreForTests(null);
+}
+function wallBrowserPathState(pathname) {
+  return {
+    entity_id: `sensor.${HUB_BROWSER_ID}_browser_path`,
+    state: pathname,
+    attributes: {},
+  };
 }
 
 test("loading state shows skeleton rows in the list grid, not a bare Loading line", () => {
@@ -1157,37 +1225,46 @@ const PHONE_WINDOW = {
 
 test("the card carries dev-hub + orient-landscape on the kiosk", async () => {
   stubWindow(HUB_WINDOW);
+  globalThis.window.location.pathname = "/family-hub/recipes";
+  injectCore();
   try {
-    const { card } = await loadedCard();
+    const { card } = await loadedCard({
+      states: [wallBrowserPathState("/family-hub/recipes")],
+    });
     const screen = card.shadowRoot.querySelector(".screen");
     assert.ok(screen.classList.contains("dev-hub"));
     assert.ok(screen.classList.contains("orient-landscape"));
     assert.ok(!screen.classList.contains("dev-mobile"));
   } finally {
+    resetCore();
     clearWindow();
   }
 });
 
 test("the card carries dev-desktop on a mouse-driven screen", async () => {
   stubWindow(DESKTOP_WINDOW);
+  injectCore();
   try {
     const { card } = await loadedCard();
     const screen = card.shadowRoot.querySelector(".screen");
     assert.ok(screen.classList.contains("dev-desktop"));
     assert.ok(screen.classList.contains("orient-landscape"));
   } finally {
+    resetCore();
     clearWindow();
   }
 });
 
 test("the card carries dev-mobile + orient-portrait on a phone", async () => {
   stubWindow(PHONE_WINDOW);
+  injectCore();
   try {
     const { card } = await loadedCard();
     const screen = card.shadowRoot.querySelector(".screen");
     assert.ok(screen.classList.contains("dev-mobile"));
     assert.ok(screen.classList.contains("orient-portrait"));
   } finally {
+    resetCore();
     clearWindow();
   }
 });
@@ -1217,6 +1294,7 @@ test("on mobile the chips are one scrollable row, never a wrap (R-IMPL-1)", asyn
 
 test("a resize re-detects the device and swaps the classes", async () => {
   stubWindow(PHONE_WINDOW);
+  injectCore();
   try {
     const { card } = await loadedCard();
     const screen = card.shadowRoot.querySelector(".screen");
@@ -1232,6 +1310,147 @@ test("a resize re-detects the device and swaps the classes", async () => {
     card._onResize();
     assert.ok(screen.classList.contains("dev-desktop"));
     assert.ok(!screen.classList.contains("dev-mobile"));
+  } finally {
+    resetCore();
+    clearWindow();
+  }
+});
+
+// -- D9 layout bands (RB-R1-4) ------------------------------------------------
+// The detail (.cook-grid) is two-column iff core layoutBand() says so:
+// wall-identity OR 900 <= viewport width <= ~1100 px, plus the
+// column-minimum condition. The class lives on .screen; the CSS keys
+// the grid off it — no media query, no device class decides columns.
+
+test("D9: the wall is two-column at 1920x1200; the same width unknown is single-column", async () => {
+  // Wall leg — identity decides, not width (fixes-18 item 24).
+  stubWindow(HUB_WINDOW);
+  globalThis.window.location.pathname = "/family-hub/recipes";
+  injectCore();
+  try {
+    const { card } = await loadedCard({
+      states: [wallBrowserPathState("/family-hub/recipes")],
+    });
+    const screen = card.shadowRoot.querySelector(".screen");
+    assert.ok(screen.classList.contains("dev-hub"));
+    assert.ok(screen.classList.contains("layout-two-column"));
+    assert.ok(!screen.classList.contains("layout-single-column"));
+  } finally {
+    resetCore();
+    clearWindow();
+  }
+  // Unknown leg — the same 1920 px viewport with no registered id is
+  // "not the wall, width above the range" -> single-column.
+  stubWindow({ ...DESKTOP_WINDOW, width: 1920, height: 1200 });
+  injectCore();
+  try {
+    const { card } = await loadedCard();
+    const screen = card.shadowRoot.querySelector(".screen");
+    assert.ok(!screen.classList.contains("dev-hub"));
+    assert.ok(screen.classList.contains("layout-single-column"));
+    assert.ok(!screen.classList.contains("layout-two-column"));
+  } finally {
+    resetCore();
+    clearWindow();
+  }
+});
+
+test("D9: the width band gives two-column at 900..1100 and single outside it", async () => {
+  const cases = [
+    // [width, height, expected two-column]
+    [900, 768, true],
+    [1024, 768, true],
+    [1100, 800, true],
+    [899, 768, false],
+    [1101, 800, false],
+    [1366, 768, false],
+    [1440, 900, false],
+    [1920, 1080, false],
+    [390, 844, false],
+    [768, 1024, false],
+  ];
+  for (const [width, height, two] of cases) {
+    stubWindow({ ...DESKTOP_WINDOW, width, height });
+    injectCore();
+    try {
+      const { card } = await loadedCard();
+      const screen = card.shadowRoot.querySelector(".screen");
+      assert.equal(
+        screen.classList.contains("layout-two-column"),
+        two,
+        `${width}x${height} two-column=${two}`
+      );
+      assert.equal(
+        screen.classList.contains("layout-single-column"),
+        !two,
+        `${width}x${height} single-column=${!two}`
+      );
+    } finally {
+      resetCore();
+      clearWindow();
+    }
+  }
+});
+
+test("D9: a resize flips the band class (1024 -> two-column, 1366 -> single)", async () => {
+  stubWindow({ ...DESKTOP_WINDOW, width: 1024, height: 768 });
+  injectCore();
+  try {
+    const { card } = await loadedCard();
+    const screen = card.shadowRoot.querySelector(".screen");
+    assert.ok(screen.classList.contains("layout-two-column"));
+    stubWindow({ ...DESKTOP_WINDOW, width: 1366, height: 768 });
+    card._onResize();
+    assert.ok(screen.classList.contains("layout-single-column"));
+    assert.ok(!screen.classList.contains("layout-two-column"));
+  } finally {
+    resetCore();
+    clearWindow();
+  }
+});
+
+test("D9: a 400 px viewport is single-column — the column minimum binds (RB-R1-4)", async () => {
+  stubWindow({ ...PHONE_WINDOW, width: 400, height: 800 });
+  injectCore();
+  try {
+    const { card } = await loadedCard();
+    const screen = card.shadowRoot.querySelector(".screen");
+    assert.ok(screen.classList.contains("layout-single-column"));
+    assert.ok(!screen.classList.contains("layout-two-column"));
+  } finally {
+    resetCore();
+    clearWindow();
+  }
+});
+
+test("D9: before core loads the card is single-column (desktop-safe unknown)", async () => {
+  resetCore();
+  stubWindow({ ...DESKTOP_WINDOW, width: 1024, height: 768 });
+  try {
+    const { card } = await loadedCard();
+    const screen = card.shadowRoot.querySelector(".screen");
+    assert.ok(screen.classList.contains("layout-single-column"));
+    assert.ok(!screen.classList.contains("layout-two-column"));
+  } finally {
+    clearWindow();
+  }
+});
+
+test("D9: the cook-grid keys off .layout-two-column — no width media query, no dev-hub rule", async () => {
+  stubWindow(DESKTOP_WINDOW);
+  try {
+    const { card } = await loadedCard();
+    const css = card.shadowRoot.querySelector("style").textContent;
+    assert.match(
+      css,
+      /\.screen\.layout-two-column \.cook-grid \{ grid-template-columns: minmax\(220px, 5fr\) minmax\(0, 7fr\); \}/
+    );
+    assert.doesNotMatch(css, /@media \(min-width: 900px\) and \(max-width: 1100px\)/);
+    assert.doesNotMatch(css, /\.screen\.dev-hub \.cook-grid/);
+    // The comment records the unknown-identity consequence, not the
+    // deleted hub-panel signature.
+    assert.match(css, /identify\(\) -> unknown degrades the wall to/);
+    assert.doesNotMatch(css, /hub-panel/);
   } finally {
     clearWindow();
   }
@@ -1957,12 +2176,41 @@ test("chips are one scrollable row at every viewport and rows cannot force the g
 
 test("the kiosk URL carries the kiosk class (RECIPE-16)", async () => {
   stubWindow({ ...HUB_WINDOW, search: "?kiosk" });
+  globalThis.window.location.pathname = "/family-hub/recipes";
+  injectCore();
   try {
-    const { card } = await loadedCard();
+    const { card } = await loadedCard({
+      states: [wallBrowserPathState("/family-hub/recipes")],
+    });
     const screen = card.shadowRoot.querySelector(".screen");
     assert.ok(screen.classList.contains("kiosk"));
     assert.ok(screen.classList.contains("dev-hub"));
   } finally {
+    resetCore();
+    clearWindow();
+  }
+});
+
+test("R1: _navigate never carries ?kiosk — it is launch-only (§4/§19)", async () => {
+  const store = new Map();
+  globalThis.sessionStorage = {
+    getItem: (k) => (store.has(k) ? store.get(k) : null),
+    setItem: (k, v) => store.set(k, String(v)),
+  };
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    // A stale flag from the old machinery must not re-attach ?kiosk:
+    // the flag machinery is deleted, and in-app navigation is plain.
+    store.set("family-hub:kiosk", "1");
+    const { card } = await loadedCard();
+    card._navigate("/family-hub/timers");
+    card._navigate("/family-hub/family-photos");
+    assert.deepEqual(nav.pushed, [
+      "/family-hub/timers",
+      "/family-hub/family-photos",
+    ]);
+  } finally {
+    delete globalThis.sessionStorage;
     clearWindow();
   }
 });
@@ -2173,6 +2421,10 @@ function timerSensor(id, name, state, extra = {}) {
     state,
     attributes: {
       timer_name: name,
+      // R1-5: fixtures are contract-v2 sensors (the bridge gate admits
+      // only contract_version 2). Pass contract_version: null in extra
+      // for a v1-shaped sensor in a mismatch test.
+      contract_version: 2,
       started_at: new Date(Date.now() - 60000).toISOString(),
       finishes_at: new Date(Date.now() + 600000).toISOString(),
       ...extra,
@@ -2640,4 +2892,91 @@ test("Wave 1 (Recipes): opening the Notes tab autofocuses the editor with the ca
   assert.equal(editor.selectionStart, noteLen);
   assert.equal(editor.selectionEnd, noteLen);
   card.disconnectedCallback();
+});
+
+// -- §9 version gates (R1-5) -------------------------------------------------
+
+test("R1-5: old bridge (no contract_version) -> Timer bridge mismatch in the strip area, no pills, browsing intact", async () => {
+  injectCore();
+  try {
+    const v1a = timerSensor("sensor.satellite_timer_pasta", "Pasta", "active", { contract_version: null });
+    const v1b = timerSensor("sensor.satellite_timer_soup", "Soup", "active", { contract_version: null });
+    const { card } = await loadedCard({ states: [v1a, v1b] });
+    // Browsing still renders: the recipe list is there.
+    assert.match(card.shadowRoot.innerHTML, /Creamy Tomato Pasta/);
+    card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+    await flush();
+    const mismatch = card.shadowRoot.querySelector(".fh-core-mismatch");
+    assert.ok(mismatch);
+    assert.match(mismatch.textContent, /Timer bridge mismatch: card expects contract v2/);
+    assert.equal(card.shadowRoot.querySelectorAll(".timer-strip-item").length, 0);
+    card.disconnectedCallback();
+  } finally {
+    resetCore();
+  }
+});
+
+test("R1-5: mixed v2 + v1 sensors -> the error shows, the v2 pill still renders", async () => {
+  injectCore();
+  try {
+    const v2 = timerSensor("sensor.satellite_timer_pasta", "Pasta", "active");
+    const v1 = timerSensor("sensor.satellite_timer_soup", "Soup", "active", { contract_version: null });
+    const { card } = await loadedCard({ states: [v2, v1] });
+    card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+    await flush();
+    const mismatch = card.shadowRoot.querySelector(".fh-core-mismatch");
+    assert.ok(mismatch);
+    assert.match(mismatch.textContent, /Timer bridge mismatch/);
+    const items = card.shadowRoot.querySelectorAll(".timer-strip-item");
+    assert.equal(items.length, 1);
+    assert.match(items[0].textContent, /Pasta/);
+    card.disconnectedCallback();
+  } finally {
+    resetCore();
+  }
+});
+
+test("R1-5: core version skew -> Hub core mismatch replaces the strip, browsing intact", async () => {
+  const wrongCore = {
+    identify: core.identify,
+    deviceFromIdentity: core.deviceFromIdentity,
+    checkCoreVersion: () =>
+      "Hub core mismatch: card needs 2.0.0, core is 9.9.9",
+    checkBridgeContract: core.checkBridgeContract,
+    layoutBand: core.layoutBand,
+  };
+  _setCoreForTests(wrongCore);
+  try {
+    const v2 = timerSensor("sensor.satellite_timer_pasta", "Pasta", "active");
+    const { card } = await loadedCard({ states: [v2] });
+    assert.match(card.shadowRoot.innerHTML, /Creamy Tomato Pasta/);
+    card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+    await flush();
+    const mismatch = card.shadowRoot.querySelector(".fh-core-mismatch");
+    assert.ok(mismatch);
+    assert.match(mismatch.textContent, /Hub core mismatch: card needs 2.0.0, core is 9.9.9/);
+    assert.equal(card.shadowRoot.querySelectorAll(".timer-strip-item").length, 0);
+    card.disconnectedCallback();
+  } finally {
+    resetCore();
+  }
+});
+
+test("R1-5: a finished v1 sensor on a hass push shows no PIP", async () => {
+  injectCore();
+  try {
+    const v1 = timerSensor("sensor.satellite_timer_pasta", "Creamy Tomato Pasta", "active", { contract_version: null });
+    const { card, hass } = await loadedCard({ states: [v1] });
+    card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+    await flush();
+    // The sensor finishes on a later push: the gate must not show the
+    // finished PIP from a mismatched sensor.
+    const finished = timerSensor("sensor.satellite_timer_pasta", "Creamy Tomato Pasta", "finished", { contract_version: null });
+    card.hass = { ...hass, states: [finished] };
+    await flush();
+    assert.equal(card.shadowRoot.querySelector(".pip"), null);
+    card.disconnectedCallback();
+  } finally {
+    resetCore();
+  }
 });

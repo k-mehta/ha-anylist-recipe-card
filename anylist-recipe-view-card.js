@@ -1047,181 +1047,6 @@ function deriveCollections(recipes) {
   );
 }
 
-// -- Device detection (SHARED MECHANISM) ----------------------------------
-//
-// The same detection runs in the AnyList recipe card
-// (k-mehta/ha-anylist-recipe-card), the Satellite Timers card
-// (k-mehta/ha-satellite-timers), the home card and the standalone
-// nav strip. It is ONE mechanism, copied verbatim into each card
-// file: each card is a single standalone file with no imports, so the
-// code cannot be shared by import — the copies must stay identical.
-// If you change the signals, the precedence, or the category names
-// here, change them in the other cards too, and update
-// ADAPTIVE-LAYOUT.md (which is also identical in both repos).
-//
-// Signals (all read from the browser the card is running in):
-//   viewport width/height — the strongest signal; the layout follows
-//     the viewport, not the device name.
-//   pointer type — matchMedia("(pointer: coarse)") is a finger/touch
-//     screen; "(pointer: fine)" is a mouse/trackpad.
-//   touch — "ontouchstart" in window, or navigator.maxTouchPoints > 0.
-//   user agent — only as a tiebreaker for phones/tablets, never alone:
-//     a desktop browser can spoof it, and a kiosk can strip it.
-//
-// Precedence (first match wins) — the unified rule (spec §3.7),
-// with the DESIGN-9 tablet category (Phase 7):
-//   1. The exact 1920x1200 panel signature, either orientation, is
-//      the hub — FIRST, before any pointer check, so a hub with a
-//      mouse attached (or a bench test with mouse only) still reads
-//      as the hub. The same panel rotated (1200x1920) is the hub in
-//      portrait (O2-01). A bare "width >= 1600 + landscape → hub"
-//      rule is FORBIDDEN: it classifies every 1920x1080 desktop
-//      monitor as a hub.
-//   2. An iPad user agent is a tablet; an Android tablet ("Android"
-//      with no "Mobi"/"Mobile" token, viewport at least 768px) is a
-//      tablet.
-//   3. A phone/tablet user agent ("Mobi", "Android", "iPhone",
-//      "iPod") is mobile.
-//   4. A viewport narrower than 768px is mobile (a narrow desktop
-//      window gets the single-column layout too — the layout follows
-//      the viewport).
-//   5. A touch screen in the tablet band (768-1024px wide, either
-//      orientation) is a tablet.
-//   6. A coarse pointer on anything but a huge landscape screen is
-//      mobile (phones).
-//   7. A touch screen that is hub-sized and landscape IS the hub,
-//      even when a mouse is also attached: the kiosk has a mouse, so
-//      a fine pointer is present too, and checking fine first would
-//      mis-detect the hub as a desktop. Touch + hub size wins over
-//      fine pointer.
-//   8. A coarse pointer on a huge landscape screen is the hub.
-//   9. A fine pointer is desktop.
-//   10. With no pointer information: a viewport at least 1024px wide
-//      is desktop; anything else is mobile.
-//
-// Known limits (every fallback still renders a usable layout, never a
-// broken one):
-//   - A 1920x1200 laptop reads as the hub, and so does a 1200x1920
-//     one: the panel signature is the only discriminator, and a
-//     laptop that size is indistinguishable from the wall panel by
-//     size alone. That is fine: the hub layout is just big targets
-//     on a wide screen.
-//   - A phone in desktop mode (no mobile user agent) still reads as
-//     mobile by width (rule 4).
-//   - A touchscreen laptop at 1366x768 (coarse, outside the tablet
-//     band) still reads as mobile — open question OQ-7 (Phase 7 log).
-//   - The hub is recognised by size + touch + landscape, not by name:
-//     if the kiosk display changes size, the thresholds above are the
-//     place to adjust.
-//
-// Orientation is separate from category: landscape is width >= height,
-// portrait is width < height. The category picks the control sizes and
-// the base layout; orientation picks the grid (e.g. one column in
-// portrait, two in landscape on mobile).
-
-const HUB_PANEL_WIDTH_PX = 1920;
-const HUB_PANEL_HEIGHT_PX = 1200;
-const MOBILE_MAX_WIDTH_PX = 768;
-const DESKTOP_MIN_WIDTH_PX = 1024;
-const MOBILE_USER_AGENT = /Mobi|Android|iPhone|iPad|iPod/i;
-const TABLET_MAX_WIDTH_PX = 1024;
-const TABLET_USER_AGENT = /iPad/i;
-const ANDROID_USER_AGENT = /Android/i;
-const MOBILE_TOKEN = /Mobi/i;
-
-// The device the card is running on, from a plain environment object
-// (width/height in CSS pixels, pointer flags, touch flag, user agent).
-// Pure — no browser access — so it is unit-testable in node. Returns
-// { category: "hub" | "desktop" | "tablet" | "mobile", orientation:
-// "landscape" | "portrait" }.
-function detectDevice(env) {
-  const width = Number((env && env.width) || 0);
-  const height = Number((env && env.height) || 0);
-  const orientation = width >= height ? "landscape" : "portrait";
-  const userAgent = String((env && env.userAgent) || "");
-  const coarse = Boolean(env && env.coarsePointer);
-  const fine = Boolean(env && env.finePointer);
-  const touch = Boolean(env && env.touch);
-  let category;
-  // Rule 1 — the kitchen panel, either orientation: the exact
-  // 1920x1200 signature is the hub in landscape, and the same panel
-  // rotated (1200x1920) is the hub in portrait (O2-01 — the portrait
-  // wall needs its OWN layout, not the phone layout). A 1920x1200
-  // laptop reads as hub too — the documented residual (spec §3.7):
-  // the panel signature is the only discriminator.
-  if (
-    (width === HUB_PANEL_WIDTH_PX && height === HUB_PANEL_HEIGHT_PX) ||
-    (width === HUB_PANEL_HEIGHT_PX && height === HUB_PANEL_WIDTH_PX)
-  )
-    category = "hub";
-  // A tablet user agent is a tablet, whatever the viewport: an iPad
-  // in split view is still a tablet (its narrow width only changes
-  // the column count, via the <900px override in the CSS).
-  else if (TABLET_USER_AGENT.test(userAgent)) category = "tablet";
-  // An Android tablet reports "Android" with no "Mobi"/"Mobile"
-  // token; an Android phone reports "Mobile". The width guard keeps
-  // a narrow Android phone in desktop mode from reading as a tablet.
-  else if (
-    ANDROID_USER_AGENT.test(userAgent) &&
-    !MOBILE_TOKEN.test(userAgent) &&
-    width >= MOBILE_MAX_WIDTH_PX
-  )
-    category = "tablet";
-  else if (MOBILE_USER_AGENT.test(userAgent)) category = "mobile";
-  else if (width < MOBILE_MAX_WIDTH_PX) category = "mobile";
-  // A touch screen in the tablet band (768-1024px wide, either
-  // orientation) is a tablet - 1024x768 must NOT fall to desktop and
-  // 768x1024 must NOT fall to mobile (DESIGN-9).
-  else if (
-    (coarse || touch) &&
-    width >= MOBILE_MAX_WIDTH_PX &&
-    width <= TABLET_MAX_WIDTH_PX
-  )
-    category = "tablet";
-  // A device with a fine pointer (a mouse) is desktop-class at
-  // desktop widths — this is what a touchscreen laptop is. It must
-  // come before the coarse check: the old order read a touchscreen
-  // laptop as mobile (coarse fired before fine was ever checked),
-  // and the old touch + >=1600px = hub rule (now deleted) mis-read
-  // the same laptop as the hub. The hub itself is already caught by
-  // the exact-signature rule above, so deleting that rule loses no
-  // legitimate case (P8-16, review 3 §4).
-  else if (fine && width >= DESKTOP_MIN_WIDTH_PX) category = "desktop";
-  // A coarse pointer with no fine pointer is a touch-only device:
-  // mobile outside the tablet band above.
-  else if (coarse) category = "mobile";
-  else if (width >= DESKTOP_MIN_WIDTH_PX) category = "desktop";
-  else category = "mobile";
-  return { category, orientation };
-}
-
-// The environment the card is actually running in, read from the
-// browser. Returns null outside a browser (node tests), where the card
-// keeps its base layout and detectDevice is never called.
-function readDeviceEnv() {
-  if (typeof window === "undefined" || typeof navigator === "undefined") {
-    return null;
-  }
-  const coarse =
-    typeof window.matchMedia === "function" &&
-    window.matchMedia("(pointer: coarse)").matches;
-  const fine =
-    typeof window.matchMedia === "function" &&
-    window.matchMedia("(pointer: fine)").matches;
-  const touch =
-    "ontouchstart" in window ||
-    (typeof navigator.maxTouchPoints === "number" &&
-      navigator.maxTouchPoints > 0);
-  return {
-    width: window.innerWidth,
-    height: window.innerHeight,
-    coarsePointer: coarse,
-    finePointer: fine,
-    touch,
-    userAgent: navigator.userAgent || "",
-  };
-}
-
 // -- Running timers (RECIPE-22) ----------------------------------------
 //
 // The running-timer strip in the cooking view reads the same bridge
@@ -1341,85 +1166,134 @@ const NAV_STRIP_VIEWS = [
   { key: "recipes", label: "Recipes", path: "/family-hub/recipes" },
 ];
 
-// Kiosk mode is the ?kiosk URL the wall runs under. In kiosk mode
-// Home Assistant's header is hidden, so the step tracker pins at
-// top: 0 instead of below the 56px header (RECIPE-16).
-function isKioskMode(search) {
-  const query = typeof search === "string" ? search : "";
-  return /(?:^|[?&])kiosk(?:[=&]|$)/.test(query);
-}
-
-// -- shared helpers (wave 1) --------------------------------------------
+// -- Hub identity: family-hub-core.js (Wave R1, RB-R1-3) ------------------
 //
-// Kiosk as a session property (N-IMPL-10 / ambiguity E): every in-app
-// navigation carries ?kiosk in the URL (primary — a same-tab reload
-// URL already has it); the flag is stored in sessionStorage key
-// family-hub:kiosk (per-tab) as backstop; on load, if the flag is set
-// but the URL lacks ?kiosk, the card does ONE location.replace adding
-// ?kiosk. Card JS cannot hide HA chrome before first paint, so a
-// bare-URL paint may flash chrome once before the re-apply reload —
-// that is the honest bound, not a defect to hide. A fresh tab, browser
-// restart, or second device re-establishes kiosk only via the WIZ-8
-// start URL (http://homeassistant.local:8123/family-hub?kiosk, launcher
-// ~/.local/bin/family-hub-kiosk.sh). The same block is duplicated in
-// the reference strip, the Home card, and the Timers card — the four
-// copies must stay identical; if you change the key, the storage, or
-// the re-apply, change them in the other cards too.
-const KIOSK_SESSION_KEY = "family-hub:kiosk";
+// Hub identity lives in family-hub-core.js (architecture v19 §4): the
+// registered Browser Mod browser id — never a screen size, never the
+// ?kiosk parameter. The per-card identity copies, the exact-size panel
+// signature, and the kiosk session flag machinery are DELETED (§19);
+// this card imports core for identity only.
+//
+// Like the timer card (and unlike the home card and the nav strip,
+// whose URLs the wizard substitutes), this card never passes through
+// the wizard — so it finds core at runtime: it asks Home Assistant
+// for the Lovelace resource list (hass.callWS
+// "lovelace/resources/list") and imports the resource whose bare path
+// is /local/family-hub-core.js (the wizard registers the versioned
+// URL, so the import gets the same module instance every other card
+// uses). Until the import resolves, identity is unknown (desktop-safe,
+// §4); on success every mounted instance re-applies its device
+// classes and re-renders at once. A failed lookup or import logs once
+// and stays unknown — the card still renders, it just never reads as
+// the wall.
+//
+// The lookup is re-attempted on every hass push (throttled) plus a
+// 30 s interval while mounted, and never re-checked after success.
+// The throttle/interval values mirror core.js (CORE_LOOKUP_RETRY_
+// THROTTLE_MS / CORE_LOOKUP_INTERVAL_MS) — they live here as literals
+// because the lookup runs before core is loaded, so they cannot be
+// imported from it.
+const CORE_RESOURCE_PATH = "/local/family-hub-core.js";
+const CORE_LOOKUP_RETRY_THROTTLE_MS = 10 * 1000;
+const CORE_LOOKUP_INTERVAL_MS = 30 * 1000;
 
-function readKioskFlag() {
-  if (typeof sessionStorage === "undefined") return false;
+// Core contract version this card was built against (§9). On mismatch
+// the card renders a visible "Hub core mismatch" error in the timer
+// strip area only — browsing never blocks on it.
+const REQUIRED_CORE = "2.0.0";
+
+let _coreModule = null; // The imported core namespace, once loaded.
+let _corePromise = null; // The in-flight lookup+import, shared by instances.
+let _coreNextRetryAt = 0; // Failed lookup/import: retry at most every 10 s.
+let _coreLoadWarned = false; // Failed lookup/import: log once, not per push.
+const _liveCards = new Set(); // Mounted instances, for re-apply on load.
+
+// Find the deployed core URL from the Lovelace resource list, or null
+// when the list cannot be read or core is not registered yet.
+async function _lookupCoreUrl(hass) {
   try {
-    return sessionStorage.getItem(KIOSK_SESSION_KEY) === "1";
+    if (!hass || typeof hass.callWS !== "function") return null;
+    const resources = await hass.callWS({ type: "lovelace/resources/list" });
+    const list = Array.isArray(resources) ? resources : [];
+    for (const res of list) {
+      const url = res && typeof res.url === "string" ? res.url : "";
+      if (url.split("?")[0] === CORE_RESOURCE_PATH) return url;
+    }
+    return null;
+  } catch (_err) {
+    return null;
+  }
+}
+
+// Start (or reuse) the core lookup + import. Resolves to the core
+// namespace, or null when the lookup/import fails (identity stays
+// unknown, desktop-safe). A hass without callWS (node tests, or a
+// push before hass exists) returns null immediately with no throttle
+// set, so the first real hass push retries at once.
+function _ensureCore(hass) {
+  if (_coreModule) return Promise.resolve(_coreModule);
+  if (_corePromise) return _corePromise;
+  if (Date.now() < _coreNextRetryAt) return Promise.resolve(null);
+  if (!hass || typeof hass.callWS !== "function") return Promise.resolve(null);
+  _corePromise = _lookupCoreUrl(hass)
+    .then((url) => (url ? import(url) : null))
+    .then((mod) => {
+      if (!mod) {
+        _corePromise = null;
+        _coreNextRetryAt = Date.now() + CORE_LOOKUP_RETRY_THROTTLE_MS;
+        return null;
+      }
+      _coreModule = mod;
+      for (const card of [..._liveCards]) {
+        card._clearCoreRetry();
+        card._applyDevice();
+        card._render();
+      }
+      return mod;
+    })
+    .catch((err) => {
+      _corePromise = null;
+      _coreNextRetryAt = Date.now() + CORE_LOOKUP_RETRY_THROTTLE_MS;
+      if (!_coreLoadWarned) {
+        _coreLoadWarned = true;
+        if (typeof console !== "undefined") {
+          console.warn(
+            "Family Hub: could not load family-hub-core.js — running desktop-safe.",
+            err
+          );
+        }
+      }
+      return null;
+    });
+  return _corePromise;
+}
+
+// Launch-only ?kiosk read: the same value core reports as
+// layout.kioskParam, used before core loads (and never as identity).
+function _isKioskLaunch() {
+  try {
+    const search =
+      typeof window !== "undefined" && window.location
+        ? window.location.search || ""
+        : "";
+    return /(?:^|[?&])kiosk(?:=|&|$)/.test(search);
   } catch (_err) {
     return false;
   }
 }
 
-function storeKioskFlag() {
-  if (typeof sessionStorage === "undefined") return;
-  try {
-    sessionStorage.setItem(KIOSK_SESSION_KEY, "1");
-  } catch (_err) {
-    // Storage blocked: kiosk still works for this load (the URL has
-    // ?kiosk); only the same-tab reload re-apply is lost.
+// Test seam: inject a core module (the node tests load the real core.js
+// through a .mjs copy and inject it here). Never used in the browser.
+function _setCoreForTests(mod) {
+  _coreModule = mod || null;
+  _corePromise = mod ? Promise.resolve(mod) : null;
+  _coreNextRetryAt = 0;
+  _coreLoadWarned = false;
+  for (const card of [..._liveCards]) {
+    card._clearCoreRetry();
+    card._applyDevice();
+    card._render();
   }
-}
-
-// True when this tab session is a kiosk session: the URL says so, or
-// the stored flag says so.
-function isKioskSession(search) {
-  return isKioskMode(search) || readKioskFlag();
-}
-
-// Append ?kiosk to an in-app path when this tab session is kiosk,
-// preserving any query string already on the path. Never adds a second
-// kiosk param.
-function withKioskQuery(path) {
-  const target = String(path || "/family-hub");
-  if (!isKioskSession(typeof window !== "undefined" && window.location ? window.location.search || "" : "")) return target;
-  const [base, query] = target.split("?");
-  if (!query) return `${base}?kiosk`;
-  const params = query.split("&");
-  if (params.some((part) => part === "kiosk" || part.indexOf("kiosk=") === 0)) return target;
-  return `${base}?${query}&kiosk`;
-}
-
-// Re-apply kiosk on load when the stored flag is set but the URL lacks
-// ?kiosk. Returns true when a re-apply reload was started.
-function reapplyKioskIfNeeded() {
-  if (typeof window === "undefined" || !window.location) return false;
-  if (!readKioskFlag()) return false;
-  if (isKioskMode(window.location.search || "")) return false;
-  const url = withKioskQuery(
-    `${window.location.pathname || "/family-hub"}${window.location.search || ""}${window.location.hash || ""}`
-  );
-  try {
-    window.location.replace(url);
-  } catch (_err) {
-    return false;
-  }
-  return true;
 }
 
 // -- Timers count badge (D-N1 / N-IMPL-5) ---------------------------------
@@ -1859,7 +1733,7 @@ const CARD_CSS = `
   .error { font-size: 22px; color: var(--error); padding: 0; }
   /* The list is a grid that uses the width it is given: one column on
      narrow screens, two from 1000px, three from 1500px. The Recipes
-     view is a panel view, so on the 1920px hub display the grid has
+     view is a panel view, so on the wall display the grid has
      the full dashboard width to work with. Tracks are minmax(0, 1fr)
      and rows carry min-width: 0, so a long unbroken string inside a
      row (a 43-character collection pill) can never force a column
@@ -2291,28 +2165,35 @@ const CARD_CSS = `
     padding: 4px 4px 8px;
   }
   /* The cooking view puts ingredients and steps together. Whether it
-     is two-column is keyed on VIEWPORT WIDTH and the hub-panel
-     signature, not device class (D9, R-IMPL-49): phone widths (<900 px)
-     are single column always; tablet widths (900–~1100 px) are
-     two-column (ingredients left, tracker + steps right); wider
-     non-hub viewports (>~1100 px) are single column; the hub panel
-     (dev-hub, either orientation) is two-column. The exact ~1100 px
-     boundary is unmeasured (OQ-2) — the media query below is the
-     starting hypothesis, to be re-decided from measurement if it
-     contradicts. The ingredient column is never narrower than ~220 px:
-     in the 900–1100 px band the 5fr share is ≥328 px by construction,
-     so the minimum never binds there; it is stated here as the guard,
-     not a second breakpoint. */
+     is two-column is core's layoutBand() (§24 D9 Row 1, RB-R1-4; Q8
+     default (a) governs — layout bands stay), never a media query or
+     a device class in this card: two-column iff wall-identity OR
+     900 <= viewport width <= ~1100 px, plus the column-minimum
+     condition. Phone widths (<900 px) are single column always;
+     tablet widths (900–~1100 px) are two-column (ingredients left,
+     tracker + steps right); wider non-hub viewports (>~1100 px) are
+     single column; the wall (either orientation) is two-column BY
+     IDENTITY — the same 1920 px width with an unknown id is
+     single-column ("not the wall, width above the range", fixes-18
+     item 24). identify() -> unknown degrades the wall to
+     single-column; the banner for that degradation follows the §4
+     banner rule, not a separate layout rule (on a ?kiosk launch with
+     a mismatched id the banner shows; without ?kiosk no banner fires
+     — the known silent case, item 25 — and the single-column wall is
+     itself obvious). The exact ~1100 px boundary is unmeasured
+     (OQ-2) — measurement at those widths in re-match governs if it
+     contradicts the rule; "~1100 px" is kept as written, never
+     invented into a measured breakpoint. The ingredient column is
+     never narrower than ~220 px: layoutBand() drops the layout to
+     single column when the width cannot hold two 220 px columns, and
+     the minmax(220px, ...) below is the structural enforcement. */
   .cook-grid {
     display: grid;
     grid-template-columns: minmax(0, 1fr);
     gap: 40px;
     align-items: start;
   }
-  @media (min-width: 900px) and (max-width: 1100px) {
-    .cook-grid { grid-template-columns: minmax(220px, 5fr) minmax(0, 7fr); }
-  }
-  .screen.dev-hub .cook-grid { grid-template-columns: minmax(220px, 5fr) minmax(0, 7fr); }
+  .screen.layout-two-column .cook-grid { grid-template-columns: minmax(220px, 5fr) minmax(0, 7fr); }
   /* Every grid/flex item in the detail chain carries min-width: 0
      (D4 rule 1), so no item's min-content can force the detail wider
      than the viewport. */
@@ -2591,13 +2472,38 @@ const CARD_CSS = `
   .skeleton-thumb, .skeleton-line { animation: pulse 1.4s ease-in-out infinite; }
   @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
   /* -- Adaptive layout --------------------------------------------------
-     The card detects its device (see detectDevice) and carries the
+     The card reads its device from core identify() and carries the
      category + orientation as classes on .screen: dev-hub, dev-desktop,
      dev-tablet or dev-mobile, and orient-landscape or orient-portrait.
-     The rules above ARE the hub layout (1920x1200 kitchen kiosk: big
-     touch targets, multi-column grid); the rules below only adjust for
+     The rules above ARE the hub layout (kitchen kiosk: big touch
+     targets, multi-column grid); the rules below only adjust for
      desktop, tablet and mobile. A card with no device classes (no
      browser environment) renders the hub layout. */
+  /* Identity banner (§4): the re-register banner shows only on a ?kiosk
+     launch whose browser id mismatches the registered wall id. It is a
+     shadow-root child before .screen so no re-render wipes it. */
+  .fh-identity-banner {
+    display: block;
+    background: #7f1d1d;
+    color: #fff;
+    font-size: 18px;
+    font-weight: 600;
+    line-height: 1.4;
+    text-align: center;
+    padding: 12px 16px;
+  }
+  .fh-identity-banner[hidden] { display: none; }
+  /* Core version mismatch (§9): timer strip area only, never browsing. */
+  .fh-core-mismatch {
+    background: #7f1d1d;
+    color: #fff;
+    font-size: 16px;
+    font-weight: 600;
+    line-height: 1.4;
+    padding: 10px 14px;
+    border-radius: 12px;
+    margin-bottom: 12px;
+  }
   /* Desktop: a mouse is precise, so targets shrink and the grid gets
      denser — three columns from 1500px (D1920 = 3 columns, 12 cards;
      there is no four-column rule — R-IMPL-3 deleted the 1700px one).
@@ -3076,7 +2982,13 @@ class AnyListRecipeViewCard extends HTMLElement {
     this._windowScrollBound = null;
     this._shell = null; // Built once: title, toolbar, chips, status, body.
     this._detailEl = null;
-    this._device = null; // { category, orientation } from detectDevice, or null outside a browser.
+    this._device = null; // { category, orientation } from core deviceFromIdentity, or null outside a browser.
+    this._identity = null; // Last core identify() result, or null before core loads.
+    this._coreMismatch = null; // checkCoreVersion() message, or null when core matches.
+    this._bridgeMismatch = null; // checkBridgeContract() error, or null when all sensors are v2.
+    this._bridgeMismatched = new Set(); // entity ids excluded from timer UI by the bridge gate.
+    this._identityBanner = null;
+    this._coreRetryTimer = null; // 30 s core-lookup retry interval, while mounted.
     this._resizeBound = null;
     this._popstateBound = null;
     this.attachShadow({ mode: "open" });
@@ -3130,6 +3042,9 @@ class AnyListRecipeViewCard extends HTMLElement {
       this._pipOnHassPush();
       this._render();
     }
+    // R1: (re-)attempt the core lookup on every hass push (throttled);
+    // the retry interval itself only runs while mounted.
+    this._ensureCoreForCard();
   }
 
   connectedCallback() {
@@ -3144,9 +3059,11 @@ class AnyListRecipeViewCard extends HTMLElement {
     this._render();
     // A deep link opened on an already-loaded list applies here; the
     // _loadAll path applies it when the load finishes.
-    // Kiosk re-apply (N-IMPL-10d): a same-tab reload whose URL lost
-    // ?kiosk gets it back with one replace (the flag is the backstop).
-    reapplyKioskIfNeeded();
+    // R1: register for the core re-apply and kick off the lookup.
+    // No kiosk re-apply: ?kiosk is launch-only (§4) — identity is
+    // the Browser Mod id, so a bare-URL reload still identifies.
+    _liveCards.add(this);
+    this._ensureCoreForCard();
     if (this._loaded) this._applyDeepLink();
     // Session restore (DESIGN-7): re-open the recipe that was open
     // and restore the scroll; a deep link owns recipe+step, the
@@ -3202,6 +3119,8 @@ class AnyListRecipeViewCard extends HTMLElement {
   }
 
   disconnectedCallback() {
+    _liveCards.delete(this);
+    this._clearCoreRetry();
     if (
       typeof window !== "undefined" &&
       this._resizeBound &&
@@ -3283,13 +3202,44 @@ class AnyListRecipeViewCard extends HTMLElement {
   // layout stands.
   _applyDevice() {
     if (!this._shell) return;
-    const env = readDeviceEnv();
-    if (!env) return;
-    const device = detectDevice(env);
+    // No viewport (node tests): keep whatever device was set — the
+    // old null-environment early return. A browser always has a
+    // window, so this never fires there.
+    if (typeof window === "undefined") return;
+    const width =
+      typeof window !== "undefined" && typeof window.innerWidth === "number"
+        ? window.innerWidth
+        : 0;
+    const height =
+      typeof window !== "undefined" && typeof window.innerHeight === "number"
+        ? window.innerHeight
+        : 0;
+    let device;
+    let identity = null;
+    if (_coreModule) {
+      // Identity comes from core (§4): the registered Browser Mod id.
+      identity = _coreModule.identify(this._hass);
+      device = _coreModule.deviceFromIdentity(identity, width, height);
+      this._coreMismatch =
+        typeof _coreModule.checkCoreVersion === "function"
+          ? _coreModule.checkCoreVersion(REQUIRED_CORE)
+          : null;
+    } else {
+      // Core not loaded yet (or failed): unknown → desktop-safe (§4).
+      // The kiosk class still follows the launch URL so the strip does
+      // not flash hidden while the lookup resolves.
+      this._ensureCoreForCard();
+      device = {
+        category: "desktop",
+        orientation: width >= height ? "landscape" : "portrait",
+      };
+      this._coreMismatch = null;
+    }
     const changed =
       !this._device ||
       this._device.category !== device.category ||
       this._device.orientation !== device.orientation;
+    this._identity = identity;
     this._device = device;
     this._shell.classList.remove(
       "dev-hub",
@@ -3304,15 +3254,88 @@ class AnyListRecipeViewCard extends HTMLElement {
       `dev-${device.category}`,
       `orient-${device.orientation}`
     );
-    if (isKioskMode(readLocationSearch())) {
-      this._shell.classList.add("kiosk");
-      // Kiosk as a session property (N-IMPL-10): remember the flag so
-      // a same-tab reload can re-apply ?kiosk (N-IMPL-10d).
-      storeKioskFlag();
-    }
+    // Kiosk mode is a class of its own (not a device category): the
+    // nav strip shows in kiosk mode ALWAYS, even on desktop (NAV-1).
+    // ?kiosk is launch-only (§4): the class follows the launch URL
+    // (core's layout.kioskParam once loaded) — no flag is stored or
+    // re-applied.
+    const kioskLaunch = identity
+      ? Boolean(identity.layout && identity.layout.kioskParam)
+      : _isKioskLaunch();
+    if (kioskLaunch) this._shell.classList.add("kiosk");
+    // D9 layout band (§24 Row 1; Q8 default (a) governs). The band is
+    // core's layoutBand() — two-column iff wall-identity OR 900 <=
+    // viewport width <= ~1100 px, plus the column-minimum condition —
+    // never re-implemented here, never a media query, never a device
+    // class. identify() -> unknown degrades the wall to single-column
+    // (fixes-18 item 24): a 1920 px viewport with an unknown id is
+    // "not the wall, width above the range". Before core loads the card
+    // is unknown -> desktop-safe single-column; _applyDevice re-runs
+    // once core loads (and on every resize), so the class corrects.
+    const band =
+      _coreModule && typeof _coreModule.layoutBand === "function"
+        ? _coreModule.layoutBand(identity, width)
+        : "single-column";
+    this._shell.classList.remove("layout-two-column", "layout-single-column");
+    this._shell.classList.add(
+      band === "two-column" ? "layout-two-column" : "layout-single-column"
+    );
     // Night mode (N-IMPL-24): dimmed strip, same targets.
     this._shell.classList.toggle("night", isNightNow(readNightSetting()));
     if (changed) this._updateChipsFade();
+    this._updateIdentityBanner();
+  }
+
+  // §4 re-register banner: visible only on a ?kiosk launch whose browser
+  // id mismatches the registered wall id. Mismatch without ?kiosk is the
+  // known silent case (fixes-18 item 25): no banner, only core's
+  // once-only console warning.
+  _updateIdentityBanner() {
+    if (!this._identityBanner) return;
+    const banner = this._identity && this._identity.banner;
+    if (banner) {
+      this._identityBanner.textContent = banner;
+      this._identityBanner.hidden = false;
+    } else {
+      this._identityBanner.textContent = "";
+      this._identityBanner.hidden = true;
+    }
+  }
+
+  // Start the core lookup for this instance (idempotent): one attempt
+  // now, then a retry every 30 s until core loads or the card
+  // unmounts. The interval runs only while mounted (connectedCallback
+  // registers the card in _liveCards) — node tests never mount, so no
+  // interval is ever started there and the test process can exit.
+  _ensureCoreForCard() {
+    if (_coreModule) return;
+    _ensureCore(this._hass);
+    if (_liveCards.has(this) && !this._coreRetryTimer) {
+      this._coreRetryTimer = setInterval(() => {
+        if (_coreModule) {
+          this._clearCoreRetry();
+          return;
+        }
+        _ensureCore(this._hass);
+      }, CORE_LOOKUP_INTERVAL_MS);
+      // Node tests mount cards without ever unmounting; unref the
+      // retry timer so it never holds the test process open. Browsers
+      // return a plain number from setInterval (no unref), so this is
+      // a no-op there.
+      if (
+        this._coreRetryTimer &&
+        typeof this._coreRetryTimer.unref === "function"
+      ) {
+        this._coreRetryTimer.unref();
+      }
+    }
+  }
+
+  _clearCoreRetry() {
+    if (this._coreRetryTimer !== null) {
+      clearInterval(this._coreRetryTimer);
+      this._coreRetryTimer = null;
+    }
   }
 
   // -- AnyList actions (over the websocket API) ---------------------------
@@ -3500,7 +3523,7 @@ class AnyListRecipeViewCard extends HTMLElement {
         window.history.pushState(
           { fhNav: "list", openId: null },
           "",
-          withKioskQuery("/family-hub/recipes")
+          "/family-hub/recipes"
         );
       } catch (_err) {
         // A pushState failure never breaks the close.
@@ -3879,11 +3902,25 @@ class AnyListRecipeViewCard extends HTMLElement {
     const states = this._hass && this._hass.states;
     // hass.states may be an array (classic) or an object keyed by
     // entity id (HA 2026.2+) — the badge helper takes the object form.
-    const badgeState = timerBadgeFromHassStates(
-      Array.isArray(states)
-        ? Object.fromEntries(states.map((s) => [s.entity_id, s]))
-        : states || null
-    );
+    // §9 bridge gate (R1-5): mismatched sensors contribute no count,
+    // and a core skew shows no badge at all.
+    this._refreshGates();
+    const badgeStates = Array.isArray(states)
+      ? Object.fromEntries(
+          states
+            .filter((s) => s && !this._bridgeMismatched.has(s.entity_id))
+            .map((s) => [s.entity_id, s])
+        )
+      : states
+        ? Object.fromEntries(
+            Object.entries(states).filter(
+              ([id]) => !this._bridgeMismatched.has(id)
+            )
+          )
+        : null;
+    const badgeState = this._coreMismatch
+      ? null
+      : timerBadgeFromHassStates(badgeStates);
     if (!badgeState) {
       badge.hidden = true;
       badge.textContent = "";
@@ -3938,10 +3975,45 @@ class AnyListRecipeViewCard extends HTMLElement {
     this._syncStripSummary();
   }
 
+  // §9 version gates (R1-5): evaluate both gates from core. Called
+  // from _runningTimers + _pipOnHassPush + _pipResolveSensor (not only
+  // _applyDevice, which early-returns without a window in node tests):
+  // the gates must evaluate wherever timer UI renders. Before core
+  // loads both read null and the timer list passes through unchanged
+  // (the R1-3 behaviour).
+  _refreshGates() {
+    if (_coreModule && typeof _coreModule.checkCoreVersion === "function") {
+      this._coreMismatch = _coreModule.checkCoreVersion(REQUIRED_CORE);
+    } else {
+      this._coreMismatch = null;
+    }
+    let mismatched = new Set();
+    if (
+      _coreModule &&
+      typeof _coreModule.checkBridgeContract === "function" &&
+      this._hass
+    ) {
+      const res = _coreModule.checkBridgeContract(this._hass.states);
+      this._bridgeMismatch = res.error;
+      mismatched = new Set(res.mismatched || []);
+    } else {
+      this._bridgeMismatch = null;
+    }
+    this._bridgeMismatched = mismatched;
+  }
+
   // The running timers for the strip, from the hass states.
   _runningTimers() {
     if (!this._hass) return [];
-    return runningTimers(this._hass.states || []);
+    this._refreshGates();
+    // A core-version skew admits no timers at all: the card does not
+    // run against a contract it does not understand (C-5/T-10
+    // "instead of running"). A bridge skew admits the v2 sensors.
+    if (this._coreMismatch) return [];
+    const states = timerSensorList(this._hass.states || []).filter(
+      (s) => s && !this._bridgeMismatched.has(s.entity_id)
+    );
+    return runningTimers(states);
   }
 
   // The timers the strip actually shows (R-IMPL-26): at most 3,
@@ -4017,11 +4089,15 @@ class AnyListRecipeViewCard extends HTMLElement {
   // Returns the sensor object, or null.
   _pipResolveSensor() {
     if (!this._pip || this._pip.entityId || !this._hass) return null;
+    this._refreshGates();
     const states = timerSensorList(this._hass.states);
     const cutoff = Date.now() - 15000;
     for (const sensor of states) {
       if (!sensor || typeof sensor.entity_id !== "string") continue;
       if (sensor.entity_id.indexOf("sensor.satellite_timer_") !== 0) continue;
+      // §9 bridge gate (R1-5): an optimistic PIP never binds to a
+      // mismatched sensor.
+      if (this._bridgeMismatched.has(sensor.entity_id)) continue;
       if (timerName(sensor) !== this._pip.name) continue;
       const attrs = sensor.attributes || {};
       const startedAt = attrs.started_at ? Date.parse(attrs.started_at) : NaN;
@@ -4230,6 +4306,7 @@ class AnyListRecipeViewCard extends HTMLElement {
   // "service") are shown by the chip-tap path and ignored here.
   _pipOnHassPush() {
     if (!this._hass) return;
+    this._refreshGates();
     const states = timerSensorList(this._hass.states);
     const seen = new Set();
     for (const sensor of states) {
@@ -4244,6 +4321,9 @@ class AnyListRecipeViewCard extends HTMLElement {
         startedAt: attrs.started_at || null,
       });
       if (!this._selected) continue;
+      // §9 bridge gate (R1-5): no PIP from a mismatched sensor — the
+      // sensor is still tracked in _pipKnown above, just never shown.
+      if (this._bridgeMismatched.has(sensor.entity_id)) continue;
       if (!prev) {
         // A sensor that appears with started_via == "voice" while a
         // detail is open is a voice-started timer: show the PIP.
@@ -4411,7 +4491,9 @@ class AnyListRecipeViewCard extends HTMLElement {
     // N-IMPL-7).
     const targetPath = target.split("?")[0];
     if (targetPath === "/family-hub/recipes" || targetPath.endsWith("/recipes")) return;
-    const url = withKioskQuery(target);
+    // R1: in-app navigation no longer carries ?kiosk — it is launch-only
+    // (§4/§19). (The core SPA helper replaces this whole method in R4.)
+    const url = target;
     try {
       if (window.history && typeof window.history.pushState === "function") {
         window.history.pushState(null, "", url);
@@ -4884,7 +4966,7 @@ class AnyListRecipeViewCard extends HTMLElement {
           window.history.pushState(
             { fhNav: "list", openId: null },
             "",
-            withKioskQuery("/family-hub/recipes")
+            "/family-hub/recipes"
           );
         } catch (_err) {
           // A pushState failure never breaks the return.
@@ -5165,6 +5247,13 @@ class AnyListRecipeViewCard extends HTMLElement {
     const style = document.createElement("style");
     style.textContent = CARD_CSS;
     this.shadowRoot.appendChild(style);
+    this._identityBanner = document.createElement("div");
+    this._identityBanner.className = "fh-identity-banner";
+    this._identityBanner.hidden = true;
+    // Banner BEFORE the shell in the shadow tree (appendChild only —
+    // the node test harness has no insertBefore, and neither do we
+    // need it: create order is document order).
+    this.shadowRoot.appendChild(this._identityBanner);
     this._shell = document.createElement("div");
     this._shell.className = "screen";
     // The nav strip is the FIRST child of the screen (DOM-first for
@@ -5487,11 +5576,22 @@ class AnyListRecipeViewCard extends HTMLElement {
   // layout rule, not a data rule: the "+N more" pill says exactly
   // how many timers the strip is hiding.
   _timerStripHtml() {
+    // §9 version gates (R1-5): a core skew OR a bridge skew shows here,
+    // in the timer strip area only — never in the browse UI. It shows
+    // even with no timers running, so a skew is never silent — and,
+    // unlike the R1-3 shape, it also shows while timers run (a skew
+    // was silent whenever the strip had pills).
     const timers = this._runningTimers();
-    if (timers.length === 0) return "";
+    const gateError = this._coreMismatch || this._bridgeMismatch;
+    const mismatch = gateError
+      ? `<div class="fh-core-mismatch" role="alert">${escapeHtml(gateError)}</div>`
+      : "";
+    // Core skew: the error replaces the timer UI entirely.
+    if (this._coreMismatch) return mismatch;
+    if (timers.length === 0) return mismatch;
     const shown = this._shownStripTimers();
     const extra = timers.length - shown.length;
-    return `<div class="timer-strip" aria-label="Running timers">${shown
+    return `${mismatch}<div class="timer-strip" aria-label="Running timers">${shown
       .map((timer) => {
         const remaining = timerRemainingSeconds(timer);
         return `<button class="timer-strip-item${timer.state === "paused" ? " paused" : ""}" data-action="goto-timers" aria-label="Go to ${escapeHtml(timerName(timer))} timer">
@@ -5850,9 +5950,11 @@ if (typeof module !== "undefined" && module.exports) {
     renderIngredientRow,
     sortRecipes,
     filterByCollection,
-    detectDevice,
-    readDeviceEnv,
-    isKioskMode,
+    CORE_RESOURCE_PATH,
+    CORE_LOOKUP_RETRY_THROTTLE_MS,
+    CORE_LOOKUP_INTERVAL_MS,
+    REQUIRED_CORE,
+    _setCoreForTests,
     pluralTimeUnit,
     timerName,
     timerSensorList,
@@ -5868,12 +5970,6 @@ if (typeof module !== "undefined" && module.exports) {
     serializeRecipeSession,
     sanitizeRecipeStep,
     voiceHintForStep,
-    KIOSK_SESSION_KEY,
-    readKioskFlag,
-    storeKioskFlag,
-    isKioskSession,
-    withKioskQuery,
-    reapplyKioskIfNeeded,
     timerBadgeState,
     timerBadgeFromHassStates,
     NIGHT_SETTING_KEY,
