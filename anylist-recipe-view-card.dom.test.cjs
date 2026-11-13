@@ -292,6 +292,18 @@ async function flush() {
   await sleep(20);
 }
 
+// Burst-5 (F4): poll until a condition holds instead of sleeping a
+// fixed margin — a fixed sleep can leave a save in flight on a
+// loaded tick even when the settle usually takes a fraction of it.
+async function waitFor(condition, timeoutMs = 2000) {
+  const started = Date.now();
+  for (;;) {
+    if (condition()) return;
+    if (Date.now() - started > timeoutMs) throw new Error("waitFor timed out");
+    await sleep(10);
+  }
+}
+
 function fakeTarget(action, extra = {}) {
   return {
     closest: () => ({ dataset: { action, ...extra } }),
@@ -1087,19 +1099,105 @@ test("empty states, by cause: empty library, no-match search, empty collection",
   assert.match(noCollection.querySelector(".button").textContent, /Show all recipes/);
 });
 
-test("a failed load shows an error with a retry button, and retry works", async () => {
+test("a failed load retries itself, shows the error only once the budget is spent, and retry works", async () => {
   const card = new AnyListRecipeViewCard();
   card.setConfig({});
+  // Short backoff so the test does not wait out the real 1/2/4 s.
+  card._loadRetryDelays = [150, 200, 250];
   const hass = fakeHass({ fail: { get_recipes: "boom" } });
   card.hass = hass;
   await flush();
+  // Mid-budget: no dead-end error yet — the transient "trying
+  // again" state shows instead (C1).
+  assert.doesNotMatch(card.shadowRoot.innerHTML, /Couldn't load recipes/);
+  assert.match(card.shadowRoot.innerHTML, /trying again/);
+  // Once the retries are spent (1 + 3 attempts), the error lands
+  // with the Try again button — and exactly 4 loads were made.
+  await sleep(900);
   assert.match(card.shadowRoot.innerHTML, /Couldn't load recipes — check the connection and try again\./);
   assert.match(card.shadowRoot.innerHTML, /Try again/);
+  assert.equal(
+    hass.calls.filter((call) => call[1] === "get_recipes").length,
+    4
+  );
   // The retry path is a fresh load: swap in a working hass and retry.
   card._hass = fakeHass();
   card.shadowRoot.dispatchClick(fakeTarget("retry"));
   await flush();
   assert.equal(card.shadowRoot.querySelectorAll(".row").length, 3);
+  card.disconnectedCallback();
+});
+
+test("a load that fails because AnyList is not installed names the remedy at once, without burning retries (C4)", async () => {
+  const card = new AnyListRecipeViewCard();
+  card.setConfig({});
+  card._loadRetryDelays = [150, 200, 250];
+  const hass = fakeHass({ fail: { get_recipes: "Service anylist.get_recipes not found" } });
+  card.hass = hass;
+  await flush();
+  // No retry wait: the failure is not transient, so the remedy
+  // shows immediately — and only one load was attempted.
+  assert.match(
+    card.shadowRoot.innerHTML,
+    /The AnyList integration is not available on this Home Assistant\. Install the AnyList integration in HACS \(or re-run the setup wizard\), then open the Recipes view again — the list loads when the view opens\./
+  );
+  assert.equal(
+    hass.calls.filter((call) => call[1] === "get_recipes").length,
+    1
+  );
+  card.disconnectedCallback();
+});
+
+test("a transient load failure recovers on its own — no error is ever shown (C1)", async () => {
+  const card = new AnyListRecipeViewCard();
+  card.setConfig({});
+  card._loadRetryDelays = [10, 20, 30];
+  const hass = fakeHass();
+  let attempts = 0;
+  const realCallWS = hass.callWS;
+  hass.callWS = async (message) => {
+    if (message.service === "get_recipes" && ++attempts <= 2) {
+      throw new Error("boom");
+    }
+    return realCallWS(message);
+  };
+  card.hass = hass;
+  await sleep(200);
+  assert.equal(card.shadowRoot.querySelectorAll(".row").length, 3);
+  assert.doesNotMatch(card.shadowRoot.innerHTML, /Couldn't load recipes/);
+  assert.doesNotMatch(card.shadowRoot.innerHTML, /trying again/);
+  // Two failed attempts plus the succeeding one; only the success
+  // reached the recording fake (the failures threw first).
+  assert.equal(attempts, 3);
+  assert.equal(
+    hass.calls.filter((call) => call[1] === "get_recipes").length,
+    1
+  );
+  card.disconnectedCallback();
+});
+
+test("re-opening the view cancels a pending load retry — no double load (O2)", async () => {
+  const card = new AnyListRecipeViewCard();
+  card.setConfig({});
+  card._loadRetryDelays = [200, 200, 200];
+  const hass = fakeHass({ fail: { get_recipes: "boom" } });
+  card.hass = hass;
+  await flush();
+  assert.equal(hass.calls.filter((call) => call[1] === "get_recipes").length, 1);
+  assert.notEqual(card._loadRetryTimer, null, "auto-retry pending");
+  // Re-open the view while the retry is pending: the fresh load
+  // supersedes the scheduled attempt, which must never fire.
+  card._loadRetryDelays = [9000, 9000, 9000];
+  card.connectedCallback();
+  await flush();
+  assert.equal(hass.calls.filter((call) => call[1] === "get_recipes").length, 2);
+  await sleep(400);
+  assert.equal(
+    hass.calls.filter((call) => call[1] === "get_recipes").length,
+    2,
+    "no phantom load from the cancelled retry"
+  );
+  card.disconnectedCallback();
 });
 
 test("recipe names are escaped — markup in a name cannot break the page", async () => {
@@ -1484,6 +1582,25 @@ async function openNotesTab(card) {
   await flush();
 }
 
+async function openSoupNotesTab(card) {
+  card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-soup" }));
+  await flush();
+  card.shadowRoot.dispatchClick(fakeTarget("tab", { tab: "notes" }));
+  await flush();
+}
+
+async function openRiceNotesTab(card) {
+  card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-rice" }));
+  await flush();
+  card.shadowRoot.dispatchClick(fakeTarget("tab", { tab: "notes" }));
+  await flush();
+}
+
+function readStore(store) {
+  const raw = store.get("family-hub:recipe:state");
+  return raw ? JSON.parse(raw) : null;
+}
+
 test("typing a note enables Save; saving calls update_recipe with the note only", async () => {
   const { card, hass } = await loadedCard();
   await openNotesTab(card);
@@ -1529,14 +1646,27 @@ test("saving an empty note clears it", async () => {
   assert.equal(card._selected.note, "");
 });
 
-test("a failed note save keeps the typed note and says so honestly", async () => {
+test("a failed note save retries itself, then keeps the typed note and says so honestly", async () => {
   const { card, hass } = await loadedCard({ fail: { update_recipe: "AnyList is down" } });
+  // Short backoff so the test does not wait out the real 0.5/1 s.
+  card._saveRetryDelays = [50, 100];
   await openNotesTab(card);
   typeNote(card, "More salt next time.");
   card.shadowRoot.dispatchClick(fakeTarget("save-note"));
+  // Mid-budget: the save is still retrying — no error yet.
   await flush();
-  assert.equal(hass.calls.length, 2);
-  assert.equal(hass.calls[1][1], "update_recipe");
+  assert.doesNotMatch(card.shadowRoot.innerHTML, /Couldn't save the note/);
+  // Once the retries are spent (1 + 2 attempts), the error lands —
+  // and all three attempts sent exactly the same note.
+  await sleep(250);
+  assert.equal(hass.calls.length, 4);
+  assert.deepEqual(hass.calls[1], [
+    "anylist",
+    "update_recipe",
+    { recipe_id: "rec-pasta", note: "More salt next time." },
+  ]);
+  assert.deepEqual(hass.calls[2], hass.calls[1]);
+  assert.deepEqual(hass.calls[3], hass.calls[1]);
   assert.match(card.shadowRoot.innerHTML, /Couldn't save the note/);
   assert.match(card.shadowRoot.innerHTML, /your text is still here/);
   // The typed note survives (the draft is kept) and the saved note
@@ -1544,6 +1674,1933 @@ test("a failed note save keeps the typed note and says so honestly", async () =>
   assert.equal(card._noteDrafts.get("rec-pasta"), "More salt next time.");
   assert.equal(card._selected.note, "Vihaan likes this with extra cheese.");
   assert.match(card.shadowRoot.innerHTML, /More salt next time\./);
+  card.disconnectedCallback();
+});
+
+test("a transient note save failure recovers on its own — the draft clears and nothing is lost (C2)", async () => {
+  const { card, hass } = await loadedCard();
+  card._saveRetryDelays = [10, 20];
+  let attempts = 0;
+  const realCallWS = hass.callWS;
+  hass.callWS = async (message) => {
+    if (message.service === "update_recipe" && ++attempts <= 2) {
+      throw new Error("AnyList is down");
+    }
+    return realCallWS(message);
+  };
+  await openNotesTab(card);
+  typeNote(card, "More salt next time.");
+  card.shadowRoot.dispatchClick(fakeTarget("save-note"));
+  await sleep(200);
+  assert.match(card.shadowRoot.innerHTML, /Note saved\./);
+  assert.doesNotMatch(card.shadowRoot.innerHTML, /Couldn't save/);
+  assert.equal(card._noteDrafts.has("rec-pasta"), false);
+  assert.equal(card._selected.note, "More salt next time.");
+  // Two failed attempts plus the succeeding one, all identical.
+  assert.equal(attempts, 3);
+  card.disconnectedCallback();
+});
+
+test("disconnect during a note-save backoff settles the save — no stuck flag, later saves work (F1)", async () => {
+  const { card, hass } = await loadedCard({ fail: { update_recipe: "AnyList is down" } });
+  card._saveRetryDelays = [10000, 10000];
+  await openNotesTab(card);
+  typeNote(card, "More salt next time.");
+  card.shadowRoot.dispatchClick(fakeTarget("save-note"));
+  await flush();
+  assert.equal(card._savingNote, true, "save in flight after attempt 1 threw");
+  assert.equal(card._saveBackoffs.size, 1, "backoff sleep pending");
+  assert.equal(hass.calls.filter((c) => c[1] === "update_recipe").length, 1);
+  card.disconnectedCallback();
+  assert.equal(card._saveBackoffs.size, 0, "disconnect settled the backoff");
+  await sleep(150);
+  // The save returned instead of hanging: the flag cleared, no
+  // failure status was invented for an abandoned save, and no retry
+  // fired after disconnect.
+  assert.equal(card._savingNote, false);
+  assert.equal(card._noteStatus, null);
+  assert.equal(hass.calls.filter((c) => c[1] === "update_recipe").length, 1);
+  // The draft survived, and a later save on the same instance works
+  // — after a re-attach, which is what Lovelace does when the view
+  // re-opens: connectedCallback clears the disconnect flag (B1), so
+  // a fresh save on the new mount may attempt and retry. A save
+  // attempted on the still-detached card stays cancelled.
+  assert.equal(card._noteDrafts.get("rec-pasta"), "More salt next time.");
+  card._hass = fakeHass();
+  card.connectedCallback();
+  await flush();
+  await card._saveNote();
+  await flush();
+  assert.equal(card._savingNote, false);
+  assert.match(card.shadowRoot.innerHTML, /Note saved\./);
+  assert.equal(card._noteDrafts.has("rec-pasta"), false);
+  card.disconnectedCallback();
+});
+
+test("overlapping note and rating saves each cancel on disconnect — a detached card saves nothing (F2)", async () => {
+  const { card, hass } = await loadedCard({ fail: { update_recipe: "AnyList is down" } });
+  card._saveRetryDelays = [300, 300];
+  await openNotesTab(card);
+  typeNote(card, "More salt next time.");
+  card.shadowRoot.dispatchClick(fakeTarget("save-note"));
+  await flush();
+  assert.equal(card._savingNote, true);
+  await sleep(50);
+  card.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "3" }));
+  await flush();
+  assert.equal(card._ratingBusy, true);
+  assert.equal(hass.calls.filter((c) => c[1] === "update_recipe").length, 2, "both first attempts made");
+  assert.equal(card._saveBackoffs.size, 2, "each save has its own backoff");
+  await sleep(50);
+  const callsAtDisconnect = hass.calls.filter((c) => c[1] === "update_recipe").length;
+  card.disconnectedCallback();
+  assert.equal(card._saveBackoffs.size, 0, "disconnect settled both backoffs");
+  await sleep(600);
+  assert.equal(
+    hass.calls.filter((c) => c[1] === "update_recipe").length,
+    callsAtDisconnect,
+    "no save ran after disconnect"
+  );
+  assert.equal(card._savingNote, false);
+  assert.equal(card._ratingBusy, false);
+  assert.equal(card._noteStatus, null);
+  // B2: the cancelled rating save keeps its intended rating and
+  // offers the retry — the note shows no status (its draft is the
+  // retry), but the rating has no Save button, so the status IS
+  // its retry path. The old assertion (null here) encoded the
+  // burst's dropped-rating behaviour.
+  assert.equal(card._pendingRating, 3);
+  assert.equal(card._pendingRatings.get("rec-pasta"), 3);
+  assert.deepEqual(card._ratingStatus, {
+    text: "Rating not saved yet — tap to retry",
+    error: true,
+    retry: "retry-rating",
+  });
+  card.disconnectedCallback();
+});
+
+test("disconnect mid-attempt then the attempt fails — no retry fires on the detached card (B1)", async () => {
+  const { card, hass } = await loadedCard();
+  card._saveRetryDelays = [50, 100];
+  let releaseAttempt1;
+  const attempt1Gate = new Promise((resolve) => {
+    releaseAttempt1 = resolve;
+  });
+  let attempts = 0;
+  const realCallWS = hass.callWS;
+  hass.callWS = async (message) => {
+    if (message.service === "update_recipe" && ++attempts === 1) {
+      await attempt1Gate;
+      throw new Error("AnyList is down");
+    }
+    return realCallWS(message);
+  };
+  await openNotesTab(card);
+  typeNote(card, "More salt next time.");
+  card.shadowRoot.dispatchClick(fakeTarget("save-note"));
+  await flush();
+  assert.equal(card._savingNote, true, "attempt 1 in flight");
+  const callsAtDisconnect = hass.calls.filter((c) => c[1] === "update_recipe").length;
+  card.disconnectedCallback();
+  assert.equal(card._saveDisconnected, true, "disconnect flag set");
+  // Attempt 1 lands after disconnect — and throws.
+  releaseAttempt1();
+  await sleep(300);
+  // No retry fired on the detached card: the call count is exactly
+  // what it was at disconnect, the flag cleared, no failure status
+  // was invented, and the draft survived.
+  assert.equal(
+    hass.calls.filter((c) => c[1] === "update_recipe").length,
+    callsAtDisconnect,
+    "zero update_recipe calls after disconnect"
+  );
+  assert.equal(card._saveBackoffs.size, 0);
+  assert.equal(card._savingNote, false);
+  assert.equal(card._noteStatus, null);
+  assert.equal(card._noteDrafts.get("rec-pasta"), "More salt next time.");
+  assert.equal(card._selected.note, "Vihaan likes this with extra cheese.");
+  card.disconnectedCallback();
+});
+
+test("disconnect mid-attempt then the attempt succeeds — the result is not applied on the detached card (B1)", async () => {
+  const { card, hass } = await loadedCard();
+  card._saveRetryDelays = [50, 100];
+  let releaseAttempt1;
+  const attempt1Gate = new Promise((resolve) => {
+    releaseAttempt1 = resolve;
+  });
+  let attempts = 0;
+  const realCallWS = hass.callWS;
+  hass.callWS = async (message) => {
+    if (message.service === "update_recipe" && ++attempts === 1) {
+      await attempt1Gate;
+    }
+    return realCallWS(message);
+  };
+  await openNotesTab(card);
+  typeNote(card, "More salt next time.");
+  card.shadowRoot.dispatchClick(fakeTarget("save-note"));
+  await flush();
+  assert.equal(card._savingNote, true, "attempt 1 in flight");
+  card.disconnectedCallback();
+  // Attempt 1 lands after disconnect — and succeeds.
+  releaseAttempt1();
+  await sleep(300);
+  // The in-flight attempt itself ran (one service call), but its
+  // result was discarded, not applied: no retry, no backoff, the
+  // stored note is untouched, the draft is kept, and no status
+  // was set on the detached card.
+  assert.equal(hass.calls.filter((c) => c[1] === "update_recipe").length, 1);
+  assert.equal(attempts, 1, "no second attempt was fired");
+  assert.equal(card._saveBackoffs.size, 0);
+  assert.equal(card._savingNote, false);
+  assert.equal(card._noteStatus, null);
+  assert.equal(card._noteDrafts.get("rec-pasta"), "More salt next time.");
+  assert.equal(card._selected.note, "Vihaan likes this with extra cheese.");
+  assert.doesNotMatch(card.shadowRoot.innerHTML, /Note saved\./);
+  card.disconnectedCallback();
+});
+
+test("a cancelled rating save keeps the rating and offers the retry on re-open (B2)", async () => {
+  const store = stubSessionStorage();
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    const { card, hass } = await loadedCard({ fail: { update_recipe: "AnyList is down" } });
+    card._saveRetryDelays = [10000, 10000];
+    await openNotesTab(card);
+    card.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "3" }));
+    await flush();
+    assert.equal(card._ratingBusy, true, "rating save in flight after attempt 1 threw");
+    assert.equal(card._saveBackoffs.size, 1, "backoff sleep pending");
+    card.disconnectedCallback();
+    await sleep(150);
+    // Cancelled, not failed: the intended rating is kept with a
+    // retry, the old rating still shows, and nothing fired after
+    // disconnect.
+    assert.equal(card._ratingBusy, false);
+    assert.equal(card._pendingRating, 3);
+    assert.equal(card._pendingRatings.get("rec-pasta"), 3);
+    assert.equal(card.shadowRoot.querySelectorAll(".star.filled").length, 5);
+    assert.equal(hass.calls.filter((c) => c[1] === "update_recipe").length, 1);
+    assert.ok(card.shadowRoot.querySelector('[data-action="retry-rating"]'), "retry offered");
+    // Re-open the view: the retry is still offered, and tapping it
+    // saves the kept rating.
+    card._hass = fakeHass();
+    card.connectedCallback();
+    await sleep(150);
+    card.shadowRoot.dispatchClick(fakeTarget("tab", { tab: "notes" }));
+    await flush();
+    assert.ok(card.shadowRoot.querySelector('[data-action="retry-rating"]'), "retry offered after re-open");
+    card.shadowRoot.dispatchClick(fakeTarget("retry-rating"));
+    await flush();
+    assert.match(card.shadowRoot.innerHTML, /Rating saved\./);
+    assert.equal(card.shadowRoot.querySelectorAll(".star.filled").length, 3);
+    assert.equal(card._selected.rating, 3);
+    assert.equal(card._pendingRating, null);
+    assert.equal(card._pendingRatings.has("rec-pasta"), false);
+    card.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("a cancelled note + rating save survives a real view re-open on a fresh card (B3)", async () => {
+  const store = stubSessionStorage();
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    const { card, hass } = await loadedCard({ fail: { update_recipe: "AnyList is down" } });
+    card._saveRetryDelays = [10000, 10000];
+    await openNotesTab(card);
+    typeNote(card, "More salt next time.");
+    card.shadowRoot.dispatchClick(fakeTarget("save-note"));
+    await flush();
+    card.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "3" }));
+    await flush();
+    assert.equal(hass.calls.filter((c) => c[1] === "update_recipe").length, 2, "both first attempts made");
+    card.disconnectedCallback();
+    await sleep(150);
+    assert.equal(card._savingNote, false);
+    assert.equal(card._ratingBusy, false);
+    // The kept draft and pending rating are in the session store,
+    // not just instance memory.
+    const saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.deepEqual(saved.noteDrafts, { "rec-pasta": "More salt next time." });
+    assert.deepEqual(saved.pendingRatings, { "rec-pasta": 3 });
+    // A fresh card instance — what Lovelace creates when the view
+    // re-opens — re-opens the saved detail, shows the kept draft
+    // in the editor, and offers the rating retry.
+    const fresh = new AnyListRecipeViewCard();
+    fresh.setConfig({});
+    fresh.hass = fakeHass();
+    await sleep(150);
+    assert.equal(fresh.shadowRoot.querySelector(".list-view").hidden, true, "fresh card re-opened the saved detail");
+    fresh.shadowRoot.dispatchClick(fakeTarget("tab", { tab: "notes" }));
+    await flush();
+    assert.match(fresh.shadowRoot.innerHTML, /More salt next time\./);
+    assert.equal(fresh._noteDrafts.get("rec-pasta"), "More salt next time.");
+    assert.equal(fresh.shadowRoot.querySelectorAll(".star.filled").length, 5);
+    assert.ok(fresh.shadowRoot.querySelector('[data-action="retry-rating"]'), "rating retry offered on the fresh card");
+    assert.equal(fresh._pendingRating, 3);
+    // The retry on the fresh card saves the kept rating, and the
+    // kept draft saves with Save — nothing has to be retyped.
+    fresh.shadowRoot.dispatchClick(fakeTarget("retry-rating"));
+    await flush();
+    assert.match(fresh.shadowRoot.innerHTML, /Rating saved\./);
+    assert.equal(fresh.shadowRoot.querySelectorAll(".star.filled").length, 3);
+    fresh.shadowRoot.dispatchClick(fakeTarget("save-note"));
+    await flush();
+    assert.match(fresh.shadowRoot.innerHTML, /Note saved\./);
+    assert.equal(fresh._selected.note, "More salt next time.");
+    card.disconnectedCallback();
+    fresh.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("switching recipes mid-save confirms the first recipe's save without a failure status (B4)", async () => {
+  const { card, hass } = await loadedCard();
+  card._saveRetryDelays = [50, 100];
+  let releaseAttempt1;
+  const attempt1Gate = new Promise((resolve) => {
+    releaseAttempt1 = resolve;
+  });
+  let attempts = 0;
+  const realCallWS = hass.callWS;
+  hass.callWS = async (message) => {
+    if (message.service === "update_recipe" && ++attempts === 1) {
+      await attempt1Gate;
+    }
+    return realCallWS(message);
+  };
+  await openNotesTab(card);
+  typeNote(card, "More salt next time.");
+  card.shadowRoot.dispatchClick(fakeTarget("save-note"));
+  await flush();
+  assert.equal(card._savingNote, true, "pasta save in flight");
+  // Open another recipe mid-save: the detail switches to soup and
+  // soup has no save in flight — but coming back to pasta still
+  // shows its save as busy.
+  card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-soup" }));
+  await flush();
+  assert.equal(card._selected.id, "rec-soup");
+  assert.equal(card._savingNote, false, "soup has no save in flight");
+  card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+  await flush();
+  assert.equal(card._savingNote, true, "pasta's in-flight save still shows busy on return");
+  card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-soup" }));
+  await flush();
+  // The server accepts the pasta note on attempt 1.
+  releaseAttempt1();
+  await sleep(250);
+  // Exactly one service call — the confirmed save did not burn
+  // the retry budget — no failure status on the soup detail, and
+  // the pasta list copy carries the new note.
+  assert.equal(hass.calls.filter((c) => c[1] === "update_recipe").length, 1, "no retry budget burned on a confirmed save");
+  assert.equal(attempts, 1);
+  assert.doesNotMatch(card.shadowRoot.innerHTML, /Couldn't save/);
+  assert.doesNotMatch(card.shadowRoot.innerHTML, /Note saved\./);
+  const pasta = card._recipes.find((recipe) => recipe.id === "rec-pasta");
+  assert.equal(pasta.note, "More salt next time.");
+  assert.equal(card._noteDrafts.has("rec-pasta"), false);
+  assert.equal(card._selected.id, "rec-soup");
+  assert.equal(card._savingNote, false);
+  card.disconnectedCallback();
+});
+
+test("text typed during a note-save retry is sent by the retry, not discarded (F3)", async () => {
+  const { card, hass } = await loadedCard();
+  card._saveRetryDelays = [50, 100];
+  let attempts = 0;
+  const realCallWS = hass.callWS;
+  hass.callWS = async (message) => {
+    if (message.service === "update_recipe" && ++attempts === 1) {
+      throw new Error("AnyList is down");
+    }
+    return realCallWS(message);
+  };
+  await openNotesTab(card);
+  typeNote(card, "More salt next time.");
+  card.shadowRoot.dispatchClick(fakeTarget("save-note"));
+  await sleep(25);
+  assert.equal(card._savingNote, true, "save is in its retry backoff");
+  // The textarea stays editable while saving — keep typing.
+  typeNote(card, "More salt next time. And pepper.");
+  assert.equal(card._noteDrafts.get("rec-pasta"), "More salt next time. And pepper.");
+  await sleep(400);
+  // The retry re-read the draft, so the newer text is what saved.
+  assert.match(card.shadowRoot.innerHTML, /Note saved\./);
+  assert.equal(card._selected.note, "More salt next time. And pepper.");
+  assert.equal(card._noteDrafts.has("rec-pasta"), false);
+  assert.match(card.shadowRoot.innerHTML, /And pepper/);
+  // Two attempts were made, but only the succeeding one reached the
+  // recording fake (the first threw before it) — and it carried the
+  // newer text.
+  assert.equal(attempts, 2);
+  assert.equal(hass.calls.filter((c) => c[1] === "update_recipe").length, 1);
+  assert.deepEqual(hass.calls[1], [
+    "anylist",
+    "update_recipe",
+    { recipe_id: "rec-pasta", note: "More salt next time. And pepper." },
+  ]);
+  card.disconnectedCallback();
+});
+
+test("text typed while the final save attempt is in flight is kept as a draft, not deleted (F3)", async () => {
+  const { card, hass } = await loadedCard();
+  card._saveRetryDelays = [50, 100];
+  let attempts = 0;
+  let releaseAttempt2;
+  const attempt2Gate = new Promise((resolve) => {
+    releaseAttempt2 = resolve;
+  });
+  const realCallWS = hass.callWS;
+  hass.callWS = async (message) => {
+    if (message.service === "update_recipe") {
+      if (++attempts === 1) throw new Error("AnyList is down");
+      if (attempts === 2) await attempt2Gate;
+    }
+    return realCallWS(message);
+  };
+  await openNotesTab(card);
+  typeNote(card, "More salt next time.");
+  card.shadowRoot.dispatchClick(fakeTarget("save-note"));
+  await sleep(120);
+  // Attempt 2 is in flight (blocked on the gate) — type more.
+  assert.equal(card._savingNote, true);
+  typeNote(card, "More salt next time. And pepper.");
+  releaseAttempt2();
+  await sleep(200);
+  // The in-flight attempt saved the text it sent; the newer typing
+  // was never in that payload, so it stays a draft with Save enabled.
+  assert.equal(card._selected.note, "More salt next time.");
+  assert.equal(card._noteDrafts.get("rec-pasta"), "More salt next time. And pepper.");
+  assert.match(card.shadowRoot.innerHTML, /And pepper/);
+  assert.match(card.shadowRoot.innerHTML, /newer text is still unsaved/);
+  assert.equal(card.shadowRoot.querySelector('[data-action="save-note"]').getAttribute("disabled"), null);
+  card.disconnectedCallback();
+});
+
+// -- burst-3 (cop-out delta review) ---------------------------------------
+//
+// The stock fakeHass always returns the pasta recipe from
+// update_recipe, so no shipped test can confirm a save for any other
+// recipe. This stub wraps a hass so each recipe's update_recipe call
+// is applied to THAT recipe's server-side copy the moment it is
+// made — the call is recorded in hass.calls at call time, exactly
+// like the stock fake — and only the RESPONSE is held, until the
+// test releases that recipe's gate. gateNext(id) must be called
+// BEFORE the save under test starts; calls with no gate queued
+// answer at once.
+function perRecipeUpdateStub(hass) {
+  const server = {
+    "rec-pasta": { ...PASTA_FULL },
+    "rec-soup": { ...SOUP_LIGHT },
+    "rec-rice": { ...RICE_LIGHT },
+  };
+  const gates = new Map();
+  const realCallWS = hass.callWS;
+  hass.callWS = async (message) => {
+    if (message.service === "update_recipe") {
+      const data = message.service_data || {};
+      const id = data.recipe_id;
+      hass.calls.push([message.domain, message.service, data]);
+      const copy = server[id];
+      if (copy) {
+        if (data.note !== undefined) copy.note = data.note;
+        if (data.rating !== undefined) copy.rating = data.rating;
+      }
+      // Burst-4 (F1): the RESPONSE is snapshotted at call time, like
+      // a real server returns — the call's own value, not whatever
+      // the server copy holds when the gate releases. The P7d tests
+      // alone do NOT prove this: reverting the snapshot alone
+      // leaves both P7d tests green (measured by the burst-4
+      // critic). The snapshot's role is proven by the direct test
+      // below (gate v1, mutate the server copy to v2, release,
+      // assert the released response carried v1) and by the pair:
+      // neuter _saveSuperseded with the snapshot intact and both
+      // P7d tests fail on value assertions.
+      const snapshot = copy ? { ...copy } : undefined;
+      const queue = gates.get(id);
+      if (queue && queue.length > 0) {
+        await queue.shift().promise;
+      }
+      return { response: { recipe: snapshot } };
+    }
+    return realCallWS(message);
+  };
+  return {
+    server,
+    gateNext(id) {
+      let release;
+      const promise = new Promise((resolve) => {
+        release = resolve;
+      });
+      if (!gates.has(id)) gates.set(id, []);
+      gates.get(id).push({ promise });
+      return release;
+    },
+  };
+}
+
+// Burst-4 (D1): fail the FIRST update_recipe attempt for one recipe,
+// then apply later calls to the shared server copy at call time
+// (like perRecipeUpdateStub). `attempts` records every call,
+// including the failed first one, so a test can assert exactly how
+// many attempts a save dispatched. Non-update_recipe calls pass
+// through to the real hass.
+function failFirstUpdateStub(hass, failId) {
+  const server = {
+    "rec-pasta": { ...PASTA_FULL },
+    "rec-soup": { ...SOUP_LIGHT },
+    "rec-rice": { ...RICE_LIGHT },
+  };
+  const attempts = [];
+  let failed = false;
+  const realCallWS = hass.callWS;
+  hass.callWS = async (message) => {
+    if (message.service === "update_recipe") {
+      const data = message.service_data || {};
+      attempts.push({ ...data });
+      if (data.recipe_id === failId && !failed) {
+        failed = true;
+        throw new Error("AnyList is down");
+      }
+      const copy = server[data.recipe_id];
+      if (copy) {
+        if (data.note !== undefined) copy.note = data.note;
+        if (data.rating !== undefined) copy.rating = data.rating;
+      }
+      return { response: { recipe: copy ? { ...copy } : undefined } };
+    }
+    return realCallWS(message);
+  };
+  return { server, attempts };
+}
+
+async function openSoupNotesTab(card) {
+  card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-soup" }));
+  await flush();
+  card.shadowRoot.dispatchClick(fakeTarget("tab", { tab: "notes" }));
+  await flush();
+}
+
+function updateRecipeCalls(hass) {
+  return hass.calls.filter((c) => c[1] === "update_recipe");
+}
+
+test("the per-recipe stub snapshots the response at call time — a gated v1 response carries v1, not the mutated v2 (burst-5, F3)", async () => {
+  const { card, hass } = await loadedCard();
+  const stub = perRecipeUpdateStub(hass);
+  await openNotesTab(card);
+  const releaseV1 = stub.gateNext("rec-pasta");
+  typeNote(card, "v1 text.");
+  card.shadowRoot.dispatchClick(fakeTarget("save-note"));
+  await flush();
+  assert.equal(updateRecipeCalls(hass).length, 1, "v1 save made its call");
+  assert.equal(stub.server["rec-pasta"].note, "v1 text.", "server copy holds v1 at call time");
+  // While the v1 response is gated, the server copy moves to v2 —
+  // as if a newer save had landed in between. The released
+  // response must still carry v1 (the value the call sent), not
+  // whatever the server copy holds when the gate releases.
+  // Without the snapshot the card applies v2 here and this fails.
+  stub.server["rec-pasta"].note = "v2 text.";
+  releaseV1();
+  await sleep(200);
+  assert.equal(card._selected.note, "v1 text.", "released response carried v1, not the mutated v2");
+  assert.equal(stub.server["rec-pasta"].note, "v2 text.", "server copy still ends at v2");
+  assert.match(card.shadowRoot.innerHTML, /Note saved\./);
+  card.disconnectedCallback();
+});
+
+test("a newer note save survives the older gated save landing after it (P7d, burst-3)", async () => {
+  const { card, hass } = await loadedCard();
+  const stub = perRecipeUpdateStub(hass);
+  await openNotesTab(card);
+  // Pasta save 1 ("v1 text.") is gated mid-attempt.
+  const releaseV1 = stub.gateNext("rec-pasta");
+  typeNote(card, "v1 text.");
+  card.shadowRoot.dispatchClick(fakeTarget("save-note"));
+  await flush();
+  assert.equal(card._savingNote, true, "pasta save 1 in flight");
+  assert.equal(updateRecipeCalls(hass).length, 1);
+  // A soup save in between must not steal pasta's flag (the
+  // burst-2 scalar bug): coming back to pasta still shows busy.
+  await openSoupNotesTab(card);
+  assert.equal(card._selected.id, "rec-soup");
+  assert.equal(card._savingNote, false, "soup has no save in flight");
+  typeNote(card, "Soup note.");
+  card.shadowRoot.dispatchClick(fakeTarget("save-note"));
+  await flush();
+  assert.equal(updateRecipeCalls(hass).length, 2, "soup save made its call");
+  const soup = card._recipes.find((recipe) => recipe.id === "rec-soup");
+  assert.equal(soup.note, "Soup note.");
+  // Back to pasta: still busy, but the newer text may be saved —
+  // it supersedes the gated v1 attempt.
+  card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+  await flush();
+  card.shadowRoot.dispatchClick(fakeTarget("tab", { tab: "notes" }));
+  await flush();
+  assert.equal(card._savingNote, true, "pasta's in-flight save still shows busy on return");
+  typeNote(card, "v2 text.");
+  card.shadowRoot.dispatchClick(fakeTarget("save-note"));
+  await flush();
+  assert.equal(updateRecipeCalls(hass).length, 3, "newer pasta save made its call while v1 was gated");
+  assert.equal(card._selected.note, "v2 text.", "newer text confirmed first");
+  assert.equal(card._noteDrafts.has("rec-pasta"), false, "newer save cleared its draft");
+  // The older gated attempt lands AFTER the newer save confirmed.
+  releaseV1();
+  await sleep(200);
+  // The newer text survives, locally and in the call order to the
+  // server (v1 sent first, v2 sent last — the server ends at v2):
+  // no fourth call, no clobber, no failure status, no resurrected
+  // draft, and the flag is clear.
+  assert.equal(updateRecipeCalls(hass).length, 3, "stale save fired no retry after landing");
+  assert.deepEqual(updateRecipeCalls(hass)[2], [
+    "anylist",
+    "update_recipe",
+    { recipe_id: "rec-pasta", note: "v2 text." },
+  ]);
+  assert.equal(card._selected.note, "v2 text.");
+  assert.equal(card._noteDrafts.has("rec-pasta"), false);
+  assert.equal(card._savingNote, false);
+  assert.match(card.shadowRoot.innerHTML, /Note saved\./);
+  assert.doesNotMatch(card.shadowRoot.innerHTML, /Couldn't save/);
+  assert.doesNotMatch(card.shadowRoot.innerHTML, /still unsaved/);
+  card.disconnectedCallback();
+});
+
+test("two note saves for two recipes: switching back shows Save disabled and fires no third call (burst-3)", async () => {
+  const { card, hass } = await loadedCard();
+  const stub = perRecipeUpdateStub(hass);
+  const releasePasta = stub.gateNext("rec-pasta");
+  const releaseSoup = stub.gateNext("rec-soup");
+  await openNotesTab(card);
+  typeNote(card, "Pasta note.");
+  card.shadowRoot.dispatchClick(fakeTarget("save-note"));
+  await flush();
+  assert.equal(card._savingNote, true, "pasta save in flight");
+  assert.equal(updateRecipeCalls(hass).length, 1);
+  await openSoupNotesTab(card);
+  typeNote(card, "Soup note.");
+  card.shadowRoot.dispatchClick(fakeTarget("save-note"));
+  await flush();
+  assert.equal(card._ratingBusy, false);
+  assert.equal(updateRecipeCalls(hass).length, 2, "soup save made its call");
+  // Back to pasta while BOTH saves are in flight: pasta's Save
+  // stays disabled, and tapping it anyway fires no third call.
+  card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+  await flush();
+  card.shadowRoot.dispatchClick(fakeTarget("tab", { tab: "notes" }));
+  await flush();
+  assert.equal(card._savingNote, true, "pasta save still in flight on return");
+  assert.equal(
+    card.shadowRoot.querySelector('[data-action="save-note"]').getAttribute("disabled"),
+    "disabled"
+  );
+  card.shadowRoot.dispatchClick(fakeTarget("save-note"));
+  await flush();
+  assert.equal(updateRecipeCalls(hass).length, 2, "no third call while pasta's save is in flight");
+  releasePasta();
+  releaseSoup();
+  await sleep(200);
+  assert.equal(updateRecipeCalls(hass).length, 2);
+  const pasta = card._recipes.find((recipe) => recipe.id === "rec-pasta");
+  const soup = card._recipes.find((recipe) => recipe.id === "rec-soup");
+  assert.equal(pasta.note, "Pasta note.");
+  assert.equal(soup.note, "Soup note.");
+  assert.equal(card._savingNote, false);
+  assert.doesNotMatch(card.shadowRoot.innerHTML, /Couldn't save/);
+  card.disconnectedCallback();
+});
+
+test("two rating saves for two recipes: switching back shows stars disabled and fires no third call (burst-3)", async () => {
+  const { card, hass } = await loadedCard();
+  const stub = perRecipeUpdateStub(hass);
+  const releasePasta = stub.gateNext("rec-pasta");
+  const releaseSoup = stub.gateNext("rec-soup");
+  await openNotesTab(card);
+  card.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "3" }));
+  await flush();
+  assert.equal(card._ratingBusy, true, "pasta rating save in flight");
+  assert.equal(updateRecipeCalls(hass).length, 1);
+  await openSoupNotesTab(card);
+  card.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "4" }));
+  await flush();
+  assert.equal(updateRecipeCalls(hass).length, 2, "soup rating save made its call");
+  // Back to pasta while BOTH rating saves are in flight: the
+  // stars stay disabled, and re-tapping the same rating fires no
+  // third call.
+  card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+  await flush();
+  card.shadowRoot.dispatchClick(fakeTarget("tab", { tab: "notes" }));
+  await flush();
+  assert.equal(card._ratingBusy, true, "pasta rating save still in flight on return");
+  assert.equal(
+    card.shadowRoot.querySelector('[data-action="rate"]').getAttribute("disabled"),
+    "disabled"
+  );
+  card.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "3" }));
+  await flush();
+  assert.equal(updateRecipeCalls(hass).length, 2, "no third call while pasta's rating save is in flight");
+  releasePasta();
+  releaseSoup();
+  await sleep(200);
+  assert.equal(updateRecipeCalls(hass).length, 2);
+  const pasta = card._recipes.find((recipe) => recipe.id === "rec-pasta");
+  const soup = card._recipes.find((recipe) => recipe.id === "rec-soup");
+  assert.equal(pasta.rating, 3);
+  assert.equal(soup.rating, 4);
+  assert.equal(card._ratingBusy, false);
+  assert.doesNotMatch(card.shadowRoot.innerHTML, /Couldn't save/);
+  card.disconnectedCallback();
+});
+
+test("a newer rating tap supersedes an older gated rating save (P7d for ratings, burst-3)", async () => {
+  const { card, hass } = await loadedCard();
+  const stub = perRecipeUpdateStub(hass);
+  await openNotesTab(card);
+  const releaseOld = stub.gateNext("rec-pasta");
+  card.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "3" }));
+  await flush();
+  assert.equal(card._ratingBusy, true, "first rating save in flight");
+  assert.equal(updateRecipeCalls(hass).length, 1);
+  // A different tap while the first is gated supersedes it.
+  card.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "4" }));
+  await flush();
+  assert.equal(updateRecipeCalls(hass).length, 2, "newer rating save made its call");
+  assert.equal(card._selected.rating, 4, "newer rating confirmed first");
+  assert.equal(card._pendingRating, null);
+  releaseOld();
+  await sleep(200);
+  assert.equal(updateRecipeCalls(hass).length, 2, "stale rating save fired no retry after landing");
+  assert.deepEqual(updateRecipeCalls(hass)[1], [
+    "anylist",
+    "update_recipe",
+    { recipe_id: "rec-pasta", rating: 4 },
+  ]);
+  assert.equal(card._selected.rating, 4, "older gated rating did not clobber the newer one");
+  assert.equal(card._ratingBusy, false);
+  assert.equal(card._pendingRatings.has("rec-pasta"), false);
+  assert.match(card.shadowRoot.innerHTML, /Rating saved\./);
+  assert.doesNotMatch(card.shadowRoot.innerHTML, /Couldn't save/);
+  card.disconnectedCallback();
+});
+
+test("a note typed within the debounce window survives disconnect on a fresh card (burst-3, critic finding 1)", async () => {
+  const store = stubSessionStorage();
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    const { card } = await loadedCard();
+    await openNotesTab(card);
+    // Type and disconnect at once — inside the 150 ms debounce, so
+    // the scheduled session save has not fired yet, and with no
+    // other save in flight whose finally could persist the draft
+    // instead. The old code dropped that timer on disconnect and
+    // the typed note was gone on a fresh card; the flush in
+    // disconnectedCallback keeps it.
+    typeNote(card, "More salt next time.");
+    card.disconnectedCallback();
+    const saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.deepEqual(saved.noteDrafts, { "rec-pasta": "More salt next time." });
+    // A fresh card instance — what Lovelace creates on re-open —
+    // shows the kept draft in the editor.
+    const fresh = new AnyListRecipeViewCard();
+    fresh.setConfig({});
+    fresh.hass = fakeHass();
+    await sleep(150);
+    assert.equal(fresh._noteDrafts.get("rec-pasta"), "More salt next time.");
+    fresh.shadowRoot.dispatchClick(fakeTarget("tab", { tab: "notes" }));
+    await flush();
+    assert.match(fresh.shadowRoot.innerHTML, /More salt next time\./);
+    card.disconnectedCallback();
+    fresh.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("disconnect flush keeps a typed draft alongside an already-failed rating save (burst-3, critic finding 1; burst-4 F2)", async () => {
+  const store = stubSessionStorage();
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    const { card, hass } = await loadedCard({ fail: { update_recipe: "AnyList is down" } });
+    // Short backoffs so the rating save fails outright and SETTLES
+    // before any draft exists: its retries are spent and its
+    // finally has already run, so it cannot be the path that
+    // persists the draft typed below — only the disconnect flush
+    // can. (Burst-4 F2: the burst-3 version tapped the rating
+    // while its save was still in flight, so the draft reached
+    // the store through that save's finally, not the flush, and
+    // the test passed on burst-2 code with no flush at all. This
+    // version fails on burst-2 code: without the flush the draft
+    // never reaches the store.)
+    card._saveRetryDelays = [10, 10];
+    await openNotesTab(card);
+    card.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "3" }));
+    // Burst-5 (F4): poll for the settle instead of a fixed 300 ms
+    // sleep — the settle usually takes ~23 ms, but a fixed sleep
+    // is a margin, not a guarantee, and a loaded tick could still
+    // leave the save in flight when the assertions below run.
+    await waitFor(() => card._ratingBusy === false);
+    assert.equal(card._ratingBusy, false, "failed rating save settled before the draft was typed");
+    assert.equal(card._pendingRatings.get("rec-pasta"), 3);
+    assert.match(card.shadowRoot.innerHTML, /Couldn't save the rating/);
+    // The pending rating is already in the store via the settled
+    // save's finally; the draft is not yet — it only exists in
+    // the debounce timer.
+    const before = JSON.parse(store.get("family-hub:recipe:state") || "{}");
+    assert.deepEqual(before.pendingRatings, { "rec-pasta": 3 });
+    assert.equal(before.noteDrafts, undefined, "draft not yet persisted before disconnect");
+    typeNote(card, "More salt next time.");
+    card.disconnectedCallback();
+    const saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.deepEqual(saved.noteDrafts, { "rec-pasta": "More salt next time." });
+    assert.deepEqual(saved.pendingRatings, { "rec-pasta": 3 });
+    const fresh = new AnyListRecipeViewCard();
+    fresh.setConfig({});
+    fresh.hass = fakeHass();
+    await sleep(150);
+    assert.equal(fresh._noteDrafts.get("rec-pasta"), "More salt next time.");
+    fresh.shadowRoot.dispatchClick(fakeTarget("tab", { tab: "notes" }));
+    await flush();
+    assert.match(fresh.shadowRoot.innerHTML, /More salt next time\./);
+    assert.equal(fresh._pendingRating, 3);
+    assert.ok(fresh.shadowRoot.querySelector('[data-action="retry-rating"]'), "rating retry offered on the fresh card");
+    card.disconnectedCallback();
+    fresh.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("stale draft and pending-rating ids are written out of the session store on load (burst-3, critic finding 3)", async () => {
+  // Seeded with NO open recipe (list view): nothing re-opens a
+  // recipe on load, so no _openRecipe _saveSession() runs to
+  // rewrite the store incidentally — the only store write on
+  // load is the prune write-back itself. (With an openId seeded,
+  // the re-open would rewrite the store and mask the defect.)
+  const seed = {
+    openId: null,
+    step: null,
+    listScrollY: 0,
+    detailScrollY: 0,
+    query: "",
+    collectionId: "",
+    sort: "name",
+    noteDrafts: { "rec-gone": "stale draft", "rec-pasta": "keep me" },
+    pendingRatings: { "rec-gone": 4 },
+  };
+  const store = stubSessionStorage({
+    "family-hub:recipe:state": JSON.stringify(seed),
+  });
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    const { card } = await loadedCard();
+    await sleep(150);
+    // In memory the prune already worked; the store must agree —
+    // the old code never wrote the pruned state back, so the stale
+    // ids sat in the store and would resurrect if the id returned.
+    assert.equal(card._noteDrafts.get("rec-pasta"), "keep me");
+    assert.equal(card._noteDrafts.has("rec-gone"), false);
+    assert.equal(card._pendingRatings.has("rec-gone"), false);
+    const saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.deepEqual(saved.noteDrafts, { "rec-pasta": "keep me" });
+    assert.equal(saved.pendingRatings, undefined, "no pending ratings left in the store");
+    // The write-back is surgical: the rest of the session survives.
+    assert.equal(saved.openId, null);
+    assert.equal(saved.step, null);
+    assert.equal(saved.sort, "name");
+    card.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("a note save superseded during its backoff never dispatches on waking (burst-4, D1)", async () => {
+  const { card, hass } = await loadedCard();
+  const stub = failFirstUpdateStub(hass, "rec-pasta");
+  card._saveRetryDelays = [200, 200];
+  await openNotesTab(card);
+  // Save 1 ("v1 text.") throws its first attempt and sits in its
+  // 200 ms backoff.
+  typeNote(card, "v1 text.");
+  card.shadowRoot.dispatchClick(fakeTarget("save-note"));
+  await flush();
+  assert.equal(stub.attempts.length, 1, "first attempt made");
+  assert.deepEqual(stub.attempts[0], { recipe_id: "rec-pasta", note: "v1 text." });
+  // During the backoff, a newer save starts and confirms.
+  await sleep(50);
+  typeNote(card, "v2 text.");
+  card.shadowRoot.dispatchClick(fakeTarget("save-note"));
+  await flush();
+  assert.equal(stub.attempts.length, 2, "newer save made its call while v1 was in backoff");
+  assert.deepEqual(stub.attempts[1], { recipe_id: "rec-pasta", note: "v2 text." });
+  assert.equal(card._selected.note, "v2 text.", "newer text confirmed first");
+  // The superseded save wakes from its backoff after the newer
+  // save confirmed: it must dispatch nothing further. Without
+  // the post-backoff supersede check it fires a third call whose
+  // callFn re-reads the draft — deleted by the newer save, so it
+  // falls back to the ORIGINAL note — and the server ends at the
+  // original while the card shows v2.
+  await sleep(400);
+  assert.equal(stub.attempts.length, 2, "stale save fired no call after its backoff");
+  assert.equal(stub.server["rec-pasta"].note, "v2 text.", "server ends at the newer text");
+  assert.equal(card._selected.note, "v2 text.");
+  assert.equal(card._noteDrafts.has("rec-pasta"), false);
+  assert.match(card.shadowRoot.innerHTML, /Note saved\./);
+  assert.doesNotMatch(card.shadowRoot.innerHTML, /Couldn't save/);
+  card.disconnectedCallback();
+});
+
+test("a rating save superseded during its backoff never dispatches on waking (burst-4, D1)", async () => {
+  const { card, hass } = await loadedCard();
+  const stub = failFirstUpdateStub(hass, "rec-pasta");
+  card._saveRetryDelays = [200, 200];
+  await openNotesTab(card);
+  // Rating 2 throws its first attempt and sits in its 200 ms backoff.
+  card.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "2" }));
+  await flush();
+  assert.equal(stub.attempts.length, 1, "first attempt made");
+  assert.deepEqual(stub.attempts[0], { recipe_id: "rec-pasta", rating: 2 });
+  // During the backoff, a newer tap starts and confirms.
+  await sleep(50);
+  card.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "4" }));
+  await flush();
+  assert.equal(stub.attempts.length, 2, "newer rating save made its call while the first was in backoff");
+  assert.deepEqual(stub.attempts[1], { recipe_id: "rec-pasta", rating: 4 });
+  assert.equal(card._selected.rating, 4, "newer rating confirmed first");
+  // The superseded save wakes from its backoff after the newer
+  // save confirmed: it must dispatch nothing further. Without
+  // the post-backoff supersede check it fires a third call with
+  // the stale rating 2, and the server ends at 2 while the card
+  // shows 4 and reports "Rating saved.".
+  await sleep(400);
+  assert.equal(stub.attempts.length, 2, "stale rating save fired no call after its backoff");
+  assert.equal(stub.server["rec-pasta"].rating, 4, "server ends at the newer rating");
+  assert.equal(card._selected.rating, 4);
+  assert.match(card.shadowRoot.innerHTML, /Rating saved\./);
+  assert.doesNotMatch(card.shadowRoot.innerHTML, /Couldn't save/);
+  card.disconnectedCallback();
+});
+
+test("a disconnect flush does not clobber another live card's stored draft (burst-4, F3)", async () => {
+  const store = stubSessionStorage();
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    // Card A loads first and types a pasta draft — its memory
+    // knows pasta only.
+    const { card: cardA } = await loadedCard();
+    await openNotesTab(cardA);
+    typeNote(cardA, "Pasta draft.");
+    // Card B, a second live instance sharing the store, types a
+    // soup draft and its save fails, so B's finally writes the
+    // soup draft to the store. A never saw it: A loaded before B
+    // wrote, so A's memory still holds pasta only.
+    const cardB = new AnyListRecipeViewCard();
+    cardB.setConfig({});
+    cardB.hass = fakeHass({ fail: { update_recipe: "AnyList is down" } });
+    cardB._saveRetryDelays = [10, 10];
+    await flush();
+    await openSoupNotesTab(cardB);
+    typeNote(cardB, "Soup draft.");
+    cardB.shadowRoot.dispatchClick(fakeTarget("save-note"));
+    await sleep(200);
+    assert.equal(cardB._noteDrafts.get("rec-soup"), "Soup draft.");
+    let saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.noteDrafts["rec-soup"], "Soup draft.", "B's failed save persisted its draft");
+    // A disconnects: the wholesale replace used to overwrite the
+    // store with A's pasta-only drafts and B's soup draft was
+    // gone. The merge keeps both — in every interleaving of A's
+    // 150 ms debounce timer with B's write, since each write
+    // unions what the store already holds.
+    cardA.disconnectedCallback();
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.deepEqual(saved.noteDrafts, { "rec-pasta": "Pasta draft.", "rec-soup": "Soup draft." });
+    const fresh = new AnyListRecipeViewCard();
+    fresh.setConfig({});
+    fresh.hass = fakeHass();
+    await sleep(150);
+    assert.equal(fresh._noteDrafts.get("rec-pasta"), "Pasta draft.");
+    assert.equal(fresh._noteDrafts.get("rec-soup"), "Soup draft.");
+    cardB.disconnectedCallback();
+    fresh.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("a _render() throw during a note save leaks no in-flight id — the next save proceeds (burst-4, F4)", async () => {
+  const { card, hass } = await loadedCard();
+  await openNotesTab(card);
+  typeNote(card, "More salt next time.");
+  const realRender = card._render.bind(card);
+  let threw = false;
+  card._render = () => {
+    if (!threw) {
+      threw = true;
+      throw new Error("render boom");
+    }
+    return realRender();
+  };
+  await assert.rejects(card._saveNote(), /render boom/);
+  card._render = realRender;
+  assert.equal(threw, true, "the throw fired");
+  assert.equal(card._savingNoteRecipeIds.has("rec-pasta"), false, "throwing render left no id behind");
+  assert.equal(updateRecipeCalls(hass).length, 0, "no call was made by the aborted save");
+  // Burst-5 (F2): the flag itself must be clear, and the rendered
+  // Save button enabled — the burst-4 test only proved a direct
+  // programmatic _saveNote() call proceeds, but a real user taps
+  // the button, which fires nothing while disabled. The finally
+  // re-rendered with the flag re-derived, so the button is live.
+  assert.equal(card._savingNote, false, "no stuck saving flag after the throw");
+  assert.equal(
+    card.shadowRoot.querySelector('[data-action="save-note"]').getAttribute("disabled"),
+    null,
+    "Save is enabled after the throw, not stuck disabled"
+  );
+  // Typing another char must not re-disable it either (the old
+  // stuck flag forced save.disabled = true via _onInput).
+  typeNote(card, "More salt next time. And pepper.");
+  assert.equal(
+    card.shadowRoot.querySelector('[data-action="save-note"]').disabled,
+    false,
+    "Save stays enabled while typing after the throw"
+  );
+  // Back to the original text for the save below.
+  typeNote(card, "More salt next time.");
+  // The next save proceeds: the guard no longer sees a save in flight.
+  await card._saveNote();
+  await flush();
+  assert.equal(updateRecipeCalls(hass).length, 1);
+  assert.deepEqual(updateRecipeCalls(hass)[0], [
+    "anylist",
+    "update_recipe",
+    { recipe_id: "rec-pasta", note: "More salt next time." },
+  ]);
+  assert.equal(card._selected.note, "More salt next time.");
+  assert.match(card.shadowRoot.innerHTML, /Note saved\./);
+  card.disconnectedCallback();
+});
+
+test("a _render() throw during a rating save leaks no in-flight id — the next tap proceeds (burst-4, F4)", async () => {
+  const { card, hass } = await loadedCard();
+  await openNotesTab(card);
+  const realRender = card._render.bind(card);
+  let threw = false;
+  card._render = () => {
+    if (!threw) {
+      threw = true;
+      throw new Error("render boom");
+    }
+    return realRender();
+  };
+  await assert.rejects(card._rate(3), /render boom/);
+  card._render = realRender;
+  assert.equal(threw, true, "the throw fired");
+  assert.equal(card._ratingBusyRecipeIds.has("rec-pasta"), false, "throwing render left no id behind");
+  assert.equal(updateRecipeCalls(hass).length, 0, "no call was made by the aborted save");
+  // Burst-5 (F2): the flag itself must be clear, and the rendered
+  // stars enabled — the burst-4 test only proved a direct
+  // programmatic _rate() call proceeds, but a real user taps a
+  // star, which fires nothing while disabled.
+  assert.equal(card._ratingBusy, false, "no stuck busy flag after the throw");
+  assert.equal(
+    card.shadowRoot.querySelector('[data-action="rate"]').getAttribute("disabled"),
+    null,
+    "stars are enabled after the throw, not stuck disabled"
+  );
+  // The next tap proceeds: the guard no longer sees a save in flight.
+  await card._rate(3);
+  await flush();
+  assert.equal(updateRecipeCalls(hass).length, 1);
+  assert.deepEqual(updateRecipeCalls(hass)[0], [
+    "anylist",
+    "update_recipe",
+    { recipe_id: "rec-pasta", rating: 3 },
+  ]);
+  assert.equal(card._selected.rating, 3);
+  assert.match(card.shadowRoot.innerHTML, /Rating saved\./);
+  card.disconnectedCallback();
+});
+
+// -- burst-5 (value-scoped tombstones + critic F1–F4) ----------------------
+//
+// Burst-4's union merge resurrected a just-deleted entry on every
+// later write: a successful rating retry left its pending rating in
+// the store (and a saved note's draft never left it), so a fresh
+// card showed a phantom retry — worse, tapping it re-sent the old
+// value and clobbered the newer saved one. A successful save now
+// records a value-scoped tombstone for the deleted entry's
+// last-written value, and the merge skips a stored entry only when
+// it equals that value.
+
+test("a failed rating save retried successfully leaves no pending rating in the store — fresh card shows no phantom retry (burst-5)", async () => {
+  const store = stubSessionStorage();
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    const { card } = await loadedCard({ fail: { update_recipe: "AnyList is down" } });
+    card._saveRetryDelays = [10, 10];
+    await openNotesTab(card);
+    card.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "3" }));
+    await waitFor(() => card._ratingBusy === false);
+    assert.equal(card._pendingRatings.get("rec-pasta"), 3);
+    // An outright failure on the same card says so honestly —
+    // "Rating not saved yet" is the re-open wording _openRecipe
+    // sets when a pending rating is restored (B2).
+    assert.match(card.shadowRoot.innerHTML, /Couldn't save the rating/);
+    assert.ok(card.shadowRoot.querySelector('[data-action="retry-rating"]'), "retry offered after the failure");
+    let saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.deepEqual(saved.pendingRatings, { "rec-pasta": 3 }, "failed save persisted its pending rating");
+    // The retry succeeds now: swap in a hass that answers.
+    card._hass = fakeHass();
+    card.shadowRoot.dispatchClick(fakeTarget("retry-rating"));
+    await waitFor(() => card._ratingBusy === false);
+    assert.match(card.shadowRoot.innerHTML, /Rating saved\./);
+    assert.equal(card._pendingRatings.has("rec-pasta"), false);
+    // THE fix: the successful retry's own finally merge used to
+    // resurrect the pending rating in the store. It must be gone.
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.pendingRatings, undefined, "no pending rating left in the store after the successful retry");
+    // A fresh card restores no pending rating and offers no retry.
+    const fresh = new AnyListRecipeViewCard();
+    fresh.setConfig({});
+    fresh.hass = fakeHass();
+    await sleep(150);
+    assert.equal(fresh.shadowRoot.querySelector(".list-view").hidden, true, "fresh card re-opened the saved detail");
+    fresh.shadowRoot.dispatchClick(fakeTarget("tab", { tab: "notes" }));
+    await flush();
+    assert.equal(fresh._pendingRatings.has("rec-pasta"), false);
+    assert.equal(fresh._pendingRating, null);
+    assert.equal(fresh.shadowRoot.querySelector('[data-action="retry-rating"]'), null, "no phantom retry on the fresh card");
+    assert.doesNotMatch(fresh.shadowRoot.innerHTML, /Rating not saved yet/);
+    card.disconnectedCallback();
+    fresh.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("a retried rating cannot be clobbered back by its own phantom retry — rate 4 after a successful retry of 3 (burst-5, critic F1a)", async () => {
+  const store = stubSessionStorage();
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    const { card } = await loadedCard({ fail: { update_recipe: "AnyList is down" } });
+    card._saveRetryDelays = [10, 10];
+    await openNotesTab(card);
+    card.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "3" }));
+    await waitFor(() => card._ratingBusy === false);
+    assert.equal(card._pendingRatings.get("rec-pasta"), 3);
+    // The retry succeeds against a hass that tracks the server copy.
+    const goodHass = fakeHass();
+    const stub = perRecipeUpdateStub(goodHass);
+    card._hass = goodHass;
+    card.shadowRoot.dispatchClick(fakeTarget("retry-rating"));
+    await waitFor(() => card._ratingBusy === false);
+    assert.match(card.shadowRoot.innerHTML, /Rating saved\./);
+    assert.equal(stub.server["rec-pasta"].rating, 3, "server holds the retried 3");
+    // Now rate 4 successfully.
+    card.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "4" }));
+    await waitFor(() => card._ratingBusy === false);
+    assert.match(card.shadowRoot.innerHTML, /Rating saved\./);
+    assert.equal(stub.server["rec-pasta"].rating, 4, "server holds 4");
+    // The store must not hold pending 3: on burst-4 it did, and a
+    // fresh card offered a retry-for-3 whose tap fired a real
+    // update_recipe {rating: 3} and clobbered the saved 4.
+    const saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.pendingRatings, undefined, "no phantom pending 3 in the store");
+    // A fresh card whose server copy is at 4 shows 4 stars and no
+    // retry — there is nothing to tap that could clobber it back.
+    const fresh = new AnyListRecipeViewCard();
+    fresh.setConfig({});
+    fresh.hass = fakeHass({ detail: { ...PASTA_FULL, rating: 4 } });
+    await sleep(150);
+    assert.equal(fresh.shadowRoot.querySelector(".list-view").hidden, true);
+    fresh.shadowRoot.dispatchClick(fakeTarget("tab", { tab: "notes" }));
+    await flush();
+    assert.equal(fresh.shadowRoot.querySelectorAll(".star.filled").length, 4);
+    assert.equal(fresh.shadowRoot.querySelector('[data-action="retry-rating"]'), null, "no phantom retry-for-3 on the fresh card");
+    assert.doesNotMatch(fresh.shadowRoot.innerHTML, /Rating not saved yet/);
+    assert.equal(stub.server["rec-pasta"].rating, 4, "server still at 4 — nothing clobbered it");
+    card.disconnectedCallback();
+    fresh.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("a saved note's debounced v1 draft cannot clobber v2 on a fresh card (burst-5, critic F1b)", async () => {
+  const store = stubSessionStorage();
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    const { card, hass } = await loadedCard();
+    const stub = perRecipeUpdateStub(hass);
+    await openNotesTab(card);
+    // Type v1 and wait out the 150 ms debounce, so the draft is
+    // persisted to the store before the save. (Without the wait
+    // the plain save-a-draft-then-newer-text flow passes on
+    // burst-4 too — the store never held the stale value — so
+    // the waited version is the discriminating one.)
+    typeNote(card, "v1 text.");
+    await sleep(200);
+    let saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.deepEqual(saved.noteDrafts, { "rec-pasta": "v1 text." }, "debounce persisted v1");
+    // Quickly edit to v2 and save immediately — the v2 debounce
+    // has not fired yet, so the store still holds v1.
+    typeNote(card, "v2 text.");
+    card.shadowRoot.dispatchClick(fakeTarget("save-note"));
+    await waitFor(() => card._savingNote === false);
+    assert.match(card.shadowRoot.innerHTML, /Note saved\./);
+    assert.equal(stub.server["rec-pasta"].note, "v2 text.", "server ends at v2");
+    assert.equal(card._noteDrafts.has("rec-pasta"), false);
+    // Let the v2 debounce fire too, then check the store: the
+    // saved draft must be gone, not resurrected as v1.
+    await sleep(200);
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.noteDrafts, undefined, "no stale v1 draft left in the store");
+    // A fresh card whose server copy is at v2 shows v2 in the
+    // editor with Save disabled — not stale v1 with Save enabled.
+    const fresh = new AnyListRecipeViewCard();
+    fresh.setConfig({});
+    fresh.hass = fakeHass({ detail: { ...PASTA_FULL, note: "v2 text." } });
+    await sleep(150);
+    assert.equal(fresh._noteDrafts.has("rec-pasta"), false);
+    fresh.shadowRoot.dispatchClick(fakeTarget("tab", { tab: "notes" }));
+    await flush();
+    assert.match(fresh.shadowRoot.innerHTML, /v2 text\./);
+    assert.doesNotMatch(fresh.shadowRoot.innerHTML, /v1 text\./);
+    assert.equal(
+      fresh.shadowRoot.querySelector('[data-action="save-note"]').getAttribute("disabled"),
+      "disabled",
+      "Save disabled on the fresh card — no stale draft to save"
+    );
+    card.disconnectedCallback();
+    fresh.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("one card's successful save does not delete another live card's pending entry for a different recipe (burst-5)", async () => {
+  const store = stubSessionStorage();
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    // Card A fails a pasta rating save; card B fails a soup one.
+    const { card: cardA } = await loadedCard({ fail: { update_recipe: "AnyList is down" } });
+    cardA._saveRetryDelays = [10, 10];
+    await openNotesTab(cardA);
+    cardA.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "3" }));
+    await waitFor(() => cardA._ratingBusy === false);
+    assert.equal(cardA._pendingRatings.get("rec-pasta"), 3);
+    const cardB = new AnyListRecipeViewCard();
+    cardB.setConfig({});
+    cardB.hass = fakeHass({ fail: { update_recipe: "AnyList is down" } });
+    cardB._saveRetryDelays = [10, 10];
+    await flush();
+    await openSoupNotesTab(cardB);
+    cardB.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "4" }));
+    await waitFor(() => cardB._ratingBusy === false);
+    assert.equal(cardB._pendingRatings.get("rec-soup"), 4);
+    let saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.deepEqual(saved.pendingRatings, { "rec-pasta": 3, "rec-soup": 4 });
+    // A's retry succeeds: pasta's pending must leave the store
+    // while soup's stays.
+    cardA._hass = fakeHass();
+    cardA.shadowRoot.dispatchClick(fakeTarget("retry-rating"));
+    await waitFor(() => cardA._ratingBusy === false);
+    assert.match(cardA.shadowRoot.innerHTML, /Rating saved\./);
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.deepEqual(saved.pendingRatings, { "rec-soup": 4 }, "A's success removed only its own pending");
+    // A fresh card restores B's pending soup rating.
+    const fresh = new AnyListRecipeViewCard();
+    fresh.setConfig({});
+    fresh.hass = fakeHass();
+    await sleep(150);
+    assert.equal(fresh._pendingRatings.get("rec-soup"), 4);
+    assert.equal(fresh._pendingRatings.has("rec-pasta"), false);
+    cardA.disconnectedCallback();
+    cardB.disconnectedCallback();
+    fresh.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("one card's successful save does not delete another live card's different pending value for the same recipe (burst-5)", async () => {
+  const store = stubSessionStorage();
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    const { card: cardA } = await loadedCard({ fail: { update_recipe: "AnyList is down" } });
+    cardA._saveRetryDelays = [10, 10];
+    await openNotesTab(cardA);
+    cardA.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "3" }));
+    await waitFor(() => cardA._ratingBusy === false);
+    assert.equal(cardA._pendingRatings.get("rec-pasta"), 3);
+    // Card B loads (restoring A's pending 3) and then fails a
+    // DIFFERENT rating for the same recipe: the store ends at 4.
+    const cardB = new AnyListRecipeViewCard();
+    cardB.setConfig({});
+    cardB.hass = fakeHass({ fail: { update_recipe: "AnyList is down" } });
+    cardB._saveRetryDelays = [10, 10];
+    await flush();
+    await openNotesTab(cardB);
+    assert.equal(cardB._pendingRatings.get("rec-pasta"), 3, "B restored A's pending 3");
+    cardB.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "4" }));
+    await waitFor(() => cardB._ratingBusy === false);
+    assert.equal(cardB._pendingRatings.get("rec-pasta"), 4);
+    let saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.deepEqual(saved.pendingRatings, { "rec-pasta": 4 }, "B's newer pending overwrote the stored 3");
+    // A's retry of 3 succeeds: the tombstone is value-scoped to 3,
+    // so the stored 4 — B's live pending — must survive the merge.
+    cardA._hass = fakeHass();
+    cardA.shadowRoot.dispatchClick(fakeTarget("retry-rating"));
+    await waitFor(() => cardA._ratingBusy === false);
+    assert.match(cardA.shadowRoot.innerHTML, /Rating saved\./);
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.deepEqual(saved.pendingRatings, { "rec-pasta": 4 }, "A's success removed only its own 3, not B's 4");
+    const fresh = new AnyListRecipeViewCard();
+    fresh.setConfig({});
+    fresh.hass = fakeHass();
+    await sleep(150);
+    assert.equal(fresh._pendingRatings.get("rec-pasta"), 4, "fresh card restores B's pending 4");
+    cardA.disconnectedCallback();
+    cardB.disconnectedCallback();
+    fresh.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("a new pending rating with a different value survives a merge after a tombstoned deletion (burst-5)", async () => {
+  const store = stubSessionStorage();
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    const { card } = await loadedCard({ fail: { update_recipe: "AnyList is down" } });
+    card._saveRetryDelays = [10, 10];
+    await openNotesTab(card);
+    card.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "3" }));
+    await waitFor(() => card._ratingBusy === false);
+    card._hass = fakeHass();
+    card.shadowRoot.dispatchClick(fakeTarget("retry-rating"));
+    await waitFor(() => card._ratingBusy === false);
+    assert.match(card.shadowRoot.innerHTML, /Rating saved\./);
+    let saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.pendingRatings, undefined, "store clean after the successful retry");
+    // A new failure for a DIFFERENT value must be able to pend:
+    // the tombstone is scoped to 3, and the live entry overlays
+    // the merge anyway.
+    card._hass = fakeHass({ fail: { update_recipe: "AnyList is down" } });
+    card.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "4" }));
+    await waitFor(() => card._ratingBusy === false);
+    assert.equal(card._pendingRatings.get("rec-pasta"), 4);
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.deepEqual(saved.pendingRatings, { "rec-pasta": 4 }, "new pending 4 survived the merge");
+    // And a later plain session save does not drop it either.
+    card._saveSession();
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.deepEqual(saved.pendingRatings, { "rec-pasta": 4 });
+    const fresh = new AnyListRecipeViewCard();
+    fresh.setConfig({});
+    fresh.hass = fakeHass();
+    await sleep(150);
+    assert.equal(fresh._pendingRatings.get("rec-pasta"), 4, "fresh card restores the new pending 4");
+    card.disconnectedCallback();
+    fresh.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("a new failure for the same id+value can re-pend after the tombstone (burst-5)", async () => {
+  const store = stubSessionStorage();
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    const { card } = await loadedCard({ fail: { update_recipe: "AnyList is down" } });
+    card._saveRetryDelays = [10, 10];
+    await openNotesTab(card);
+    card.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "3" }));
+    await waitFor(() => card._ratingBusy === false);
+    card._hass = fakeHass();
+    card.shadowRoot.dispatchClick(fakeTarget("retry-rating"));
+    await waitFor(() => card._ratingBusy === false);
+    assert.match(card.shadowRoot.innerHTML, /Rating saved\./);
+    let saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.pendingRatings, undefined, "store clean after the successful retry");
+    // The same value fails again on a FRESH card (the first card's
+    // copy now shows 3, so _rate(3) would early-return there): the
+    // tombstone must not suppress the genuine new pending.
+    const fresh = new AnyListRecipeViewCard();
+    fresh.setConfig({});
+    fresh.hass = fakeHass({ fail: { update_recipe: "AnyList is down" } });
+    fresh._saveRetryDelays = [10, 10];
+    await sleep(150);
+    fresh.shadowRoot.dispatchClick(fakeTarget("tab", { tab: "notes" }));
+    await flush();
+    fresh.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "3" }));
+    await waitFor(() => fresh._ratingBusy === false);
+    assert.equal(fresh._pendingRatings.get("rec-pasta"), 3, "same value re-pended");
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.deepEqual(saved.pendingRatings, { "rec-pasta": 3 }, "re-pended 3 survived the merge despite the tombstone");
+    assert.notEqual(fresh.shadowRoot.querySelector('[data-action="retry-rating"]'), null, "retry offered for the re-pended rating");
+    card.disconnectedCallback();
+    fresh.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+// -- burst-6 (stale-holder healing, tombstone persistence, F2/F3) ---------
+//
+// Burst-5's value-scoped tombstones fixed the single-writer
+// resurrection, but the delta critic showed the tombstone does not
+// fix the stale holder in the multi-card case: a second live card
+// holding the entry in memory re-publishes it on its next ordinary
+// write, and the ping-pong is unbounded because the burst-5
+// "at most one write cycle" lifetime drops the tombstone before a
+// slow holder writes. Burst-6 heals the holder in the merge (a live
+// entry equalling a stored tombstone, on a card that never learned
+// it, is deleted from memory with its retry affordance cleared)
+// and makes tombstones persist in the store (every write re-carries
+// them) until a genuine re-pend of the same id+value drops them.
+
+test("a second live card cannot resurrect a retried rating on its next ordinary write — stale holder healed (burst-6, critic F1 P1a)", async () => {
+  const store = stubSessionStorage();
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    // Card A fails rating 3: the store holds pending 3.
+    const { card: cardA } = await loadedCard({ fail: { update_recipe: "AnyList is down" } });
+    cardA._saveRetryDelays = [10, 10];
+    await openNotesTab(cardA);
+    cardA.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "3" }));
+    await waitFor(() => cardA._ratingBusy === false);
+    assert.equal(cardA._pendingRatings.get("rec-pasta"), 3);
+    // Card B loads and restores the pending 3 into memory.
+    const cardB = new AnyListRecipeViewCard();
+    cardB.setConfig({});
+    cardB.hass = fakeHass();
+    await sleep(150);
+    await openNotesTab(cardB);
+    assert.equal(cardB._pendingRatings.get("rec-pasta"), 3, "B restored A's pending 3");
+    assert.equal(cardB._pendingRating, 3);
+    assert.ok(cardB.shadowRoot.querySelector('[data-action="retry-rating"]'), "B offers the retry for the pending 3");
+    // A's retry succeeds: the store is clean except the tombstone.
+    cardA._hass = fakeHass();
+    cardA.shadowRoot.dispatchClick(fakeTarget("retry-rating"));
+    await waitFor(() => cardA._ratingBusy === false);
+    assert.match(cardA.shadowRoot.innerHTML, /Rating saved\./);
+    let saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.pendingRatings, undefined, "store clean after A's successful retry");
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-pasta": [3] }, "tombstone 3 in the store");
+    // B never adopted the tombstone, so nothing ever healed it —
+    // the critic measured tombstonesInMemory: 0 here.
+    assert.equal(cardB._pendingRatingTombstones.size, 0, "B holds no recorded tombstone");
+    assert.equal(cardB._knownPendingRatingTombstones.size, 0, "B never learned the tombstone");
+    assert.equal(cardB._pendingRatings.get("rec-pasta"), 3, "B still holds the stale 3 in memory");
+    // THE fix: B's next ordinary session write must NOT re-publish
+    // the stale 3 — it heals B's memory instead.
+    cardB._saveSession();
+    assert.equal(cardB._pendingRatings.has("rec-pasta"), false, "B's stale entry is gone from memory");
+    assert.equal(cardB._pendingRating, null, "B's retry affordance cleared");
+    assert.equal(cardB._ratingStatus, null, "B's retry status cleared");
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.pendingRatings, undefined, "B's write left the store clean");
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-pasta": [3] }, "tombstone persists across B's write");
+    // The next render reflects the cleared affordance.
+    cardB._render();
+    assert.equal(cardB.shadowRoot.querySelector('[data-action="retry-rating"]'), null, "no retry button on B after the healing write");
+    assert.doesNotMatch(cardB.shadowRoot.innerHTML, /Rating not saved yet/);
+    // A fresh card restores no pending rating and offers no retry.
+    const fresh = new AnyListRecipeViewCard();
+    fresh.setConfig({});
+    fresh.hass = fakeHass();
+    await sleep(150);
+    assert.equal(fresh._pendingRatings.has("rec-pasta"), false);
+    assert.equal(fresh._pendingRating, null);
+    fresh.shadowRoot.dispatchClick(fakeTarget("tab", { tab: "notes" }));
+    await flush();
+    assert.equal(fresh.shadowRoot.querySelector('[data-action="retry-rating"]'), null, "no phantom retry on the fresh card");
+    assert.doesNotMatch(fresh.shadowRoot.innerHTML, /Rating not saved yet/);
+    cardA.disconnectedCallback();
+    cardB.disconnectedCallback();
+    fresh.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("the resurrection cannot ping-pong: two stale holders both write after the retry and the store stays clean (burst-6, critic F1 P1b)", async () => {
+  const store = stubSessionStorage();
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    const { card: cardA } = await loadedCard({ fail: { update_recipe: "AnyList is down" } });
+    cardA._saveRetryDelays = [10, 10];
+    await openNotesTab(cardA);
+    cardA.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "3" }));
+    await waitFor(() => cardA._ratingBusy === false);
+    assert.equal(cardA._pendingRatings.get("rec-pasta"), 3);
+    // Two stale holders restore the pending 3.
+    const cardB = new AnyListRecipeViewCard();
+    cardB.setConfig({});
+    cardB.hass = fakeHass();
+    await sleep(150);
+    assert.equal(cardB._pendingRatings.get("rec-pasta"), 3, "B restored the pending 3");
+    const cardD = new AnyListRecipeViewCard();
+    cardD.setConfig({});
+    cardD.hass = fakeHass();
+    await sleep(150);
+    assert.equal(cardD._pendingRatings.get("rec-pasta"), 3, "D restored the pending 3");
+    // A's retry succeeds: the store is clean except the tombstone.
+    cardA._hass = fakeHass();
+    cardA.shadowRoot.dispatchClick(fakeTarget("retry-rating"));
+    await waitFor(() => cardA._ratingBusy === false);
+    let saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.pendingRatings, undefined);
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-pasta": [3] });
+    // Both holders write: on burst-5 the first write re-published
+    // the 3 and the second cycle repeated unboundedly. Neither
+    // re-publishes now, and a second round of writes stays clean.
+    cardB._saveSession();
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.pendingRatings, undefined, "B's write did not re-publish the 3");
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-pasta": [3] });
+    assert.equal(cardB._pendingRatings.has("rec-pasta"), false, "B healed");
+    cardD._saveSession();
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.pendingRatings, undefined, "D's write did not re-publish the 3");
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-pasta": [3] });
+    assert.equal(cardD._pendingRatings.has("rec-pasta"), false, "D healed");
+    cardB._saveSession();
+    cardD._saveSession();
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.pendingRatings, undefined, "no second cycle: the store stays clean");
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-pasta": [3] });
+    const fresh = new AnyListRecipeViewCard();
+    fresh.setConfig({});
+    fresh.hass = fakeHass();
+    await sleep(150);
+    assert.equal(fresh._pendingRatings.has("rec-pasta"), false);
+    assert.equal(fresh.shadowRoot.querySelector('[data-action="retry-rating"]'), null, "no phantom retry after both holders wrote");
+    cardA.disconnectedCallback();
+    cardB.disconnectedCallback();
+    cardD.disconnectedCallback();
+    fresh.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("rating a different recipe does not re-publish the stale pending — the save-finally write heals it (burst-6, critic F1 P1c)", async () => {
+  const store = stubSessionStorage();
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    const { card: cardA } = await loadedCard({ fail: { update_recipe: "AnyList is down" } });
+    cardA._saveRetryDelays = [10, 10];
+    await openNotesTab(cardA);
+    cardA.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "3" }));
+    await waitFor(() => cardA._ratingBusy === false);
+    assert.equal(cardA._pendingRatings.get("rec-pasta"), 3);
+    // Card B loads (restoring the pending 3) and opens soup —
+    // before A's retry, so no tombstone exists yet.
+    const hassB = fakeHass();
+    const stubB = perRecipeUpdateStub(hassB);
+    const cardB = new AnyListRecipeViewCard();
+    cardB.setConfig({});
+    cardB.hass = hassB;
+    await sleep(150);
+    await openSoupNotesTab(cardB);
+    assert.equal(cardB._pendingRatings.get("rec-pasta"), 3, "B still holds the stale pasta 3");
+    // A's retry succeeds: the store is clean except the tombstone.
+    cardA._hass = fakeHass();
+    cardA.shadowRoot.dispatchClick(fakeTarget("retry-rating"));
+    await waitFor(() => cardA._ratingBusy === false);
+    let saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.pendingRatings, undefined);
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-pasta": [3] });
+    assert.equal(cardB._pendingRatings.get("rec-pasta"), 3, "B still holds the stale 3 — no B write since the retry");
+    // B rates soup 4 successfully: the save-finally session write
+    // is an ordinary B write, and on burst-5 it re-published the
+    // stale pasta 3. It must heal instead.
+    cardB.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "4" }));
+    await waitFor(() => cardB._ratingBusy === false);
+    assert.match(cardB.shadowRoot.innerHTML, /Rating saved\./);
+    assert.equal(stubB.server["rec-soup"].rating, 4, "server holds B's soup 4");
+    assert.equal(cardB._pendingRatings.has("rec-pasta"), false, "B's stale pasta entry is gone from memory");
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.pendingRatings, undefined, "no stale pasta 3 re-published by B's soup save");
+    assert.deepEqual(saved.pendingRatingTombstones["rec-pasta"], [3], "the pasta tombstone persists");
+    // B's successful soup save also tombstones the saved soup 4
+    // (burst-5's unconditional recording: a successful save
+    // tombstones its value, so another card that failed the same
+    // value is healed too) — that is expected store content, not
+    // a re-published pending.
+    assert.deepEqual(saved.pendingRatingTombstones["rec-soup"], [4], "B's soup save tombstoned its own value");
+    // Re-opening pasta on B offers no retry for it.
+    await openNotesTab(cardB);
+    assert.equal(cardB._pendingRating, null);
+    assert.equal(cardB.shadowRoot.querySelector('[data-action="retry-rating"]'), null, "no phantom retry when B re-opens pasta");
+    const fresh = new AnyListRecipeViewCard();
+    fresh.setConfig({});
+    fresh.hass = fakeHass();
+    await sleep(150);
+    assert.equal(fresh._pendingRatings.has("rec-pasta"), false);
+    assert.equal(fresh.shadowRoot.querySelector('[data-action="retry-rating"]'), null, "no phantom retry on the fresh card");
+    cardA.disconnectedCallback();
+    cardB.disconnectedCallback();
+    fresh.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("a second live card cannot resurrect a saved note draft on its next ordinary write (burst-6, critic F1 notes P1a)", async () => {
+  const store = stubSessionStorage();
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    const { card: cardA, hass: hassA } = await loadedCard();
+    const stubA = perRecipeUpdateStub(hassA);
+    await openNotesTab(cardA);
+    typeNote(cardA, "v1 text.");
+    await sleep(200);
+    let saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.deepEqual(saved.noteDrafts, { "rec-pasta": "v1 text." }, "debounce persisted v1");
+    // Card B loads and restores the v1 draft.
+    const cardB = new AnyListRecipeViewCard();
+    cardB.setConfig({});
+    cardB.hass = fakeHass();
+    await sleep(150);
+    await openNotesTab(cardB);
+    assert.equal(cardB._noteDrafts.get("rec-pasta"), "v1 text.", "B restored A's draft");
+    assert.match(cardB.shadowRoot.innerHTML, /v1 text\./);
+    // A edits to v2 and saves: the store loses the draft and gains
+    // the tombstone for v1 (A's last-written value).
+    typeNote(cardA, "v2 text.");
+    cardA.shadowRoot.dispatchClick(fakeTarget("save-note"));
+    await waitFor(() => cardA._savingNote === false);
+    assert.match(cardA.shadowRoot.innerHTML, /Note saved\./);
+    assert.equal(stubA.server["rec-pasta"].note, "v2 text.", "server ends at v2");
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.noteDrafts, undefined, "store clean of drafts after A's save");
+    assert.deepEqual(saved.noteDraftTombstones, { "rec-pasta": "v1 text." }, "tombstone v1 in the store");
+    assert.equal(cardB._knownNoteDraftTombstones.size, 0, "B never learned the tombstone");
+    assert.equal(cardB._noteDrafts.get("rec-pasta"), "v1 text.", "B still holds the stale v1 draft in memory");
+    // THE fix: B's next ordinary session write heals instead of
+    // re-publishing the stale draft.
+    cardB._saveSession();
+    assert.equal(cardB._noteDrafts.has("rec-pasta"), false, "B's stale draft is gone from memory");
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.noteDrafts, undefined, "B's write left the store clean of drafts");
+    assert.deepEqual(saved.noteDraftTombstones, { "rec-pasta": "v1 text." }, "tombstone persists across B's write");
+    // The next render shows the saved note, not the stale draft.
+    cardB._render();
+    assert.doesNotMatch(cardB.shadowRoot.innerHTML, /v1 text\./);
+    // A fresh card shows v2 in the editor with Save disabled.
+    const fresh = new AnyListRecipeViewCard();
+    fresh.setConfig({});
+    fresh.hass = fakeHass({ detail: { ...PASTA_FULL, note: "v2 text." } });
+    await sleep(150);
+    assert.equal(fresh._noteDrafts.has("rec-pasta"), false);
+    fresh.shadowRoot.dispatchClick(fakeTarget("tab", { tab: "notes" }));
+    await flush();
+    assert.match(fresh.shadowRoot.innerHTML, /v2 text\./);
+    assert.doesNotMatch(fresh.shadowRoot.innerHTML, /v1 text\./);
+    assert.equal(
+      fresh.shadowRoot.querySelector('[data-action="save-note"]').getAttribute("disabled"),
+      "disabled",
+      "Save disabled on the fresh card — no stale draft to save"
+    );
+    cardA.disconnectedCallback();
+    cardB.disconnectedCallback();
+    fresh.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("saving another recipe's rating does not re-publish a stale note draft — the save-finally write heals it (burst-6, critic F1 notes P1c)", async () => {
+  const store = stubSessionStorage();
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    const { card: cardA, hass: hassA } = await loadedCard();
+    const stubA = perRecipeUpdateStub(hassA);
+    await openNotesTab(cardA);
+    typeNote(cardA, "v1 text.");
+    await sleep(200);
+    let saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.deepEqual(saved.noteDrafts, { "rec-pasta": "v1 text." }, "debounce persisted v1");
+    // Card B loads (restoring the v1 draft) and opens soup —
+    // before A's save, so no tombstone exists yet.
+    const hassB = fakeHass();
+    const stubB = perRecipeUpdateStub(hassB);
+    const cardB = new AnyListRecipeViewCard();
+    cardB.setConfig({});
+    cardB.hass = hassB;
+    await sleep(150);
+    await openSoupNotesTab(cardB);
+    assert.equal(cardB._noteDrafts.get("rec-pasta"), "v1 text.", "B still holds the stale v1 draft");
+    // A edits to v2 and saves.
+    typeNote(cardA, "v2 text.");
+    cardA.shadowRoot.dispatchClick(fakeTarget("save-note"));
+    await waitFor(() => cardA._savingNote === false);
+    assert.equal(stubA.server["rec-pasta"].note, "v2 text.", "server ends at v2");
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.noteDrafts, undefined);
+    assert.deepEqual(saved.noteDraftTombstones, { "rec-pasta": "v1 text." });
+    assert.equal(cardB._noteDrafts.get("rec-pasta"), "v1 text.", "B still holds the stale draft — no B write since the save");
+    // B rates soup 4 successfully: the save-finally session write
+    // must heal the stale pasta draft, not re-publish it.
+    cardB.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "4" }));
+    await waitFor(() => cardB._ratingBusy === false);
+    assert.match(cardB.shadowRoot.innerHTML, /Rating saved\./);
+    assert.equal(stubB.server["rec-soup"].rating, 4, "server holds B's soup 4");
+    assert.equal(cardB._noteDrafts.has("rec-pasta"), false, "B's stale pasta draft is gone from memory");
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.noteDrafts, undefined, "no stale pasta draft re-published by B's soup save");
+    assert.deepEqual(saved.noteDraftTombstones, { "rec-pasta": "v1 text." }, "tombstone persists");
+    const fresh = new AnyListRecipeViewCard();
+    fresh.setConfig({});
+    fresh.hass = fakeHass({ detail: { ...PASTA_FULL, note: "v2 text." } });
+    await sleep(150);
+    assert.equal(fresh._noteDrafts.has("rec-pasta"), false);
+    cardA.disconnectedCallback();
+    cardB.disconnectedCallback();
+    fresh.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("a fresh card that adopts a tombstone can still re-pend the same value — and the bare load writes nothing (burst-6, critic F1 P3d)", async () => {
+  // The store holds only the tombstone: the value already saved,
+  // nothing pending. Seed it directly so the load has no open
+  // detail to re-open and no scroll to restore.
+  const seedState = {
+    openId: null,
+    step: null,
+    listScrollY: 0,
+    detailScrollY: 0,
+    query: "",
+    collectionId: "",
+    sort: "name",
+    // Legacy scalar shape on purpose: the parser normalises it to [3].
+    pendingRatingTombstones: { "rec-pasta": 3 },
+  };
+  const store = stubSessionStorage({
+    "family-hub:recipe:state": JSON.stringify(seedState),
+  });
+  const nav = stubWindow(HUB_WINDOW);
+  // Count setItem calls: the bare load must not write at all.
+  let writes = 0;
+  const realSetItem = globalThis.sessionStorage.setItem;
+  globalThis.sessionStorage.setItem = (key, value) => {
+    writes++;
+    return realSetItem(key, value);
+  };
+  try {
+    const card = new AnyListRecipeViewCard();
+    card.setConfig({});
+    card.hass = fakeHass({ fail: { update_recipe: "AnyList is down" } });
+    card._saveRetryDelays = [10, 10];
+    await sleep(150);
+    assert.equal(writes, 0, "the bare load wrote nothing to the store");
+    assert.deepEqual([...card._knownPendingRatingTombstones.get("rec-pasta")], [3], "the card adopted the tombstone");
+    assert.equal(card._pendingRatings.has("rec-pasta"), false, "nothing pending to restore");
+    globalThis.sessionStorage.setItem = realSetItem;
+    // The same value fails again: the tombstone must not suppress
+    // the genuine new pending — the card learned the tombstone
+    // before the entry was created, so the drop rule protects it.
+    await openNotesTab(card);
+    card.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "3" }));
+    await waitFor(() => card._ratingBusy === false);
+    assert.equal(card._pendingRatings.get("rec-pasta"), 3, "same value re-pended");
+    const saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.deepEqual(saved.pendingRatings, { "rec-pasta": 3 }, "re-pended 3 survived the merge despite the tombstone");
+    assert.equal(saved.pendingRatingTombstones, undefined, "the re-pend dropped the tombstone from the store");
+    assert.ok(card.shadowRoot.querySelector('[data-action="retry-rating"]'), "retry offered for the re-pended rating");
+    card.disconnectedCallback();
+  } finally {
+    globalThis.sessionStorage.setItem = realSetItem;
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("an adopted tombstone survives the adopter's own writes — it is not dropped by the second write (burst-6, F3)", async () => {
+  // Burst-5's "at most one write cycle" lifetime was off by one:
+  // the load performed exactly two writes, the first carrying the
+  // adopted tombstone and the second dropping it from the store.
+  // Tombstones now persist until a genuine re-pend drops them.
+  const seedState = {
+    openId: null,
+    step: null,
+    listScrollY: 0,
+    detailScrollY: 0,
+    query: "",
+    collectionId: "",
+    sort: "name",
+    // Legacy scalar shape on purpose: the parser normalises it to [3].
+    pendingRatingTombstones: { "rec-pasta": 3 },
+  };
+  const store = stubSessionStorage({
+    "family-hub:recipe:state": JSON.stringify(seedState),
+  });
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    const card = new AnyListRecipeViewCard();
+    card.setConfig({});
+    card.hass = fakeHass();
+    await sleep(150);
+    assert.deepEqual([...card._knownPendingRatingTombstones.get("rec-pasta")], [3], "the card adopted the tombstone");
+    let saved = JSON.parse(store.get("family-hub:recipe:state"));
+    // The bare load writes nothing, so the raw seeded scalar is
+    // still in the store bytes — the card adopted it as [3] in
+    // memory. The first write below normalises it to the array.
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-pasta": 3 }, "tombstone still in the store after the load");
+    // Two plain session writes: on burst-5 the second dropped it.
+    card._saveSession();
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-pasta": [3] }, "tombstone survives the first write");
+    card._saveSession();
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-pasta": [3] }, "tombstone survives the second write");
+    assert.deepEqual([...card._knownPendingRatingTombstones.get("rec-pasta")], [3], "the known tombstone is never consumed");
+    card.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("a different pending value survives a merge and the tombstone persists across the other card's write (burst-6, P2b + persistence)", async () => {
+  const store = stubSessionStorage();
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    const { card: cardA } = await loadedCard({ fail: { update_recipe: "AnyList is down" } });
+    cardA._saveRetryDelays = [10, 10];
+    await openNotesTab(cardA);
+    cardA.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "3" }));
+    await waitFor(() => cardA._ratingBusy === false);
+    assert.equal(cardA._pendingRatings.get("rec-pasta"), 3);
+    // Card B loads (restoring A's pending 3) and then fails a
+    // DIFFERENT rating for the same recipe: the store ends at 4.
+    const cardB = new AnyListRecipeViewCard();
+    cardB.setConfig({});
+    cardB.hass = fakeHass({ fail: { update_recipe: "AnyList is down" } });
+    cardB._saveRetryDelays = [10, 10];
+    await sleep(150);
+    await openNotesTab(cardB);
+    assert.equal(cardB._pendingRatings.get("rec-pasta"), 3, "B restored A's pending 3");
+    cardB.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "4" }));
+    await waitFor(() => cardB._ratingBusy === false);
+    assert.equal(cardB._pendingRatings.get("rec-pasta"), 4);
+    let saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.deepEqual(saved.pendingRatings, { "rec-pasta": 4 }, "B's newer pending overwrote the stored 3");
+    // A's retry of 3 succeeds: the tombstone is value-scoped to 3,
+    // so the stored 4 — B's live pending — must survive the merge,
+    // and the tombstone must persist alongside it.
+    cardA._hass = fakeHass();
+    cardA.shadowRoot.dispatchClick(fakeTarget("retry-rating"));
+    await waitFor(() => cardA._ratingBusy === false);
+    assert.match(cardA.shadowRoot.innerHTML, /Rating saved\./);
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.deepEqual(saved.pendingRatings, { "rec-pasta": 4 }, "A's success removed only its own 3, not B's 4");
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-pasta": [3] }, "tombstone 3 carried alongside the different pending");
+    // B's next write keeps both: its live 4 survives (it differs
+    // from the tombstone) and the tombstone is re-carried.
+    cardB._saveSession();
+    assert.equal(cardB._pendingRatings.get("rec-pasta"), 4, "B's live 4 was not dropped by the tombstone for 3");
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.deepEqual(saved.pendingRatings, { "rec-pasta": 4 }, "B's write kept its pending 4");
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-pasta": [3] }, "B's write kept the tombstone 3");
+    const fresh = new AnyListRecipeViewCard();
+    fresh.setConfig({});
+    fresh.hass = fakeHass();
+    await sleep(150);
+    assert.equal(fresh._pendingRatings.get("rec-pasta"), 4, "fresh card restores B's pending 4");
+    cardA.disconnectedCallback();
+    cardB.disconnectedCallback();
+    fresh.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("a failed carrying write strands the tombstone in memory and the disconnect flush carries it (burst-6, F2)", async () => {
+  const store = stubSessionStorage();
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    const { card } = await loadedCard({ fail: { update_recipe: "AnyList is down" } });
+    card._saveRetryDelays = [10, 10];
+    await openNotesTab(card);
+    card.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "3" }));
+    await waitFor(() => card._ratingBusy === false);
+    assert.equal(card._pendingRatings.get("rec-pasta"), 3);
+    let saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.deepEqual(saved.pendingRatings, { "rec-pasta": 3 }, "failed save persisted its pending rating");
+    // The retry succeeds on the server, but its carrying write to
+    // the session store throws once.
+    const realSetItem = globalThis.sessionStorage.setItem;
+    let threw = false;
+    globalThis.sessionStorage.setItem = (key, value) => {
+      if (!threw) {
+        threw = true;
+        throw new Error("storage quota exceeded");
+      }
+      return realSetItem(key, value);
+    };
+    try {
+      card._hass = fakeHass();
+      card.shadowRoot.dispatchClick(fakeTarget("retry-rating"));
+      await waitFor(() => card._ratingBusy === false);
+    } finally {
+      globalThis.sessionStorage.setItem = realSetItem;
+    }
+    assert.match(card.shadowRoot.innerHTML, /Rating saved\./);
+    assert.equal(card._pendingRatings.has("rec-pasta"), false, "the live entry is gone from memory");
+    assert.deepEqual([...card._pendingRatingTombstones.get("rec-pasta")], [3], "the tombstone is retained in memory");
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.deepEqual(saved.pendingRatings, { "rec-pasta": 3 }, "the store still holds the stale pending 3");
+    assert.equal(saved.pendingRatingTombstones, undefined, "the tombstone never reached the store");
+    // Disconnect with no scroll timer pending: on burst-5 no flush
+    // ran, so the phantom came back on the next load.
+    assert.equal(card._scrollSaveTimer, null, "no scroll timer pending at disconnect");
+    card.disconnectedCallback();
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.pendingRatings, undefined, "the disconnect flush cleaned the stale pending");
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-pasta": [3] }, "the disconnect flush carried the tombstone");
+    // A fresh card shows no phantom retry.
+    const fresh = new AnyListRecipeViewCard();
+    fresh.setConfig({});
+    fresh.hass = fakeHass();
+    await sleep(150);
+    assert.equal(fresh._pendingRatings.has("rec-pasta"), false);
+    fresh.shadowRoot.dispatchClick(fakeTarget("tab", { tab: "notes" }));
+    await flush();
+    assert.equal(fresh.shadowRoot.querySelector('[data-action="retry-rating"]'), null, "no phantom retry on the fresh card");
+    assert.doesNotMatch(fresh.shadowRoot.innerHTML, /Rating not saved yet/);
+    fresh.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
 });
 
 test("an unsaved note draft survives leaving the recipe and coming back", async () => {
@@ -1591,14 +3648,54 @@ test("Clear un-rates the recipe (rating 0)", async () => {
   assert.equal(card.shadowRoot.querySelector('[data-action="clear-rating"]'), null);
 });
 
-test("a failed rating save keeps the old rating and says so honestly", async () => {
-  const { card } = await loadedCard({ fail: { update_recipe: "AnyList is down" } });
+test("a failed rating save retries itself, then keeps the old rating and says so honestly", async () => {
+  const { card, hass } = await loadedCard({ fail: { update_recipe: "AnyList is down" } });
+  // Short backoff so the test does not wait out the real 0.5/1 s.
+  card._saveRetryDelays = [50, 100];
   await openNotesTab(card);
   card.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "3" }));
+  // Mid-budget: the save is still retrying — no error yet.
   await flush();
+  assert.doesNotMatch(card.shadowRoot.innerHTML, /Couldn't save the rating/);
+  // Once the retries are spent (1 + 2 attempts), the error lands —
+  // and all three attempts sent exactly the same rating.
+  await sleep(250);
+  assert.equal(hass.calls.length, 4);
+  assert.deepEqual(hass.calls[1], [
+    "anylist",
+    "update_recipe",
+    { recipe_id: "rec-pasta", rating: 3 },
+  ]);
+  assert.deepEqual(hass.calls[2], hass.calls[1]);
+  assert.deepEqual(hass.calls[3], hass.calls[1]);
   assert.match(card.shadowRoot.innerHTML, /Couldn't save the rating/);
   assert.equal(card.shadowRoot.querySelectorAll(".star.filled").length, 5);
   assert.equal(card._selected.rating, 5);
+  assert.equal(card._pendingRating, 3);
+  card.disconnectedCallback();
+});
+
+test("a transient rating save failure recovers on its own (C2)", async () => {
+  const { card, hass } = await loadedCard();
+  card._saveRetryDelays = [10, 20];
+  let attempts = 0;
+  const realCallWS = hass.callWS;
+  hass.callWS = async (message) => {
+    if (message.service === "update_recipe" && ++attempts <= 2) {
+      throw new Error("AnyList is down");
+    }
+    return realCallWS(message);
+  };
+  await openNotesTab(card);
+  card.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "3" }));
+  await sleep(200);
+  assert.match(card.shadowRoot.innerHTML, /Rating saved\./);
+  assert.doesNotMatch(card.shadowRoot.innerHTML, /Couldn't save/);
+  assert.equal(card.shadowRoot.querySelectorAll(".star.filled").length, 3);
+  assert.equal(card._selected.rating, 3);
+  assert.equal(card._pendingRating, null);
+  assert.equal(attempts, 3);
+  card.disconnectedCallback();
 });
 
 test("the serving scaler scales the displayed quantities and makes no server call", async () => {
@@ -2661,15 +4758,18 @@ test("Wave 1 (Recipes): a 5 s fade hides the PIP; the fade class lands first (R-
 
 test("Wave 1 (Recipes): an update_recipe that returns {} does NOT certify a note save — retry is tappable (R-IMPL-39)", async () => {
   const { card } = await loadedCard();
+  card._saveRetryDelays = [10, 20];
   card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
   await flush();
   card.shadowRoot.dispatchClick(fakeTarget("tab", { tab: "notes" }));
   await flush();
   typeNote(card, "More salt next time.");
   // The rig stub's shape: a non-throwing update_recipe returning {}.
+  // The unconfirmed response is retried like a failure (C2) before
+  // the error shows, so wait the budget out.
   card._callAction = async () => ({});
   card.shadowRoot.dispatchClick(fakeTarget("save-note"));
-  await flush();
+  await sleep(150);
   assert.match(card.shadowRoot.innerHTML, /Couldn't save — tap to retry/);
   assert.equal(card._noteDrafts.get("rec-pasta"), "More salt next time.");
   assert.equal(card._selected.note, "Vihaan likes this with extra cheese.");
@@ -2685,13 +4785,16 @@ test("Wave 1 (Recipes): an update_recipe that returns {} does NOT certify a note
 
 test("Wave 1 (Recipes): an update_recipe that returns {} does NOT certify a rating save — retry is tappable (R-IMPL-39)", async () => {
   const { card } = await loadedCard();
+  card._saveRetryDelays = [10, 20];
   card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
   await flush();
   card.shadowRoot.dispatchClick(fakeTarget("tab", { tab: "notes" }));
   await flush();
   card._callAction = async () => ({});
   card.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "3" }));
-  await flush();
+  // The unconfirmed response is retried like a failure (C2) before
+  // the error shows, so wait the budget out.
+  await sleep(150);
   assert.match(card.shadowRoot.innerHTML, /Couldn't save — tap to retry/);
   assert.equal(card._pendingRating, 3);
   assert.equal(card.shadowRoot.querySelectorAll(".star.filled").length, 5);
@@ -2978,5 +5081,1261 @@ test("R1-5: a finished v1 sensor on a hass push shows no PIP", async () => {
     card.disconnectedCallback();
   } finally {
     resetCore();
+  }
+});
+
+// -- burst-7 (critic F1–F4 + verifier item b) -------------------------
+//
+// Burst-6 healed the stale holder on the merge path, but the delta
+// critic measured three paths where the fix does not hold: a
+// same-instance re-open shields the stale entry (F1), the
+// known-check is value-blind (F2), and the stored tombstone never
+// updates so only the first saved value per id is guarded (F3 —
+// now set-valued for ratings, recorded-wins for notes). Tombstones
+// for ids that left the list were never pruned (F4), and a heal
+// left the ghost note text editable (verifier item b).
+
+test("burst-7 F1: a same-instance re-open from the list view does not shield a stale entry — adoption clears it (critic D1)", async () => {
+  const store = stubSessionStorage();
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    const { card: cardA } = await loadedCard({ fail: { update_recipe: "AnyList is down" } });
+    cardA._saveRetryDelays = [10, 10];
+    await openNotesTab(cardA);
+    cardA.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "3" }));
+    await waitFor(() => cardA._ratingBusy === false);
+    assert.equal(cardA._pendingRatings.get("rec-pasta"), 3);
+    const cardB = new AnyListRecipeViewCard();
+    const hassB = fakeHass();
+    cardB.setConfig({});
+    cardB.hass = hassB;
+    await sleep(150);
+    await openNotesTab(cardB);
+    assert.equal(cardB._pendingRatings.get("rec-pasta"), 3, "B restored A's pending 3");
+    // A's retry succeeds: store clean except the tombstone.
+    cardA._hass = fakeHass();
+    cardA.shadowRoot.dispatchClick(fakeTarget("retry-rating"));
+    await waitFor(() => cardA._ratingBusy === false);
+    let saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.pendingRatings, undefined, "store clean after A's retry");
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-pasta": [3] }, "tombstone [3] in store");
+    assert.equal(cardB._pendingRatings.get("rec-pasta"), 3, "B still holds stale 3");
+    // Back to the list: openId null, so the re-attach restore has
+    // no open recipe to re-save before the async load adopts.
+    cardA.shadowRoot.dispatchClick(fakeTarget("back"));
+    await flush();
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.openId, null, "precondition: openId null after back");
+    assert.equal(saved.listScrollY, 0, "precondition: listScrollY 0 after back");
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-pasta": [3] }, "tombstone kept by the clear");
+    const loadsBefore = hassB.calls.filter((c) => c[1] === "get_recipes").length;
+    cardB.disconnectedCallback();
+    cardB.connectedCallback();
+    await sleep(250);
+    const loadsAfter = hassB.calls.filter((c) => c[1] === "get_recipes").length;
+    assert.equal(loadsAfter, loadsBefore + 1, "reload proof: one more get_recipes");
+    // Adoption must have cleared the stale memory entry, not
+    // shielded it: known holds [3] and memory holds nothing.
+    assert.deepEqual([...cardB._knownPendingRatingTombstones.get("rec-pasta")], [3], "B adopted tombstone 3");
+    assert.equal(cardB._pendingRatings.get("rec-pasta"), undefined, "stale memory cleared by adoption");
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.pendingRatings, undefined, "store pending clean after reload");
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-pasta": [3] }, "tombstone kept by the reload");
+    cardB._saveSession();
+    assert.equal(cardB._pendingRatings.get("rec-pasta"), undefined, "B memory clean after write");
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.pendingRatings, undefined, "store pending clean after B write");
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-pasta": [3] }, "tombstone kept by B write");
+    const fresh = new AnyListRecipeViewCard();
+    fresh.setConfig({});
+    fresh.hass = fakeHass();
+    await sleep(150);
+    assert.equal(fresh._pendingRatings.get("rec-pasta"), undefined, "fresh card restores no phantom");
+    assert.equal(fresh.shadowRoot.querySelector('[data-action="retry-rating"]'), null, "no phantom retry on fresh card");
+    cardA.disconnectedCallback();
+    cardB.disconnectedCallback();
+    fresh.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("burst-7 F1 (notes): a same-instance re-open from the list view clears a stale note draft on adoption", async () => {
+  const store = stubSessionStorage();
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    const { card: cardA, hass: hassA } = await loadedCard();
+    const stubA = perRecipeUpdateStub(hassA);
+    await openNotesTab(cardA);
+    typeNote(cardA, "v1 text.");
+    await sleep(200);
+    let saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.deepEqual(saved.noteDrafts, { "rec-pasta": "v1 text." }, "debounce persisted v1");
+    const cardB = new AnyListRecipeViewCard();
+    cardB.setConfig({});
+    cardB.hass = fakeHass();
+    await sleep(150);
+    await openNotesTab(cardB);
+    assert.equal(cardB._noteDrafts.get("rec-pasta"), "v1 text.", "B restored A's draft");
+    typeNote(cardA, "v2 text.");
+    cardA.shadowRoot.dispatchClick(fakeTarget("save-note"));
+    await waitFor(() => cardA._savingNote === false);
+    assert.equal(stubA.server["rec-pasta"].note, "v2 text.", "server ends at v2");
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.noteDrafts, undefined, "store clean of drafts after A's save");
+    assert.deepEqual(saved.noteDraftTombstones, { "rec-pasta": "v1 text." }, "tombstone v1 in the store");
+    assert.equal(cardB._noteDrafts.get("rec-pasta"), "v1 text.", "B still holds the stale v1 draft");
+    cardA.shadowRoot.dispatchClick(fakeTarget("back"));
+    await flush();
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.openId, null, "precondition: openId null after back");
+    cardB.disconnectedCallback();
+    cardB.connectedCallback();
+    await sleep(250);
+    assert.equal(cardB._knownNoteDraftTombstones.get("rec-pasta"), "v1 text.", "B adopted tombstone v1");
+    assert.equal(cardB._noteDrafts.get("rec-pasta"), undefined, "stale draft cleared by adoption");
+    cardB._saveSession();
+    assert.equal(cardB._noteDrafts.has("rec-pasta"), false, "B draft clean after write");
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.noteDrafts, undefined, "store clean of drafts after B write");
+    assert.deepEqual(saved.noteDraftTombstones, { "rec-pasta": "v1 text." }, "tombstone kept by B write");
+    const fresh = new AnyListRecipeViewCard();
+    fresh.setConfig({});
+    fresh.hass = fakeHass({ detail: { ...PASTA_FULL, note: "v2 text." } });
+    await sleep(150);
+    assert.equal(fresh._noteDrafts.has("rec-pasta"), false, "fresh card restores no draft");
+    cardA.disconnectedCallback();
+    cardB.disconnectedCallback();
+    fresh.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("burst-8 F1 guard (revised): adoption must NOT delete a genuine re-pend created by a local tap after learning the value", async () => {
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    // REVISED in burst-8 — what changed and why: the burst-7
+    // version created the "re-pend" by assigning the pending map
+    // directly (card._pendingRatings.set(...)). A directly-assigned
+    // entry carries no provenance, so it is indistinguishable from
+    // a restored stale entry — and adoption now (correctly) deletes
+    // it. That locked behaviour WAS the shielding itself (a
+    // provenance-free entry surviving adoption), so the test is
+    // revised to create the re-pend the honest way: a real tap.
+    // Seed a tombstone for 3; the card adopts it, then the cook
+    // re-taps the same value and the save fails — the re-pend is
+    // created AFTER the learning, so it is genuine. A carrying
+    // write that never ran (or threw) leaves the tombstone in the
+    // store while the genuine pending sits in memory; the next
+    // restore must keep it, not delete it as if it were stale.
+    // The carrying write is made to throw here (setItem throws —
+    // the card swallows it), which holds that precondition.
+    const seedState = {
+      openId: null, step: null, listScrollY: 0, detailScrollY: 0,
+      query: "", collectionId: "", sort: "name",
+      pendingRatingTombstones: { "rec-pasta": [3] },
+    };
+    const store = stubSessionStorage({ "family-hub:recipe:state": JSON.stringify(seedState) });
+    const card = new AnyListRecipeViewCard();
+    card.setConfig({});
+    card.hass = fakeHass();
+    await sleep(150);
+    assert.deepEqual([...card._knownPendingRatingTombstones.get("rec-pasta")], [3], "adopted tombstone 3");
+    await openNotesTab(card);
+    // Genuine re-pend created after learning, by a real tap whose
+    // save fails — with the store failing underneath it, so the
+    // tombstone survives in the store while the pending sits in
+    // memory.
+    const realSetItem = globalThis.sessionStorage.setItem;
+    globalThis.sessionStorage.setItem = () => {
+      throw new Error("store down");
+    };
+    try {
+      card._hass = fakeHass({ fail: { update_recipe: "AnyList is down" } });
+      card._saveRetryDelays = [10, 10];
+      card.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "3" }));
+      await waitFor(() => card._ratingBusy === false);
+    } finally {
+      globalThis.sessionStorage.setItem = realSetItem;
+    }
+    assert.equal(card._pendingRatings.get("rec-pasta"), 3, "genuine re-pend held after the failed tap");
+    let saved = readStore(store);
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-pasta": [3] }, "tombstone survived the failed carrying write");
+    // Adoption re-reads the store: the genuine re-pend survives.
+    card._restorePendingSaves();
+    assert.equal(card._pendingRatings.get("rec-pasta"), 3, "genuine re-pend survives the restore");
+    assert.deepEqual([...card._knownPendingRatingTombstones.get("rec-pasta")], [3], "known tombstone kept");
+    card._saveSession();
+    saved = readStore(store);
+    assert.deepEqual(saved.pendingRatings, { "rec-pasta": 3 }, "re-pend reaches the store");
+    assert.equal(saved.pendingRatingTombstones, undefined, "the re-pend drops its tombstone");
+    card.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("burst-7 F2: the drop rule is value-scoped — a tombstone for the held value drops it even when known holds a different value (critic D2)", async () => {
+  const store = stubSessionStorage();
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    // Step 1: X saves 4 -> store tombstone [4].
+    const { card: cardX } = await loadedCard();
+    await openNotesTab(cardX);
+    cardX.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "4" }));
+    await waitFor(() => cardX._ratingBusy === false);
+    let saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-pasta": [4] }, "tombstone [4] landed first");
+    // Step 2: A fails 3 -> store pending 3 + tombstone [4].
+    const { card: cardA } = await loadedCard({ fail: { update_recipe: "AnyList is down" } });
+    cardA._saveRetryDelays = [10, 10];
+    await openNotesTab(cardA);
+    cardA.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "3" }));
+    await waitFor(() => cardA._ratingBusy === false);
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.deepEqual(saved.pendingRatings, { "rec-pasta": 3 }, "A's failed 3 is pending");
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-pasta": [4] }, "tombstone [4] persists");
+    // Step 3: B loads -> adopts known {4}, restores live 3.
+    const cardB = new AnyListRecipeViewCard();
+    cardB.setConfig({});
+    cardB.hass = fakeHass();
+    await sleep(150);
+    assert.deepEqual([...cardB._knownPendingRatingTombstones.get("rec-pasta")], [4], "B adopted tombstone 4");
+    assert.equal(cardB._pendingRatings.get("rec-pasta"), 3, "B restored pending 3");
+    // Step 4: C re-pends 4 (fails) -> its write evicts tombstone 4;
+    // the store ends at pending {4}, tombstone undefined.
+    const cardC = new AnyListRecipeViewCard();
+    cardC.setConfig({});
+    cardC.hass = fakeHass({ fail: { update_recipe: "AnyList is down" } });
+    cardC._saveRetryDelays = [10, 10];
+    await sleep(150);
+    await openNotesTab(cardC);
+    assert.equal(cardC._pendingRatings.get("rec-pasta"), 3, "C restored pending 3");
+    cardC.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "4" }));
+    await waitFor(() => cardC._ratingBusy === false);
+    assert.equal(cardC._pendingRatings.get("rec-pasta"), 4, "C's failed 4 overwrote its restored 3 in memory");
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.deepEqual(saved.pendingRatings, { "rec-pasta": 4 }, "C's write published its live 4");
+    assert.equal(saved.pendingRatingTombstones, undefined, "C's live 4 evicted tombstone 4 from the store");
+    assert.equal(cardB._pendingRatings.get("rec-pasta"), 3, "B still holds its restored 3 in memory");
+    assert.deepEqual([...cardB._knownPendingRatingTombstones.get("rec-pasta")], [4], "B's known still holds the OLD value 4");
+    // Step 5: A's retry of 3 succeeds -> tombstone [3] lands,
+    // C's genuine pending 4 survives.
+    cardA._hass = fakeHass();
+    cardA.shadowRoot.dispatchClick(fakeTarget("retry-rating"));
+    await waitFor(() => cardA._ratingBusy === false);
+    assert.match(cardA.shadowRoot.innerHTML, /Rating saved\./);
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.deepEqual(saved.pendingRatings, { "rec-pasta": 4 }, "A's success kept C's genuine pending 4");
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-pasta": [3] }, "tombstone [3] landed");
+    // Step 6: B's next ordinary write. The store holds a tombstone
+    // for the EXACT value B holds (3), and B's known map holds a
+    // DIFFERENT value (4). A value-scoped check drops B's stale 3.
+    cardB._saveSession();
+    assert.equal(cardB._pendingRatings.get("rec-pasta"), undefined, "B's stale 3 dropped");
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.deepEqual(saved.pendingRatings, { "rec-pasta": 4 }, "only C's genuine 4 survives in the store");
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-pasta": [3] }, "tombstone [3] kept by B's write");
+    const fresh = new AnyListRecipeViewCard();
+    fresh.setConfig({});
+    fresh.hass = fakeHass();
+    await sleep(150);
+    // NOTE: the critic's probe asserts the fresh card restores
+    // nothing here, but that contradicts its own store assertion
+    // above (pending {4} must restore as 4 — C's genuine pending,
+    // the burst-6 P2b behaviour). The correct expectation is 4.
+    assert.equal(fresh._pendingRatings.get("rec-pasta"), 4, "fresh card restores C's genuine pending 4, not B's stale 3");
+    cardX.disconnectedCallback();
+    cardA.disconnectedCallback();
+    cardB.disconnectedCallback();
+    cardC.disconnectedCallback();
+    fresh.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("burst-7 F3 (ratings): set-valued tombstones — saving a second value guards both, and the loser's holder is healed (critic FROZEN)", async () => {
+  const store = stubSessionStorage();
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    // A saves 3 -> tombstone [3].
+    const { card: cardA } = await loadedCard();
+    await openNotesTab(cardA);
+    cardA.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "3" }));
+    await waitFor(() => cardA._ratingBusy === false);
+    let saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-pasta": [3] }, "tombstone [3] landed");
+    // D fails 4 -> pending 4. C loads and restores it.
+    const { card: cardD } = await loadedCard({ fail: { update_recipe: "AnyList is down" } });
+    cardD._saveRetryDelays = [10, 10];
+    await openNotesTab(cardD);
+    cardD.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "4" }));
+    await waitFor(() => cardD._ratingBusy === false);
+    const cardC = new AnyListRecipeViewCard();
+    cardC.setConfig({});
+    cardC.hass = fakeHass();
+    await sleep(150);
+    assert.equal(cardC._pendingRatings.get("rec-pasta"), 4, "C restored pending 4");
+    // D's retry saves 4. NOTE: the critic's probe expects the
+    // tombstone to become {4} (latest wins); the coordinator
+    // decision for burst-7 is set-valued, so the tombstone is
+    // [3, 4] — BOTH values guarded, strictly stronger.
+    cardD._hass = fakeHass();
+    cardD.shadowRoot.dispatchClick(fakeTarget("retry-rating"));
+    await waitFor(() => cardD._ratingBusy === false);
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-pasta": [3, 4] }, "tombstone guards both saved values");
+    assert.equal(saved.pendingRatings, undefined, "store clean after D's save");
+    // C's ordinary writes must not re-publish the just-saved 4.
+    cardC._saveSession();
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.pendingRatings, undefined, "store pending clean after C write #1");
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-pasta": [3, 4] }, "tombstones kept after C write #1");
+    cardC._saveSession();
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.pendingRatings, undefined, "store pending clean after C write #2");
+    const fresh = new AnyListRecipeViewCard();
+    fresh.setConfig({});
+    fresh.hass = fakeHass();
+    await sleep(150);
+    assert.equal(fresh._pendingRatings.get("rec-pasta"), undefined, "fresh card restores no phantom");
+    cardA.disconnectedCallback();
+    cardD.disconnectedCallback();
+    cardC.disconnectedCallback();
+    fresh.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("burst-7 F3 (ratings): the loser's holder cannot re-publish after a second save of its value (critic RESIDUAL1)", async () => {
+  const store = stubSessionStorage();
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    const { card: cardA } = await loadedCard();
+    await openNotesTab(cardA);
+    cardA.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "3" }));
+    await waitFor(() => cardA._ratingBusy === false);
+    const { card: cardD } = await loadedCard({ fail: { update_recipe: "AnyList is down" } });
+    cardD._saveRetryDelays = [10, 10];
+    await openNotesTab(cardD);
+    cardD.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "4" }));
+    await waitFor(() => cardD._ratingBusy === false);
+    const cardC = new AnyListRecipeViewCard();
+    cardC.setConfig({});
+    cardC.hass = fakeHass();
+    await sleep(150);
+    assert.equal(cardC._pendingRatings.get("rec-pasta"), 4, "C restored pending 4");
+    cardD._hass = fakeHass();
+    cardD.shadowRoot.dispatchClick(fakeTarget("retry-rating"));
+    await waitFor(() => cardD._ratingBusy === false);
+    let saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.pendingRatings, undefined, "store clean right after D's save");
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-pasta": [3, 4] }, "both values guarded after D's save");
+    cardC._saveSession();
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.pendingRatings, undefined, "C write #1 re-publishes nothing — healed, not 'once'");
+    assert.equal(cardC._pendingRatings.has("rec-pasta"), false, "C healed by write #1");
+    // A SECOND card saves 4 again (E fails 4, then retries).
+    const { card: cardE } = await loadedCard({ fail: { update_recipe: "AnyList is down" } });
+    cardE._saveRetryDelays = [10, 10];
+    await openNotesTab(cardE);
+    cardE.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "4" }));
+    await waitFor(() => cardE._ratingBusy === false);
+    cardE._hass = fakeHass();
+    cardE.shadowRoot.dispatchClick(fakeTarget("retry-rating"));
+    await waitFor(() => cardE._ratingBusy === false);
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.pendingRatings, undefined, "store clean right after E's save");
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-pasta": [3, 4] }, "both values still guarded after E's save");
+    cardC._saveSession();
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.pendingRatings, undefined, "C write #2 re-publishes nothing either");
+    const fresh = new AnyListRecipeViewCard();
+    fresh.setConfig({});
+    fresh.hass = fakeHass();
+    await sleep(150);
+    assert.equal(fresh._pendingRatings.get("rec-pasta"), undefined, "fresh card restores no phantom");
+    fresh._saveSession();
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.pendingRatings, undefined, "no ordinary write re-publishes");
+    cardA.disconnectedCallback();
+    cardD.disconnectedCallback();
+    cardC.disconnectedCallback();
+    cardE.disconnectedCallback();
+    fresh.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("burst-7 F3 (notes): recorded wins — the newest save's tombstone replaces the stored one", async () => {
+  const store = stubSessionStorage();
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    // A types alpha-1 (debounce persists it) and saves alpha-2:
+    // the tombstone names its last-written value, alpha-1.
+    const { card: cardA } = await loadedCard();
+    await openNotesTab(cardA);
+    typeNote(cardA, "alpha draft one.");
+    await sleep(200);
+    typeNote(cardA, "alpha draft two.");
+    cardA.shadowRoot.dispatchClick(fakeTarget("save-note"));
+    await waitFor(() => cardA._savingNote === false);
+    let saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.deepEqual(saved.noteDraftTombstones, { "rec-pasta": "alpha draft one." }, "A's save tombstoned alpha-1");
+    // B loads, types beta-1 (debounce persists it) and saves beta-2:
+    // its recorded tombstone (beta-1) must REPLACE alpha-1 in the
+    // store — under burst-6 stored-wins it would stay alpha-1.
+    const cardB = new AnyListRecipeViewCard();
+    cardB.setConfig({});
+    cardB.hass = fakeHass();
+    await sleep(150);
+    await openNotesTab(cardB);
+    typeNote(cardB, "beta draft one.");
+    await sleep(200);
+    typeNote(cardB, "beta draft two.");
+    cardB.shadowRoot.dispatchClick(fakeTarget("save-note"));
+    await waitFor(() => cardB._savingNote === false);
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.deepEqual(saved.noteDraftTombstones, { "rec-pasta": "beta draft one." }, "newest save's tombstone wins");
+    assert.equal(saved.noteDrafts, undefined, "store clean of drafts after B's save");
+    cardA.disconnectedCallback();
+    cardB.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("burst-7 F4: a tombstone for an id that left the recipe list is pruned on load (critic PRUNE)", async () => {
+  const seedState = {
+    openId: null, step: null, listScrollY: 0, detailScrollY: 0,
+    query: "", collectionId: "", sort: "name",
+    pendingRatingTombstones: { "rec-gone": [3], "rec-pasta": [3] },
+    noteDraftTombstones: { "rec-gone": "dead note text", "rec-pasta": "x" },
+  };
+  const store = stubSessionStorage({ "family-hub:recipe:state": JSON.stringify(seedState) });
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    const beforeBytes = store.get("family-hub:recipe:state").length;
+    const card = new AnyListRecipeViewCard();
+    card.setConfig({});
+    card.hass = fakeHass();
+    await sleep(150);
+    let saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.pendingRatingTombstones["rec-gone"], undefined, "rating tombstone for rec-gone pruned on load");
+    assert.equal(saved.noteDraftTombstones["rec-gone"], undefined, "note tombstone for rec-gone pruned on load");
+    assert.deepEqual(saved.pendingRatingTombstones["rec-pasta"], [3], "control tombstone for live rec-pasta kept");
+    assert.equal(saved.noteDraftTombstones["rec-pasta"], "x", "control note tombstone kept");
+    card._saveSession();
+    card._saveSession();
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.pendingRatingTombstones["rec-gone"], undefined, "rating tombstone for rec-gone stays pruned after 2 writes");
+    assert.equal(saved.noteDraftTombstones["rec-gone"], undefined, "note tombstone for rec-gone stays pruned after 2 writes");
+    assert.deepEqual(saved.pendingRatingTombstones["rec-pasta"], [3], "control tombstone survives the writes");
+    assert.ok(store.get("family-hub:recipe:state").length < beforeBytes, "store shrank after pruning");
+    card.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("burst-7 F4 (PRUNE2): a tombstoned pending for a gone id cleans the pending AND its tombstone", async () => {
+  const seedState = {
+    openId: null, step: null, listScrollY: 0, detailScrollY: 0,
+    query: "", collectionId: "", sort: "name",
+    pendingRatings: { "rec-gone": 3 },
+    pendingRatingTombstones: { "rec-gone": [3] },
+  };
+  const store = stubSessionStorage({ "family-hub:recipe:state": JSON.stringify(seedState) });
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    const card = new AnyListRecipeViewCard();
+    card.setConfig({});
+    card.hass = fakeHass();
+    await sleep(150);
+    const saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.pendingRatings, undefined, "pending for rec-gone cleaned");
+    assert.equal(saved.pendingRatingTombstones, undefined, "tombstone for rec-gone pruned with the entry");
+    card.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("burst-7 verifier (b): a heal refreshes the note editor — typing afterwards edits the saved note, never the stale draft", async () => {
+  const store = stubSessionStorage();
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    const { card: cardA, hass: hassA } = await loadedCard();
+    const stubA = perRecipeUpdateStub(hassA);
+    await openNotesTab(cardA);
+    typeNote(cardA, "v1 text.");
+    await sleep(200);
+    let saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.deepEqual(saved.noteDrafts, { "rec-pasta": "v1 text." }, "debounce persisted v1");
+    const hassB = fakeHass();
+    const cardB = new AnyListRecipeViewCard();
+    cardB.setConfig({});
+    cardB.hass = hassB;
+    await sleep(150);
+    await openNotesTab(cardB);
+    assert.equal(cardB._noteDrafts.get("rec-pasta"), "v1 text.", "B restored v1");
+    typeNote(cardA, "v2 text.");
+    cardA.shadowRoot.dispatchClick(fakeTarget("save-note"));
+    await waitFor(() => cardA._savingNote === false);
+    assert.equal(stubA.server["rec-pasta"].note, "v2 text.", "server ends at v2");
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.noteDrafts, undefined);
+    assert.deepEqual(saved.noteDraftTombstones, { "rec-pasta": "v1 text." });
+    // The heal: an ordinary write with NO explicit render (the
+    // scroll-debounce shape). The fix re-renders from _saveSession,
+    // so the editor must already show the saved note, not v1.
+    const callsBefore = updateRecipeCalls(hassB).length;
+    cardB._saveSession();
+    assert.equal(cardB._noteDrafts.has("rec-pasta"), false, "memory healed");
+    assert.doesNotMatch(cardB.shadowRoot.innerHTML, /v1 text\./, "editor no longer shows the stale v1 after the heal");
+    const editor = cardB.shadowRoot.querySelector('[data-role="note"]');
+    assert.equal(editor.value, cardB._selected.note, "editor shows the saved note");
+    const saveBtn = cardB.shadowRoot.querySelector('[data-action="save-note"]');
+    assert.equal(saveBtn.getAttribute("disabled"), "disabled", "Save disabled — nothing unsaved after the heal");
+    // Now the cook types in the refreshed editor: the new draft is
+    // based on the saved note, never on v1 — and saving it sends
+    // that text, not v1-derived text.
+    const edited = `${cardB._selected.note} edited`;
+    typeNote(cardB, edited);
+    cardB.shadowRoot.dispatchClick(fakeTarget("save-note"));
+    await waitFor(() => cardB._savingNote === false);
+    const callsAfter = updateRecipeCalls(hassB);
+    assert.equal(callsAfter.length, callsBefore + 1, "exactly one save from the edited note");
+    assert.equal(callsAfter[callsAfter.length - 1][2].note, edited, "saved text is the edited saved note");
+    assert.doesNotMatch(callsAfter[callsAfter.length - 1][2].note, /v1 text\./, "saved text is not v1-derived");
+    saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.noteDrafts, undefined, "store clean of drafts after the save");
+    cardA.disconnectedCallback();
+    cardB.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+// -- burst-8 (provenance, not alreadyKnown; deferred restore) ------------
+//
+// The burst-7 F1 guard ("already knew this value") shielded stale
+// entries: it treated "knew" as proof of a genuine re-pend. Burst-8
+// replaces it with provenance — a tombstone generation counter plus
+// the entry's creation generation (see the card's constructor
+// comment) — and defers the connectedCallback session restore until
+// after the load's adoption, so no pre-adoption write can evict a
+// tombstone. The tests below are the healed versions of the
+// reviewers' defect demonstrations (verifier V7-3/V7-3b/V7-15b/V7-16,
+// critic D7-1/D7-1b/D7-2/D7-3/D7-3b/D7-7b2): same scenarios, the
+// shielding/clobber/race behaviour asserted GONE.
+
+test("burst-8 V7-3 healed: a known value that became stale after creation is deleted on re-open — no re-publish, no clobber of a newer saved 5", async () => {
+  const seedState = {
+    openId: null, step: null, listScrollY: 0, detailScrollY: 0,
+    query: "", collectionId: "", sort: "name",
+    pendingRatingTombstones: { "rec-soup": [2] },
+  };
+  const store = stubSessionStorage({ "family-hub:recipe:state": JSON.stringify(seedState) });
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    const cardB = new AnyListRecipeViewCard();
+    const hassB = fakeHass();
+    cardB.setConfig({});
+    cardB.hass = hassB;
+    await sleep(150);
+    assert.deepEqual([...cardB._knownPendingRatingTombstones.get("rec-soup")], [2], "B adopted tombstone 2");
+    const { card: cardC } = await loadedCard({ fail: { update_recipe: "AnyList is down" } });
+    cardC._saveRetryDelays = [10, 10];
+    await openSoupNotesTab(cardC);
+    cardC.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "2" }));
+    await waitFor(() => cardC._ratingBusy === false);
+    let saved = readStore(store);
+    assert.deepEqual(saved.pendingRatings, { "rec-soup": 2 }, "C's failed 2 is pending");
+    assert.equal(saved.pendingRatingTombstones, undefined, "C's live 2 evicted the tombstone");
+    // B re-opens #1: restores C's pending 2 (genuine at this point).
+    cardB.disconnectedCallback();
+    cardB.connectedCallback();
+    await sleep(250);
+    assert.equal(cardB._pendingRatings.get("rec-soup"), 2, "B restored C's pending 2");
+    // D saves 2: server 2, tombstone [2] lands, store clean.
+    const cardD = new AnyListRecipeViewCard();
+    const hassD = fakeHass();
+    const stubD = perRecipeUpdateStub(hassD);
+    cardD.setConfig({});
+    cardD.hass = hassD;
+    await sleep(150);
+    await openSoupNotesTab(cardD);
+    cardD.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "2" }));
+    await waitFor(() => cardD._ratingBusy === false);
+    assert.equal(stubD.server["rec-soup"].rating, 2, "server holds 2 after D's save");
+    saved = readStore(store);
+    assert.equal(saved.pendingRatings, undefined, "store clean after D's save");
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-soup": [2] }, "tombstone [2] landed");
+    // B re-opens #2: the tombstone re-landed since B's entry was
+    // restored, so adoption deletes it — no shield.
+    cardB.disconnectedCallback();
+    cardB.connectedCallback();
+    await sleep(250);
+    assert.equal(cardB._pendingRatings.get("rec-soup"), undefined, "HEALED: B's stale 2 deleted on re-open adoption");
+    saved = readStore(store);
+    assert.equal(saved.pendingRatings, undefined, "no re-publish after the reload");
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-soup": [2] }, "tombstone kept by the reload");
+    cardB._saveSession();
+    saved = readStore(store);
+    assert.equal(saved.pendingRatings, undefined, "B's write re-publishes nothing");
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-soup": [2] }, "tombstone kept by B's write");
+    const fresh = new AnyListRecipeViewCard();
+    fresh.setConfig({});
+    fresh.hass = fakeHass();
+    await sleep(150);
+    assert.equal(fresh._pendingRatings.get("rec-soup"), undefined, "fresh card restores no phantom");
+    // E saves 5: the server moves on to 5. E never held a pending
+    // for soup, so its save records tombstone 5 alongside the
+    // carried 2 — [2,5], not [2] as on the shielded run, where
+    // E's last-written value was B's re-published 2.
+    const cardE = new AnyListRecipeViewCard();
+    const hassE = fakeHass();
+    cardE.setConfig({});
+    cardE.hass = hassE;
+    await sleep(150);
+    const stubE = perRecipeUpdateStub(hassE);
+    stubE.server["rec-soup"].rating = 2;
+    await openSoupNotesTab(cardE);
+    cardE.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "5" }));
+    await waitFor(() => cardE._ratingBusy === false);
+    assert.equal(stubE.server["rec-soup"].rating, 5, "server holds 5 after E's save");
+    saved = readStore(store);
+    assert.equal(saved.pendingRatings, undefined, "store clean after E's save");
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-soup": [2, 5] }, "tombstones [2,5] after E's save");
+    assert.equal(cardB._pendingRatings.get("rec-soup"), undefined, "B's memory stays clean after E saved 5");
+    // B writes again: still nothing to re-publish — and B offers
+    // no retry for 2, so there is nothing that could clobber 5.
+    cardB._saveSession();
+    saved = readStore(store);
+    assert.equal(saved.pendingRatings, undefined, "B's second write re-publishes nothing");
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-soup": [2, 5] }, "tombstones kept by B's second write");
+    await openSoupNotesTab(cardB);
+    assert.equal(cardB._pendingRating, null, "B offers no retry for the stale 2");
+    assert.equal(cardB.shadowRoot.querySelector('[data-action="retry-rating"]'), null, "no retry button on B");
+    assert.equal(stubE.server["rec-soup"].rating, 5, "server still holds 5 — no clobber");
+    cardB.disconnectedCallback();
+    cardC.disconnectedCallback();
+    cardD.disconnectedCallback();
+    cardE.disconnectedCallback();
+    fresh.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("burst-8 V7-3b healed (isolated, no open recipe at re-open): alreadyKnown alone no longer shields B's stale 2", async () => {
+  const seedState = {
+    openId: null, step: null, listScrollY: 0, detailScrollY: 0,
+    query: "", collectionId: "", sort: "name",
+    pendingRatingTombstones: { "rec-soup": [2] },
+  };
+  const store = stubSessionStorage({ "family-hub:recipe:state": JSON.stringify(seedState) });
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    const cardB = new AnyListRecipeViewCard();
+    const hassB = fakeHass();
+    cardB.setConfig({});
+    cardB.hass = hassB;
+    await sleep(150);
+    assert.deepEqual([...cardB._knownPendingRatingTombstones.get("rec-soup")], [2], "B adopted tombstone 2");
+    const { card: cardC } = await loadedCard({ fail: { update_recipe: "AnyList is down" } });
+    cardC._saveRetryDelays = [10, 10];
+    await openSoupNotesTab(cardC);
+    cardC.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "2" }));
+    await waitFor(() => cardC._ratingBusy === false);
+    let saved = readStore(store);
+    assert.deepEqual(saved.pendingRatings, { "rec-soup": 2 }, "C's failed 2 is pending");
+    assert.equal(saved.pendingRatingTombstones, undefined, "C's live 2 evicted the tombstone");
+    cardC.shadowRoot.dispatchClick(fakeTarget("back"));
+    await flush();
+    saved = readStore(store);
+    assert.equal(saved.openId, null, "precondition: list view before B re-open 1 (no race)");
+    cardB.disconnectedCallback();
+    cardB.connectedCallback();
+    await sleep(250);
+    assert.equal(cardB._pendingRatings.get("rec-soup"), 2, "B restored C's pending 2");
+    const cardD = new AnyListRecipeViewCard();
+    const hassD = fakeHass();
+    const stubD = perRecipeUpdateStub(hassD);
+    cardD.setConfig({});
+    cardD.hass = hassD;
+    await sleep(150);
+    await openSoupNotesTab(cardD);
+    cardD.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "2" }));
+    await waitFor(() => cardD._ratingBusy === false);
+    assert.equal(stubD.server["rec-soup"].rating, 2, "server holds 2 after D's save");
+    saved = readStore(store);
+    assert.equal(saved.pendingRatings, undefined, "store clean after D's save");
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-soup": [2] }, "tombstone [2] landed");
+    cardD.shadowRoot.dispatchClick(fakeTarget("back"));
+    await flush();
+    saved = readStore(store);
+    assert.equal(saved.openId, null, "precondition: list view before B re-open 2 (no race)");
+    cardB.disconnectedCallback();
+    cardB.connectedCallback();
+    await sleep(250);
+    saved = readStore(store);
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-soup": [2] }, "no race: tombstone [2] still in store right after reload");
+    assert.equal(saved.pendingRatings, undefined, "no race: no pending re-published yet");
+    assert.equal(cardB._pendingRatings.get("rec-soup"), undefined, "HEALED: B's memory 2 deleted by adoption — the re-landed tombstone outranks the restored entry");
+    cardB.disconnectedCallback();
+    cardC.disconnectedCallback();
+    cardD.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("burst-8 V7-15b healed (notes, isolated): alreadyKnown alone no longer shields B's stale draft", async () => {
+  const seedState = {
+    openId: null, step: null, listScrollY: 0, detailScrollY: 0,
+    query: "", collectionId: "", sort: "name",
+    noteDraftTombstones: { "rec-soup": "simmer one." },
+  };
+  const store = stubSessionStorage({ "family-hub:recipe:state": JSON.stringify(seedState) });
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    const cardB = new AnyListRecipeViewCard();
+    cardB.setConfig({});
+    cardB.hass = fakeHass();
+    await sleep(150);
+    assert.equal(cardB._knownNoteDraftTombstones.get("rec-soup"), "simmer one.", "B adopted tombstone simmer one");
+    const cardC = new AnyListRecipeViewCard();
+    cardC.setConfig({});
+    cardC.hass = fakeHass();
+    await sleep(150);
+    await openSoupNotesTab(cardC);
+    typeNote(cardC, "simmer one.");
+    await sleep(200);
+    let saved = readStore(store);
+    assert.deepEqual(saved.noteDrafts, { "rec-soup": "simmer one." }, "C's re-typed draft persisted");
+    assert.equal(saved.noteDraftTombstones, undefined, "C's live draft evicted the tombstone");
+    cardC.shadowRoot.dispatchClick(fakeTarget("back"));
+    await flush();
+    saved = readStore(store);
+    assert.equal(saved.openId, null, "precondition: list view before B re-open 1 (no race)");
+    cardB.disconnectedCallback();
+    cardB.connectedCallback();
+    await sleep(250);
+    assert.equal(cardB._noteDrafts.get("rec-soup"), "simmer one.", "B restored C's draft");
+    const cardD = new AnyListRecipeViewCard();
+    const hassD = fakeHass();
+    const stubD = perRecipeUpdateStub(hassD);
+    cardD.setConfig({});
+    cardD.hass = hassD;
+    await sleep(150);
+    await openSoupNotesTab(cardD);
+    typeNote(cardD, "simmer one.");
+    cardD.shadowRoot.dispatchClick(fakeTarget("save-note"));
+    await waitFor(() => cardD._savingNote === false);
+    assert.equal(stubD.server["rec-soup"].note, "simmer one.", "server holds simmer one after D's save");
+    saved = readStore(store);
+    assert.equal(saved.noteDrafts, undefined, "store clean of drafts after D's save");
+    assert.deepEqual(saved.noteDraftTombstones, { "rec-soup": "simmer one." }, "tombstone simmer one landed");
+    cardD.shadowRoot.dispatchClick(fakeTarget("back"));
+    await flush();
+    saved = readStore(store);
+    assert.equal(saved.openId, null, "precondition: list view before B re-open 2 (no race)");
+    cardB.disconnectedCallback();
+    cardB.connectedCallback();
+    await sleep(250);
+    saved = readStore(store);
+    assert.deepEqual(saved.noteDraftTombstones, { "rec-soup": "simmer one." }, "no race: tombstone still in store right after reload");
+    assert.equal(saved.noteDrafts, undefined, "no race: no draft re-published yet");
+    assert.equal(cardB._noteDrafts.get("rec-soup"), undefined, "HEALED: B's draft deleted by adoption — the re-landed tombstone outranks the restored draft");
+    cardB.disconnectedCallback();
+    cardC.disconnectedCallback();
+    cardD.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("burst-8 V7-16 healed (pre-adoption race): with a recipe left open, the re-open write no longer evicts the tombstone before adoption runs", async () => {
+  const seedState = {
+    openId: null, step: null, listScrollY: 0, detailScrollY: 0,
+    query: "", collectionId: "", sort: "name",
+    pendingRatingTombstones: { "rec-soup": [2] },
+  };
+  const store = stubSessionStorage({ "family-hub:recipe:state": JSON.stringify(seedState) });
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    const cardB = new AnyListRecipeViewCard();
+    const hassB = fakeHass();
+    cardB.setConfig({});
+    cardB.hass = hassB;
+    await sleep(150);
+    assert.deepEqual([...cardB._knownPendingRatingTombstones.get("rec-soup")], [2], "B adopted tombstone 2");
+    const { card: cardC } = await loadedCard({ fail: { update_recipe: "AnyList is down" } });
+    cardC._saveRetryDelays = [10, 10];
+    await openSoupNotesTab(cardC);
+    cardC.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "2" }));
+    await waitFor(() => cardC._ratingBusy === false);
+    cardB.disconnectedCallback();
+    cardB.connectedCallback();
+    await sleep(250);
+    assert.equal(cardB._pendingRatings.get("rec-soup"), 2, "B restored C's pending 2");
+    const cardD = new AnyListRecipeViewCard();
+    const hassD = fakeHass();
+    const stubD = perRecipeUpdateStub(hassD);
+    cardD.setConfig({});
+    cardD.hass = hassD;
+    await sleep(150);
+    await openSoupNotesTab(cardD);
+    cardD.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "2" }));
+    await waitFor(() => cardD._ratingBusy === false);
+    assert.equal(stubD.server["rec-soup"].rating, 2, "server holds 2 after D's save");
+    let saved = readStore(store);
+    assert.equal(saved.pendingRatings, undefined, "store clean after D's save");
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-soup": [2] }, "tombstone [2] landed");
+    assert.equal(saved.openId, "rec-soup", "precondition: a recipe is LEFT OPEN (D never went back)");
+    // B re-attaches with the recipe left open: the restore is
+    // deferred until after the load's adoption, so the tombstone
+    // survives to adoption and the stale entry is healed there —
+    // the store is clean immediately after the reload, before any
+    // explicit write.
+    cardB.disconnectedCallback();
+    cardB.connectedCallback();
+    await sleep(250);
+    saved = readStore(store);
+    assert.equal(saved.pendingRatings, undefined, "HEALED: no pending re-published right after reload");
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-soup": [2] }, "HEALED: the tombstone survived the re-open — no pre-adoption write evicted it");
+    assert.equal(cardB._pendingRatings.get("rec-soup"), undefined, "HEALED: B's stale 2 is gone after the reload");
+    cardB.disconnectedCallback();
+    cardC.disconnectedCallback();
+    cardD.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("burst-8 D7-1 healed: a re-pend that became stale after creation is dropped on the next ordinary write — no phantom pending, tombstone intact", async () => {
+  const store = stubSessionStorage();
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    // X saves soup 4 -> tombstone [4].
+    const { card: cardX, hass: hassX } = await loadedCard();
+    perRecipeUpdateStub(hassX);
+    await openSoupNotesTab(cardX);
+    cardX.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "4" }));
+    await waitFor(() => cardX._ratingBusy === false);
+    let saved = readStore(store);
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-soup": [4] }, "tombstone [4] landed");
+    // B loads -> knows 4.
+    const cardB = new AnyListRecipeViewCard();
+    cardB.setConfig({});
+    cardB.hass = fakeHass();
+    await sleep(150);
+    assert.deepEqual([...cardB._knownPendingRatingTombstones.get("rec-soup")], [4], "B adopted tombstone 4");
+    // Y saves soup 2 -> server 2, tombstone [2, 4].
+    const { card: cardY, hass: hassY } = await loadedCard();
+    perRecipeUpdateStub(hassY);
+    await openSoupNotesTab(cardY);
+    cardY.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "2" }));
+    await waitFor(() => cardY._ratingBusy === false);
+    saved = readStore(store);
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-soup": [2, 4] }, "tombstone [2,4] after Y saves 2 (set is sorted)");
+    // B re-rates 4 (genuine: the server is 2) and fails.
+    await openSoupNotesTab(cardB);
+    cardB._hass = fakeHass({ fail: { update_recipe: "AnyList is down" } });
+    cardB._saveRetryDelays = [10, 10];
+    cardB.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "4" }));
+    await waitFor(() => cardB._ratingBusy === false);
+    assert.equal(cardB._pendingRatings.get("rec-soup"), 4, "B holds its genuine failed 4");
+    saved = readStore(store);
+    assert.deepEqual(saved.pendingRatings, { "rec-soup": 4 }, "B's failed 4 is pending in the store");
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-soup": [2] }, "tombstone 4 evicted by B's live 4");
+    // A loads, restores the pending 4, retries it successfully.
+    const cardA = new AnyListRecipeViewCard();
+    const hassA = fakeHass();
+    cardA.setConfig({});
+    cardA.hass = hassA;
+    await sleep(150);
+    assert.equal(cardA._pendingRatings.get("rec-soup"), 4, "A restored the pending 4");
+    await openSoupNotesTab(cardA);
+    perRecipeUpdateStub(hassA);
+    cardA.shadowRoot.dispatchClick(fakeTarget("retry-rating"));
+    await waitFor(() => cardA._ratingBusy === false);
+    saved = readStore(store);
+    assert.equal(saved.pendingRatings, undefined, "store pending clean after A's retry");
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-soup": [2, 4] }, "tombstone [2,4] after A's retry");
+    assert.equal(cardB._pendingRatings.get("rec-soup"), 4, "B still holds 4 in memory — now stale (server is 4)");
+    // B's next ordinary write: the re-landed tombstone 4 outranks
+    // the entry created before it landed — B is healed, not shielded.
+    cardB._saveSession();
+    assert.equal(cardB._pendingRatings.get("rec-soup"), undefined, "HEALED: B memory clean after write — stale 4 dropped");
+    saved = readStore(store);
+    assert.equal(saved.pendingRatings, undefined, "HEALED: B re-published nothing");
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-soup": [2, 4] }, "HEALED: tombstones [2,4] kept — the re-publish did not evict 4");
+    const fresh = new AnyListRecipeViewCard();
+    fresh.setConfig({});
+    fresh.hass = fakeHass();
+    await sleep(150);
+    assert.equal(fresh._pendingRatings.get("rec-soup"), undefined, "HEALED: fresh card restores no phantom");
+    await openSoupNotesTab(fresh);
+    assert.equal(fresh.shadowRoot.querySelector('[data-action="retry-rating"]'), null, "HEALED: fresh card offers no retry for the already-saved 4");
+    cardX.disconnectedCallback();
+    cardY.disconnectedCallback();
+    cardB.disconnectedCallback();
+    cardA.disconnectedCallback();
+    fresh.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("burst-8 D7-1b healed: a re-attach after the value was saved elsewhere deletes the stale entry at adoption", async () => {
+  const store = stubSessionStorage();
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    const { card: cardX, hass: hassX } = await loadedCard();
+    perRecipeUpdateStub(hassX);
+    await openSoupNotesTab(cardX);
+    cardX.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "4" }));
+    await waitFor(() => cardX._ratingBusy === false);
+    const cardB = new AnyListRecipeViewCard();
+    cardB.setConfig({});
+    cardB.hass = fakeHass();
+    await sleep(150);
+    assert.deepEqual([...cardB._knownPendingRatingTombstones.get("rec-soup")], [4], "B adopted tombstone 4");
+    const { card: cardY, hass: hassY } = await loadedCard();
+    perRecipeUpdateStub(hassY);
+    await openSoupNotesTab(cardY);
+    cardY.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "2" }));
+    await waitFor(() => cardY._ratingBusy === false);
+    await openSoupNotesTab(cardB);
+    cardB._hass = fakeHass({ fail: { update_recipe: "AnyList is down" } });
+    cardB._saveRetryDelays = [10, 10];
+    cardB.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "4" }));
+    await waitFor(() => cardB._ratingBusy === false);
+    const cardA = new AnyListRecipeViewCard();
+    const hassA = fakeHass();
+    cardA.setConfig({});
+    cardA.hass = hassA;
+    await sleep(150);
+    await openSoupNotesTab(cardA);
+    perRecipeUpdateStub(hassA);
+    cardA.shadowRoot.dispatchClick(fakeTarget("retry-rating"));
+    await waitFor(() => cardA._ratingBusy === false);
+    let saved = readStore(store);
+    assert.equal(saved.pendingRatings, undefined, "store pending clean after A's retry");
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-soup": [2, 4] }, "tombstone [2,4] after A's retry");
+    assert.equal(cardB._pendingRatings.get("rec-soup"), 4, "B still holds 4 — now stale");
+    // B re-attaches: adoption runs before any restore write, sees
+    // the re-landed tombstone 4, and deletes the stale entry.
+    cardB.disconnectedCallback();
+    cardB.connectedCallback();
+    await sleep(250);
+    assert.equal(cardB._pendingRatings.get("rec-soup"), undefined, "HEALED: B memory clean after re-attach reload — adoption deleted the stale 4");
+    cardB._saveSession();
+    saved = readStore(store);
+    assert.equal(saved.pendingRatings, undefined, "HEALED: B re-published nothing");
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-soup": [2, 4] }, "HEALED: tombstones [2,4] kept");
+    const fresh = new AnyListRecipeViewCard();
+    fresh.setConfig({});
+    fresh.hass = fakeHass();
+    await sleep(150);
+    assert.equal(fresh._pendingRatings.get("rec-soup"), undefined, "HEALED: fresh card restores no phantom");
+    await openSoupNotesTab(fresh);
+    assert.equal(fresh.shadowRoot.querySelector('[data-action="retry-rating"]'), null, "HEALED: fresh card offers no retry for the already-saved 4");
+    cardX.disconnectedCallback();
+    cardY.disconnectedCallback();
+    cardB.disconnectedCallback();
+    cardA.disconnectedCallback();
+    fresh.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("burst-8 D7-2 healed (notes): a re-typed note that became stale after creation is dropped on the next ordinary write", async () => {
+  const store = stubSessionStorage();
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    const { card: cardX, hass: hassX } = await loadedCard();
+    const stubX = perRecipeUpdateStub(hassX);
+    await openRiceNotesTab(cardX);
+    typeNote(cardX, "q1.");
+    await sleep(200);
+    let saved = readStore(store);
+    assert.deepEqual(saved.noteDrafts, { "rec-rice": "q1." }, "debounce persisted q1");
+    typeNote(cardX, "q2.");
+    cardX.shadowRoot.dispatchClick(fakeTarget("save-note"));
+    await waitFor(() => cardX._savingNote === false);
+    assert.equal(stubX.server["rec-rice"].note, "q2.", "server ends at q2");
+    saved = readStore(store);
+    assert.equal(saved.noteDrafts, undefined, "store clean of drafts after X save");
+    assert.deepEqual(saved.noteDraftTombstones, { "rec-rice": "q1." }, "tombstone q1 in store");
+    // B loads -> knows q1.
+    const cardB = new AnyListRecipeViewCard();
+    cardB.setConfig({});
+    cardB.hass = fakeHass();
+    await sleep(150);
+    assert.equal(cardB._knownNoteDraftTombstones.get("rec-rice"), "q1.", "B adopted tombstone q1");
+    // B re-types q1 (genuine: the cook wants the old text back).
+    await openRiceNotesTab(cardB);
+    typeNote(cardB, "q1.");
+    await sleep(200);
+    assert.equal(cardB._noteDrafts.get("rec-rice"), "q1.", "B holds its re-typed q1");
+    saved = readStore(store);
+    assert.deepEqual(saved.noteDrafts, { "rec-rice": "q1." }, "B's re-typed q1 reached the store");
+    assert.equal(saved.noteDraftTombstones, undefined, "tombstone q1 evicted by B's live q1");
+    // D loads, restores B's draft q1, saves it as-is -> server q1.
+    const cardD = new AnyListRecipeViewCard();
+    const hassD = fakeHass();
+    cardD.setConfig({});
+    cardD.hass = hassD;
+    await sleep(150);
+    assert.equal(cardD._noteDrafts.get("rec-rice"), "q1.", "D restored the draft q1");
+    await openRiceNotesTab(cardD);
+    perRecipeUpdateStub(hassD);
+    cardD.shadowRoot.dispatchClick(fakeTarget("save-note"));
+    await waitFor(() => cardD._savingNote === false);
+    saved = readStore(store);
+    assert.deepEqual(saved.noteDraftTombstones, { "rec-rice": "q1." }, "tombstone q1 landed again after D's save");
+    assert.equal(cardB._noteDrafts.get("rec-rice"), "q1.", "B still holds q1 in memory — now stale (server is q1)");
+    // B's next ordinary write: the re-landed tombstone outranks it.
+    cardB._saveSession();
+    assert.equal(cardB._noteDrafts.get("rec-rice"), undefined, "HEALED: B memory clean after write — stale q1 dropped");
+    saved = readStore(store);
+    assert.equal(saved.noteDrafts, undefined, "HEALED: B re-published nothing");
+    assert.deepEqual(saved.noteDraftTombstones, { "rec-rice": "q1." }, "HEALED: tombstone q1 kept");
+    const fresh = new AnyListRecipeViewCard();
+    fresh.setConfig({});
+    fresh.hass = fakeHass();
+    await sleep(150);
+    assert.equal(fresh._noteDrafts.get("rec-rice"), undefined, "HEALED: fresh card restores no phantom draft");
+    cardX.disconnectedCallback();
+    cardB.disconnectedCallback();
+    cardD.disconnectedCallback();
+    fresh.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("burst-8 D7-3 healed: a fresh re-rate of an already-saved value on a card that never learned the tombstone is kept as pending, with its retry", async () => {
+  const store = stubSessionStorage();
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    // C loads first (empty store, knows nothing).
+    const { card: cardC } = await loadedCard();
+    // X saves soup 5, Y saves soup 2 -> server 2, tombstone [2,5].
+    const { card: cardX, hass: hassX } = await loadedCard();
+    perRecipeUpdateStub(hassX);
+    await openSoupNotesTab(cardX);
+    cardX.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "5" }));
+    await waitFor(() => cardX._ratingBusy === false);
+    const { card: cardY, hass: hassY } = await loadedCard();
+    perRecipeUpdateStub(hassY);
+    await openSoupNotesTab(cardY);
+    cardY.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "2" }));
+    await waitFor(() => cardY._ratingBusy === false);
+    let saved = readStore(store);
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-soup": [2, 5] }, "tombstone [2,5] landed (set is sorted)");
+    // C (live since before the tombstones, never learned them)
+    // re-rates 5 and fails. The tap is a fresh local action newer
+    // than the card's knowledge, so the merge keeps it — the save
+    // did try (3 attempts), and the cook's tap must not vanish.
+    await openSoupNotesTab(cardC);
+    cardC._hass = fakeHass({ fail: { update_recipe: "AnyList is down" } });
+    cardC._saveRetryDelays = [10, 10];
+    const attemptsBefore = cardC._hass.calls.filter((c) => c[1] === "update_recipe").length;
+    cardC.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "5" }));
+    await waitFor(() => cardC._ratingBusy === false);
+    const attempts = cardC._hass.calls.filter((c) => c[1] === "update_recipe").length - attemptsBefore;
+    assert.equal(attempts, 3, "the save did try: initial + 2 backoff retries");
+    assert.equal(cardC._pendingRatings.get("rec-soup"), 5, "HEALED: C memory keeps the fresh 5 as pending");
+    assert.ok(cardC._ratingStatus && cardC._ratingStatus.retry === "retry-rating", "HEALED: the tappable retry is offered");
+    assert.ok(cardC.shadowRoot.querySelector('[data-action="retry-rating"]'), "HEALED: retry button present after the failed tap");
+    saved = readStore(store);
+    assert.deepEqual(saved.pendingRatings, { "rec-soup": 5 }, "HEALED: store holds the fresh pending 5");
+    cardC.disconnectedCallback();
+    cardX.disconnectedCallback();
+    cardY.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("burst-8 D7-3b healed: typing the exact tombstoned text on a card that never learned it survives the debounce write — editor and memory keep it", async () => {
+  const store = stubSessionStorage();
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    // C loads first (empty store, knows nothing).
+    const { card: cardC } = await loadedCard();
+    // X types w1, saves w2 -> tombstone w1.
+    const { card: cardX, hass: hassX } = await loadedCard();
+    perRecipeUpdateStub(hassX);
+    await openRiceNotesTab(cardX);
+    typeNote(cardX, "w1.");
+    await sleep(200);
+    typeNote(cardX, "w2.");
+    cardX.shadowRoot.dispatchClick(fakeTarget("save-note"));
+    await waitFor(() => cardX._savingNote === false);
+    let saved = readStore(store);
+    assert.deepEqual(saved.noteDraftTombstones, { "rec-rice": "w1." }, "tombstone w1 landed");
+    // C opens rice and types exactly w1 (fresh text, never learned
+    // the tombstone). The debounce write must keep it, not heal it
+    // away — and the heal re-render must not wipe the editor.
+    await openRiceNotesTab(cardC);
+    typeNote(cardC, "w1.");
+    assert.equal(cardC._noteDrafts.get("rec-rice"), "w1.", "typed w1 is the draft right after typing");
+    await sleep(300);
+    assert.equal(cardC._noteDrafts.get("rec-rice"), "w1.", "HEALED: C memory keeps the typed w1 after the debounce write");
+    const editor = cardC.shadowRoot.querySelector('[data-role="note"]');
+    assert.equal(editor ? editor.value : null, "w1.", "HEALED: the editor still shows the typed w1 — no heal wipe");
+    saved = readStore(store);
+    assert.deepEqual(saved.noteDrafts, { "rec-rice": "w1." }, "HEALED: store holds the typed draft w1");
+    cardC.disconnectedCallback();
+    cardX.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("burst-8 D7-7b2 healed: re-typing the exact tombstoned text and letting a write fire keeps it in memory and in the editor", async () => {
+  const store = stubSessionStorage();
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    const { card: cardA, hass: hassA } = await loadedCard();
+    perRecipeUpdateStub(hassA);
+    await openNotesTab(cardA);
+    typeNote(cardA, "v1 text.");
+    await sleep(200);
+    const cardB = new AnyListRecipeViewCard();
+    cardB.setConfig({});
+    cardB.hass = fakeHass();
+    await sleep(150);
+    await openNotesTab(cardB);
+    assert.equal(cardB._noteDrafts.get("rec-pasta"), "v1 text.", "B restored v1");
+    typeNote(cardA, "v2 text.");
+    cardA.shadowRoot.dispatchClick(fakeTarget("save-note"));
+    await waitFor(() => cardA._savingNote === false);
+    // B fiddles with the stale draft, then puts it back to exactly v1.
+    typeNote(cardB, "v1 text. plus more");
+    typeNote(cardB, "v1 text.");
+    assert.equal(cardB._noteDrafts.get("rec-pasta"), "v1 text.", "draft is back to exactly v1 before the write");
+    cardB._saveSession();
+    assert.equal(cardB._noteDrafts.get("rec-pasta"), "v1 text.", "HEALED: B memory keeps the re-typed v1 after the write");
+    const editorAfter = cardB.shadowRoot.querySelector('[data-role="note"]');
+    assert.equal(editorAfter ? editorAfter.value : null, "v1 text.", "HEALED: the editor still shows the re-typed v1 — no heal wipe");
+    cardA.disconnectedCallback();
+    cardB.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
+  }
+});
+
+test("burst-8 race isolation: re-attaching with a recipe left open writes NOTHING to the store until the load's adoption runs", async () => {
+  const seedState = {
+    openId: null, step: null, listScrollY: 0, detailScrollY: 0,
+    query: "", collectionId: "", sort: "name",
+    pendingRatingTombstones: { "rec-soup": [2] },
+  };
+  const store = stubSessionStorage({ "family-hub:recipe:state": JSON.stringify(seedState) });
+  const nav = stubWindow(HUB_WINDOW);
+  try {
+    const cardB = new AnyListRecipeViewCard();
+    cardB.setConfig({});
+    cardB.hass = fakeHass();
+    await sleep(150);
+    const { card: cardC } = await loadedCard({ fail: { update_recipe: "AnyList is down" } });
+    cardC._saveRetryDelays = [10, 10];
+    await openSoupNotesTab(cardC);
+    cardC.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "2" }));
+    await waitFor(() => cardC._ratingBusy === false);
+    cardB.disconnectedCallback();
+    cardB.connectedCallback();
+    await sleep(250);
+    assert.equal(cardB._pendingRatings.get("rec-soup"), 2, "B restored C's pending 2");
+    const cardD = new AnyListRecipeViewCard();
+    const hassD = fakeHass();
+    const stubD = perRecipeUpdateStub(hassD);
+    cardD.setConfig({});
+    cardD.hass = hassD;
+    await sleep(150);
+    await openSoupNotesTab(cardD);
+    cardD.shadowRoot.dispatchClick(fakeTarget("rate", { rating: "2" }));
+    await waitFor(() => cardD._ratingBusy === false);
+    assert.equal(stubD.server["rec-soup"].rating, 2, "server holds 2 after D's save");
+    let saved = readStore(store);
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-soup": [2] }, "tombstone [2] landed");
+    assert.equal(saved.openId, "rec-soup", "precondition: a recipe is LEFT OPEN (D never went back)");
+    assert.equal(cardB._pendingRatings.get("rec-soup"), 2, "B still holds 2 — now stale");
+    // The re-attach itself must not write: connectedCallback returns
+    // with the load still in flight, and the restore is deferred
+    // until adoption. Two signals, read synchronously — no await —
+    // so any synchronous pre-adoption write would already show:
+    // (a) the store is byte-identical, and (b) sessionStorage saw
+    // zero writes. (b) is the sharper one: a pre-adoption write
+    // that merely rewrites identical bytes still counts as a
+    // write, and the merge's drop rule can mask (a) by healing
+    // the entry before the bytes are compared.
+    cardB.disconnectedCallback();
+    const beforeReattach = store.get("family-hub:recipe:state");
+    const realSetItem = globalThis.sessionStorage.setItem;
+    let syncWrites = 0;
+    globalThis.sessionStorage.setItem = (...args) => {
+      syncWrites++;
+      return realSetItem(...args);
+    };
+    try {
+      cardB.connectedCallback();
+    } finally {
+      globalThis.sessionStorage.setItem = realSetItem;
+    }
+    assert.equal(
+      syncWrites,
+      0,
+      "ISOLATION: connectedCallback performed zero session-store writes synchronously — the restore waits for the load's adoption"
+    );
+    assert.equal(
+      store.get("family-hub:recipe:state"),
+      beforeReattach,
+      "ISOLATION: the store is byte-identical immediately after connectedCallback returns — no synchronous pre-adoption write"
+    );
+    // And once the load lands, adoption heals the entry.
+    await sleep(250);
+    assert.equal(cardB._pendingRatings.get("rec-soup"), undefined, "B's stale 2 is gone after the load's adoption");
+    saved = readStore(store);
+    assert.equal(saved.pendingRatings, undefined, "no re-publish after the reload");
+    assert.deepEqual(saved.pendingRatingTombstones, { "rec-soup": [2] }, "tombstone kept");
+    cardB.disconnectedCallback();
+    cardC.disconnectedCallback();
+    cardD.disconnectedCallback();
+  } finally {
+    clearWindow();
+    clearSessionStorage();
   }
 });

@@ -42,6 +42,18 @@
 // How long to wait after the last keystroke before searching, so one
 // search runs per pause in typing instead of one per letter.
 const SEARCH_DEBOUNCE_MS = 300;
+// Cop-out audit C1/C2 (Nov 12, 2026): a failed load or save retried
+// itself never — the error was the whole response. Both now retry on
+// their own with exponential backoff, bounded: the view-open load
+// tries again up to 3 times (1 s, 2 s, 4 s), a note/rating save up
+// to 2 times (0.5 s, 1 s). A save is idempotent (same text), so
+// re-sending it is safe. The error shows only once the budget is
+// spent — never an infinite retry, and never a dead-end error on a
+// transient blip.
+const LOAD_RETRY_MAX_ATTEMPTS = 3;
+const LOAD_RETRY_DELAYS_MS = [1000, 2000, 4000];
+const SAVE_RETRY_MAX_ATTEMPTS = 2;
+const SAVE_RETRY_DELAYS_MS = [500, 1000];
 // PIP (D3, R-IMPL-17–22): the floating timer indicator auto-hides
 // 5 s after it appears, fading out over 300 ms; a finished timer's
 // PIP never auto-hides. A touch on the PIP suspends the 5 s clock
@@ -1478,6 +1490,85 @@ function sanitizeRecipeStep(value) {
 // stands — see the implementation report, resolution #13),
 // listScrollY, detailScrollY (written, NEVER read for a restore —
 // D2d), query, collectionId, sort.
+// B3: noteDrafts (recipe id -> unsaved typed note) and pendingRatings
+// (recipe id -> rating a save was trying to set) ride in the same
+// session so an unsaved note / unconfirmed rating survives a real
+// view re-open (a fresh card instance), not just the same instance's
+// memory. Both are omitted when empty, so a session with nothing
+// pending serializes exactly as before. Burst-5 adds the tombstone
+// fields (noteDraftTombstones — id -> the deleted value;
+// pendingRatingTombstones — id -> the array of deleted values,
+// burst-7 set-valued; same omission rule); see _saveSession
+// for what they guard.
+function sanitizeNoteDrafts(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const out = {};
+  for (const [key, draft] of Object.entries(value)) {
+    if (typeof key === "string" && key.trim() && typeof draft === "string") {
+      out[key.trim()] = draft;
+    }
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+// Burst-8: one rule for reading a rating value out of the store
+// (pending ratings, tombstones, and the runtime set normaliser
+// below all use it). A value counts only when it is already an
+// integer in 0–5, or a string that is exactly an integer literal
+// in 0–5 (an older store may hold "3"). Everything else is
+// dropped, never coerced: Number(null) === 0 used to read a
+// corrupt null as a phantom clear-rating (0), Number(true) === 1
+// read a boolean as a guard, and Number("") === 0 read an empty
+// string the same way. The card only ever writes numbers.
+function asRatingValue(v) {
+  if (typeof v === "number") {
+    return Number.isInteger(v) && v >= 0 && v <= 5 ? v : undefined;
+  }
+  if (typeof v === "string" && /^-?\d+$/.test(v.trim())) {
+    const n = Number(v);
+    return Number.isInteger(n) && n >= 0 && n <= 5 ? n : undefined;
+  }
+  return undefined;
+}
+
+function sanitizePendingRatings(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const out = {};
+  for (const [key, rating] of Object.entries(value)) {
+    const n = asRatingValue(rating);
+    if (typeof key === "string" && key.trim() && n !== undefined) {
+      out[key.trim()] = n;
+    }
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+// Burst-7 (F3b): rating tombstones are SET-valued — id -> the
+// sorted array of saved values that value guards (ratings are
+// 0–5 integers, so the set is bounded: at most six numbers per id —
+// the five ratings 1–5 plus 0, the legitimate clear-rating value).
+// A legacy single number (burst-5/6 store shape) reads as a
+// one-element set, so a session written by the older code still
+// heals. Notes stay single-value (unbounded text); see
+// _mergedNoteDraftTombstonesForSession for why.
+// Burst-8: the bound is enforced by the integer domain, not just
+// claimed by the comment — the old Number() coercion kept eleven
+// fractional values (0.1…1.5) for one id and read a corrupt null
+// as a [0] guard. Only integers in 0–5 (or integer-literal strings,
+// as in asRatingValue) are kept; anything else (fractions, null,
+// booleans, empty/non-numeric strings, out-of-range) is dropped.
+function sanitizePendingRatingTombstones(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const out = {};
+  for (const [key, raw] of Object.entries(value)) {
+    if (typeof key !== "string" || !key.trim()) continue;
+    const values = Array.isArray(raw) ? raw : [raw];
+    const kept = [...new Set(values.map((v) => asRatingValue(v)).filter((n) => n !== undefined))].sort((a, b) => a - b);
+    if (kept.length > 0) out[key.trim()] = kept;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 function parseRecipeSession(raw) {
   if (typeof raw !== "string" || !raw) return null;
   let parsed;
@@ -1491,7 +1582,7 @@ function parseRecipeSession(raw) {
   const query = typeof parsed.query === "string" ? parsed.query : "";
   const collectionId = typeof parsed.collectionId === "string" ? parsed.collectionId : "";
   const sort = typeof parsed.sort === "string" && ["name", "rating", "cook", "prep"].includes(parsed.sort) ? parsed.sort : "name";
-  return {
+  const state = {
     openId,
     step: sanitizeRecipeStep(parsed.step),
     listScrollY: sanitizeRecipeScroll(parsed.listScrollY),
@@ -1500,10 +1591,26 @@ function parseRecipeSession(raw) {
     collectionId,
     sort,
   };
+  const noteDrafts = sanitizeNoteDrafts(parsed.noteDrafts);
+  if (noteDrafts) state.noteDrafts = noteDrafts;
+  const pendingRatings = sanitizePendingRatings(parsed.pendingRatings);
+  if (pendingRatings) state.pendingRatings = pendingRatings;
+  // Burst-5: value-scoped tombstones (see _saveSession) ride in the
+  // same session so a fresh card honours them — a note tombstone is
+  // an id -> the deleted value, sanitized exactly like the map it
+  // guards, and omitted when empty like the maps. A rating
+  // tombstone is an id -> the sorted array of deleted values it
+  // guards (burst-7, set-valued); a legacy single number reads as
+  // a one-element set.
+  const noteDraftTombstones = sanitizeNoteDrafts(parsed.noteDraftTombstones);
+  if (noteDraftTombstones) state.noteDraftTombstones = noteDraftTombstones;
+  const pendingRatingTombstones = sanitizePendingRatingTombstones(parsed.pendingRatingTombstones);
+  if (pendingRatingTombstones) state.pendingRatingTombstones = pendingRatingTombstones;
+  return state;
 }
 
 function serializeRecipeSession(state) {
-  return JSON.stringify({
+  const out = {
     openId:
       state && typeof state.openId === "string" && state.openId.trim()
         ? state.openId.trim()
@@ -1519,7 +1626,16 @@ function serializeRecipeSession(state) {
       ["name", "rating", "cook", "prep"].includes(state.sort)
         ? state.sort
         : "name",
-  });
+  };
+  const noteDrafts = sanitizeNoteDrafts(state && state.noteDrafts);
+  if (noteDrafts) out.noteDrafts = noteDrafts;
+  const pendingRatings = sanitizePendingRatings(state && state.pendingRatings);
+  if (pendingRatings) out.pendingRatings = pendingRatings;
+  const noteDraftTombstones = sanitizeNoteDrafts(state && state.noteDraftTombstones);
+  if (noteDraftTombstones) out.noteDraftTombstones = noteDraftTombstones;
+  const pendingRatingTombstones = sanitizePendingRatingTombstones(state && state.pendingRatingTombstones);
+  if (pendingRatingTombstones) out.pendingRatingTombstones = pendingRatingTombstones;
+  return JSON.stringify(out);
 }
 
 const CARD_CSS = `
@@ -2895,6 +3011,16 @@ class AnyListRecipeViewCard extends HTMLElement {
     this._loading = false;
     this._error = "";
     this._loaded = false;
+    // Cop-out audit C1: the view-open load retries itself on a
+    // transient failure (bounded backoff, see LOAD_RETRY_*). A
+    // scheduled retry is a transient state — the skeleton keeps
+    // showing and the status says so; the error appears only once
+    // the budget is spent. _loadRetryDelays is an instance copy of
+    // the constant so tests can shrink the waits.
+    this._loadRetryTimer = null;
+    this._loadRetryAttempt = 0;
+    this._loadRetrying = false;
+    this._loadRetryDelays = LOAD_RETRY_DELAYS_MS;
     // Cooking state, per recipe id, kept for the card's lifetime so a
     // cook can leave a recipe and come back without losing their place
     // (Paprika keeps the highlighted step and crossed-off ingredients
@@ -2915,14 +3041,186 @@ class AnyListRecipeViewCard extends HTMLElement {
     this._noteDrafts = new Map();
     this._noteStatus = null; // { text, error, retry? } or null
     this._savingNote = false;
+    // Cop-out audit C2: a note/rating save retries itself on
+    // failure (bounded backoff, see SAVE_RETRY_*). _saveBackoffs is
+    // the set of pending backoff sleeps — one handle per in-flight
+    // save, each carrying its own timer and resolver, so a note save
+    // and a rating save in backoff at once never share state (F2)
+    // and disconnect settles every one of them instead of just
+    // clearing the latest timer (F1). _saveRetryDelays is an
+    // instance copy of the constant so tests can shrink the waits.
+    // _saveDisconnected (B1) is the generation flag the backoff
+    // settles cannot provide: a call already inside its service
+    // await at disconnect must still come back cancelled, never
+    // fire a retry or apply its result on the detached card.
+    // Set in disconnectedCallback, cleared in connectedCallback.
+    this._saveBackoffs = new Set();
+    this._saveRetryDelays = SAVE_RETRY_DELAYS_MS;
+    this._saveDisconnected = false;
     // Rating: a tap saves at once (no separate Save button). The
     // status is the feedback line under the stars. _ratingBusy
     // blocks double-taps while a save is in flight. _pendingRating
     // holds the rating a failed save was trying to set, so the
-    // retry button can re-attempt exactly that value (R-IMPL-39).
+    // retry button can re-attempt exactly that value (R-IMPL-39);
+    // _pendingRatings is the same per recipe id, so the pending
+    // rating survives opening another recipe and a view re-open
+    // (B2, B3) — the scalar always mirrors the open recipe's entry.
+    // _savingNoteRecipeIds / _ratingBusyRecipeIds are the sets of
+    // recipes with a note / rating save in flight (burst-3): one
+    // shared boolean + one id scalar could not represent two
+    // in-flight saves, so the second save's finally cleared the
+    // flag while the first was still in flight. Each save adds
+    // its recipe id on start and deletes it in its finally — but
+    // only when it is still the latest save for that recipe, so
+    // an older save's finally never clears a newer save's flag.
+    // _savingNote / _ratingBusy are derived from the sets for the
+    // OPEN recipe (set in _openRecipe, re-derived in each finally),
+    // so switching recipes never confuses one recipe's flag with
+    // another's (B4).
+    // Supersede (burst-3, P7d): a second save for the SAME recipe
+    // with newer content may start while the first is still in
+    // flight — the first attempt already sent the old text, and
+    // the cook's newer text must not be lost to it. _noteSaveLatest
+    // / _ratingSaveLatest hold the sequence number of the latest
+    // save started per recipe (from the shared _saveSeq counter);
+    // _saveWithRetry treats a save as superseded once a newer
+    // save for the same recipe and kind has started — it makes
+    // no further attempts and never applies its result, so the
+    // older attempt landing after the newer save confirmed can
+    // never clobber the newer text back (locally or in the call
+    // order to the server, which already ends at the newer call).
+    // _inFlightNoteText / _inFlightRating hold what the latest
+    // dispatched attempt actually sent, so the guards can tell a
+    // duplicate re-save of the same text (blocked) from a save
+    // of newer content (allowed, superseding).
     this._ratingStatus = null; // { text, error, retry? } or null
     this._ratingBusy = false;
     this._pendingRating = null;
+    this._pendingRatings = new Map();
+    // Burst-5 (tombstones): when a successful save deletes an entry
+    // from _noteDrafts / _pendingRatings, the deletion must reach
+    // the session store — under union-merge semantics it never does
+    // on its own (see _saveSession). _noteDraftTombstones records
+    // { id -> value } for each such deletion; _pendingRatingTombstones
+    // records { id -> Set of values } (burst-7: ratings are 1–5, so
+    // the set is bounded — every saved value gets its own guard).
+    // Both are value-scoped: a merge skips a stored entry only when
+    // it equals a tombstoned value, so another live card's newer
+    // pending for the same id survives. _lastStoredNoteDrafts /
+    // _lastStoredPendingRatings record what THIS card last wrote to
+    // the store (updated only on a successful store write): the
+    // tombstone value is that last-written value, not the value just
+    // saved — the store can hold an older text this card wrote
+    // earlier (a debounced v1) while the save confirmed a newer one
+    // (v2), and only the last-written value names the stale entry.
+    // A recorded tombstone is consumed (deleted from memory) only
+    // after a store write that carried it succeeds; a failed
+    // setItem consumes nothing.
+    // Burst-6 (persistence + stale-holder healing): the recorded
+    // maps alone cannot heal a second live card holding the entry
+    // in stale memory — that card re-publishes it on its next
+    // write, and the burst-5 "at most one write cycle" lifetime
+    // dropped the tombstone before a slow holder ever wrote (that
+    // lifetime claim was off by one anyway: an adopter's first
+    // write carried the tombstone and its second dropped it).
+    // So tombstones now PERSIST in the store: every write re-carries
+    // the stored tombstones (see _merged*DraftTombstonesForSession),
+    // and a tombstone leaves the store only when a genuine re-pend
+    // for the same id+value drops it (the live-entry exclusion is
+    // value-scoped) or the id leaves the recipe list (pruning).
+    // Bound: at most one note tombstone per recipe id, and at most
+    // six rating values per recipe id (the 0–5 integer domain), so the
+    // store holds at most as many tombstone entries as there are
+    // recipes. Tombstones for ids that left the list are pruned on
+    // load and on every write (burst-7, F4) — the bound above is
+    // against the CURRENT list, not the store's history.
+    // And the merge now HEALS a stale holder: a live entry whose
+    // id+value equals a stored tombstone, on a card that never
+    // learned that tombstone VALUE, is deleted from memory with
+    // its retry affordance cleared — the tombstone proves that
+    // value already saved, so re-publishing it can only clobber.
+    // _knownNoteDraftTombstones / _knownPendingRatingTombstones
+    // record every tombstone this instance has ever learned of
+    // (recorded by its own save, or adopted from the store at load)
+    // and are NEVER consumed. Burst-7 used them as the drop rule's
+    // protection ("a live entry created after this instance learned
+    // that tombstone VALUE is genuine"). That premise is FALSE, and
+    // burst-8 removes it as the decision: the known maps record
+    // only THAT a value was learned, never WHEN relative to the
+    // entry's creation — an entry restored from the store, and an
+    // entry made stale by a later save AFTER its creation, both
+    // match a known value and were shielded (verifier V7-3/V7-3b,
+    // critic D7-1/D7-2). The known maps are kept — tests and the
+    // merge's bookkeeping read them — but they no longer decide
+    // protection. The decision is PROVENANCE (burst-8), below.
+    // Burst-8 (provenance): a live entry is protected from the
+    // drop rule only when it was created by a LOCAL action (a tap
+    // or typing) AFTER the latest landing of that tombstone value
+    // — never when it was restored from the store, and never when
+    // the tombstone has re-landed since the entry was created.
+    // _tombstoneGen* is the landing generation per id+value: it
+    // increments each time this instance observes that tombstone
+    // value transition absent -> present in the store (see
+    // _observeStoredTombstones). _entryGen* is the generation the
+    // live entry was created (or restored) under. A stale entry
+    // has entryGen < gen: it predates the latest landing, so the
+    // value was saved after the entry was made and the entry must
+    // go. A genuine re-pend has entryGen >= gen: it was created
+    // after the landing it matches, so it stays. _fresh* is the
+    // one-shot bridge for a tap the card has never learned the
+    // tombstone for (critic D7-3): a local tap creates the entry
+    // after this card's last store read, so a tombstone already
+    // in the store cannot prove the tap stale — the tap is newer
+    // than the card's knowledge. The fresh mark protects the
+    // entry through exactly ONE merge (the write that persists
+    // it), then is consumed; after that the generation rule
+    // governs, so a later re-landing of the same value still
+    // heals the entry. _lastSeen* is the tombstone state as of
+    // this instance's last store observation or successful write
+    // — the baseline the absent -> present transition is read
+    // against. Without it, a re-landing after this card's own
+    // write evicted the tombstone would read as "still present"
+    // and the generation would never advance.
+    // One slot, one value (NOTES): the store holds a single
+    // tombstone value per id, and on a conflict the RECORDED value
+    // wins — the newest save's tombstone replaces the stored one
+    // (burst-7, F3a), so the guard tracks the latest saved value.
+    // The documented tradeoff: a stale holder of an OLDER saved
+    // note value loses its guard when a newer save overwrites the
+    // slot, and can re-publish that older value until it is saved
+    // again. Notes are unbounded text, so a set per id is not
+    // practical. RATINGS have no such residual (burst-7, F3b):
+    // the set holds every saved value, so a stale holder of ANY
+    // saved rating is healed — the burst-6 "the loser's stale
+    // holder can re-publish once" is gone for ratings, and it was
+    // never once: it recurred after every later save of the loser's
+    // value, because no tombstone for that value could ever land.
+    this._noteDraftTombstones = new Map();
+    this._pendingRatingTombstones = new Map();
+    this._knownNoteDraftTombstones = new Map();
+    this._knownPendingRatingTombstones = new Map();
+    this._tombstoneGenRatings = new Map();
+    this._tombstoneGenNotes = new Map();
+    this._entryGenRatings = new Map();
+    this._entryGenNotes = new Map();
+    this._lastSeenRatingTombstones = new Map();
+    this._lastSeenNoteTombstones = new Map();
+    this._freshPendingRatings = new Map();
+    this._freshNoteDrafts = new Map();
+    // Burst-7 (verifier item b): set when a merge heals the OPEN
+    // recipe's note draft — _saveSession then re-renders, so the
+    // editor shows the saved note instead of leaving the stale
+    // draft text editable as a ghost. Consumed by _saveSession.
+    this._healedOpenNoteDraft = false;
+    this._lastStoredNoteDrafts = new Map();
+    this._lastStoredPendingRatings = new Map();
+    this._savingNoteRecipeIds = new Set();
+    this._ratingBusyRecipeIds = new Set();
+    this._noteSaveLatest = new Map();
+    this._ratingSaveLatest = new Map();
+    this._inFlightNoteText = new Map();
+    this._inFlightRating = new Map();
+    this._saveSeq = 0;
     // Serving scaling is transient by design: the chosen serving
     // count per recipe id, for this cooking session only. It resets
     // when the recipe is opened (see _openRecipe) and never calls
@@ -3055,6 +3353,15 @@ class AnyListRecipeViewCard extends HTMLElement {
     // not need one. _loadAll is a no-op while a load is already in
     // flight, so the attach that follows the first hass object does
     // not double-load.
+    // Re-attach clears the disconnect flag (B1): backoff-pending
+    // saves abandoned by the last detach stay abandoned — only new
+    // saves run — but an in-flight attempt that lands AFTER the
+    // re-attach still applies its result (P5): the card is live
+    // again and the save is legitimate, so it is not discarded.
+    // (The burst-2 wording "saves abandoned by the last detach
+    // stay abandoned" was imprecise for exactly that interleaving.)
+    // A fresh save on this mount is allowed to attempt and retry.
+    this._saveDisconnected = false;
     if (this._hass) this._loadAll();
     this._render();
     // A deep link opened on an already-loaded list applies here; the
@@ -3065,10 +3372,15 @@ class AnyListRecipeViewCard extends HTMLElement {
     _liveCards.add(this);
     this._ensureCoreForCard();
     if (this._loaded) this._applyDeepLink();
-    // Session restore (DESIGN-7): re-open the recipe that was open
-    // and restore the scroll; a deep link owns recipe+step, the
-    // session owns the scroll (N-IMPL-21b).
-    if (this._loaded) this._restoreSession();
+    // Burst-8 (verifier Finding 2 / critic 1b): NO synchronous
+    // _restoreSession() here. It used to re-open the saved recipe
+    // at once — _openRecipe -> _saveSession — while _loadAll's
+    // fetch was still in flight, so the restore's write ran BEFORE
+    // the load's _restorePendingSaves adoption and evicted the
+    // tombstone adoption needed to heal a stale entry. The restore
+    // now runs only from _loadAll's success path, after adoption
+    // (and on first mount it never ran here either — _loaded was
+    // false — so nothing is lost, only the pre-adoption write).
     // System-back / forward within Recipes (decision F).
     if (
       typeof window !== "undefined" &&
@@ -3153,10 +3465,52 @@ class AnyListRecipeViewCard extends HTMLElement {
       window.removeEventListener("popstate", this._popstateBound);
       this._popstateBound = null;
     }
-    if (this._scrollSaveTimer !== null) {
+    // Burst-3 (critic finding 1): a note typed within the 150 ms
+    // debounce window was lost on a real re-open — the pending
+    // session save was dropped by the clearTimeout below instead
+    // of flushed. Flush it first, so the typed draft (and any
+    // pending rating) reaches the session store before the card
+    // goes away; the timer is only a delay, never a discard.
+    // Burst-6 (F2): also flush when a tombstone is still pending
+    // in memory — a carrying write that threw (setItem failed
+    // once) leaves the tombstone unrecorded in the store and the
+    // stale entry still there, and a disconnect with no scroll
+    // timer pending used to perform no flush retry, so the phantom
+    // came back on the next load. _saveSession swallows setItem
+    // failures, so a still-broken store costs nothing here. The
+    // known-tombstone maps do NOT trigger the flush: they are
+    // already in the store (adopted from it) and need no carrying.
+    if (
+      this._scrollSaveTimer !== null ||
+      this._noteDraftTombstones.size > 0 ||
+      this._pendingRatingTombstones.size > 0
+    ) {
+      this._saveSession();
       clearTimeout(this._scrollSaveTimer);
       this._scrollSaveTimer = null;
     }
+    // A scheduled load retry (C1) or a save backoff sleep (C2) never
+    // fires after disconnect — a detached card loads or saves nothing.
+    // Cancelling a save backoff also settles its sleep, so the
+    // awaiting save returns and its busy flag clears instead of
+    // hanging forever (F1); every in-flight save carries its own
+    // backoff, so all of them are settled, not just the latest (F2).
+    // That alone does not cover a call already inside its service
+    // await (B1): _saveDisconnected is set first, so when that
+    // attempt lands — success or failure — _saveWithRetry returns
+    // "cancelled" instead of firing a retry or applying the result
+    // on the detached card. (The earlier claim that a detached
+    // card "loads or saves nothing" was overstated for exactly
+    // that window: the backoff settle fixed the hang, but an
+    // in-flight attempt could still fire one more service call
+    // after disconnect. The flag closes the window.)
+    this._saveDisconnected = true;
+    if (this._loadRetryTimer !== null) {
+      clearTimeout(this._loadRetryTimer);
+      this._loadRetryTimer = null;
+    }
+    this._loadRetrying = false;
+    this._cancelSaveBackoffs();
     this._sessionRestored = false;
     this._interacted = false;
     this._releaseWakeLock();
@@ -3365,8 +3719,27 @@ class AnyListRecipeViewCard extends HTMLElement {
     return result;
   }
 
-  async _loadAll() {
+  // The view-open download, with bounded automatic retry (cop-out
+  // audit C1): a transient failure schedules another attempt with
+  // exponential backoff instead of leaving the dead-end error on
+  // screen. isRetry marks an attempt the retry timer fired — only a
+  // fresh (non-retry) load resets the attempt count, so a view
+  // re-open or a manual Try again starts a new budget. The error
+  // shows only once the budget is spent. The integration-missing
+  // failure is NOT transient — no amount of retrying installs it —
+  // so it shows its remedy at once (C4) instead of burning the
+  // budget on it.
+  async _loadAll(isRetry = false) {
     if (this._loading) return;
+    // A fresh load supersedes a scheduled retry (view re-opened, or
+    // Try again tapped while a retry was pending): the scheduled
+    // attempt must not fire a second load afterwards.
+    if (this._loadRetryTimer !== null) {
+      clearTimeout(this._loadRetryTimer);
+      this._loadRetryTimer = null;
+    }
+    if (!isRetry) this._loadRetryAttempt = 0;
+    this._loadRetrying = false;
     this._loading = true;
     this._error = "";
     this._render();
@@ -3383,6 +3756,11 @@ class AnyListRecipeViewCard extends HTMLElement {
       this._recipes = sortRecipes(recipes.map((item) => normalizeRecipe(item)));
       this._collections = deriveCollections(this._recipes);
       this._loaded = true;
+      this._loadRetryAttempt = 0;
+      // B3: restore kept drafts and pending ratings BEFORE the
+      // session re-opens its recipe, so _openRecipe can offer the
+      // pending rating's retry and the editor shows the kept draft.
+      this._restorePendingSaves();
       // A deep link (?recipe=<id>&step=<n>) opens its recipe once
       // the list it names has loaded.
       this._applyDeepLink();
@@ -3390,7 +3768,31 @@ class AnyListRecipeViewCard extends HTMLElement {
       // and restore the scroll, unless a deep link owns the state.
       this._restoreSession();
     } catch (err) {
-      this._error = this._friendlyError(err);
+      if (this._isIntegrationMissingError(err)) {
+        this._loadRetryAttempt = 0;
+        this._error = this._friendlyError(err);
+      } else if (this._loadRetryAttempt < LOAD_RETRY_MAX_ATTEMPTS) {
+        const delays = this._loadRetryDelays || LOAD_RETRY_DELAYS_MS;
+        const delay =
+          delays[this._loadRetryAttempt] !== undefined
+            ? delays[this._loadRetryAttempt]
+            : delays[delays.length - 1];
+        this._loadRetryAttempt += 1;
+        this._loadRetrying = true;
+        this._loadRetryTimer = setTimeout(() => {
+          this._loadRetryTimer = null;
+          this._loadAll(true);
+        }, delay);
+        if (
+          this._loadRetryTimer &&
+          typeof this._loadRetryTimer.unref === "function"
+        ) {
+          this._loadRetryTimer.unref();
+        }
+      } else {
+        this._loadRetryAttempt = 0;
+        this._error = this._friendlyError(err);
+      }
     } finally {
       this._loading = false;
       this._render();
@@ -3456,12 +3858,37 @@ class AnyListRecipeViewCard extends HTMLElement {
     // save feedback lines clear. The note draft is NOT cleared — an
     // unsaved note survives leaving the recipe and coming back, the
     // same way checked ingredients and the current step do.
+    // The busy flags follow the recipe being opened, not the card:
+    // a save in flight for ANOTHER recipe leaves this recipe's
+    // flags clear, and a save in flight for THIS recipe keeps them
+    // set — clearing them outright mid-save let a second save
+    // start and let the first save's finally clear the second
+    // save's flag (B4). Burst-3: the flags are derived from the
+    // per-recipe in-flight sets, so two saves for two recipes
+    // are represented at once and neither one's finally can
+    // clear the other's flag.
     this._scaleServings.delete(id);
     this._showOriginal.delete(id);
     this._noteStatus = null;
     this._ratingStatus = null;
-    this._savingNote = false;
-    this._ratingBusy = false;
+    this._savingNote = this._savingNoteRecipeIds.has(id);
+    this._ratingBusy = this._ratingBusyRecipeIds.has(id);
+    // A rating save that failed or was abandoned for this recipe
+    // is still pending: the retry is offered again on re-open
+    // (B2) — without it the intended rating exists nowhere and
+    // the cook would have to notice and re-tap. The note needs
+    // no status here: its draft is in the editor with Save
+    // enabled, which is the retry.
+    this._pendingRating = this._pendingRatings.has(id)
+      ? this._pendingRatings.get(id)
+      : null;
+    if (this._pendingRating !== null) {
+      this._ratingStatus = {
+        text: "Rating not saved yet — tap to retry",
+        error: true,
+        retry: "retry-rating",
+      };
+    }
     this._finishShown = false;
     this._timerError = "";
     // Cooking state survives a reload (RECIPE-9): restore the saved
@@ -3534,21 +3961,43 @@ class AnyListRecipeViewCard extends HTMLElement {
   // Write the clean list-top session state (no open detail, no step,
   // both scroll buckets zero). The search query, filter and sort are
   // KEPT — a strip-Recipes tap clears the open detail, not the
-  // list the user was browsing.
+  // list the user was browsing. Kept drafts and pending ratings
+  // are kept too (B3): closing the detail does not throw away an
+  // unsaved note or an unconfirmed rating.
   _clearRecipeSession() {
     if (typeof sessionStorage === "undefined") return;
+    // Burst-4 (F3): merged like _saveSession — closing the detail
+    // on this card must not clobber a draft or pending rating
+    // another live card wrote to the store since this one read it.
+    // Burst-5: the merge is tombstone-aware like _saveSession, so
+    // closing the detail does not resurrect a just-saved entry.
+    const prev = this._readSavedSession();
+    // Burst-8: observe this store state's tombstone landings
+    // before the merges below decide anything (see _saveSession).
+    this._observeStoredTombstones(prev);
+    const state = {
+      openId: null,
+      step: null,
+      listScrollY: 0,
+      detailScrollY: 0,
+      query: this._query || "",
+      collectionId: this._collectionId || "",
+      sort: this._sort || "name",
+      noteDrafts: this._mergedNoteDraftsForSession(prev),
+      pendingRatings: this._mergedPendingRatingsForSession(prev),
+      noteDraftTombstones: this._mergedNoteDraftTombstonesForSession(prev),
+      pendingRatingTombstones: this._mergedPendingRatingTombstonesForSession(prev),
+    };
     try {
       sessionStorage.setItem(
         RECIPE_SESSION_KEY,
-        serializeRecipeSession({
-          openId: null,
-          step: null,
-          listScrollY: 0,
-          detailScrollY: 0,
-          query: this._query || "",
-          collectionId: this._collectionId || "",
-          sort: this._sort || "name",
-        })
+        serializeRecipeSession(state)
+      );
+      this._noteStoreWriteSucceeded(
+        state.noteDrafts,
+        state.pendingRatings,
+        state.noteDraftTombstones,
+        state.pendingRatingTombstones
       );
     } catch (_err) {
       // Storage full or blocked: the view still works, it just is
@@ -3732,6 +4181,699 @@ class AnyListRecipeViewCard extends HTMLElement {
     }
   }
 
+  // The pending-save half of the session state (B3), as plain
+  // objects for the serializer — undefined when nothing is pending,
+  // so a session with nothing pending serializes exactly as before.
+  _noteDraftsForSession() {
+    if (this._noteDrafts.size === 0) return undefined;
+    const out = {};
+    for (const [id, draft] of this._noteDrafts) out[id] = draft;
+    return out;
+  }
+
+  _pendingRatingsForSession() {
+    if (this._pendingRatings.size === 0) return undefined;
+    const out = {};
+    for (const [id, rating] of this._pendingRatings) out[id] = rating;
+    return out;
+  }
+
+  // Burst-4 (F3): union the stored maps with this instance's maps,
+  // in-memory winning per id. A stored entry this instance never
+  // knew about (another live card's draft or pending rating)
+  // survives the write; an entry this instance owns overwrites
+  // the stored one. Returns undefined when the union is empty, so
+  // a session with nothing pending serializes exactly as before.
+  // Burst-5 (tombstones): a stored entry is skipped when it equals
+  // a tombstone for its id — either one this instance recorded when
+  // a save deleted the entry, or one read from the store (another
+  // card's, or this instance's own from an earlier write). The
+  // check is value-scoped: a stored entry with a DIFFERENT value
+  // for the same id (another live card's newer pending) survives.
+  // Burst-6 (stale-holder healing): a live in-memory entry is
+  // dropped, not overlaid, when it equals a STORED tombstone for
+  // its id and this instance never learned that tombstone VALUE —
+  // the entry predates the tombstone, so the value already saved
+  // and re-publishing it can only clobber a newer saved value.
+  // The drop also clears the retry affordance for the open recipe
+  // (_noteStatus / _pendingRating + _ratingStatus): the state is
+  // cleared here and the next render reflects it — a note heal
+  // re-renders from _saveSession (burst-7, verifier item b), so
+  // the ghost editor text is refreshed at once; a save-finally
+  // write is rendered right after by the finally, while a
+  // scroll-debounce rating write leaves the inert retry button on
+  // screen until the next render (cosmetic only — tapping it is a
+  // no-op, guarded by _pendingRating === null). A live entry
+  // created AFTER the tombstone VALUE's latest landing (a genuine
+  // re-pend of that value) is protected: it overlays like
+  // any live entry, and the tombstone-carry below drops the
+  // tombstone for that value, so a fresh card restores the re-pend.
+  // Burst-8: "after learning" is PROVENANCE now (generation vs
+  // entry creation), not the known maps — see the constructor
+  // comment. A genuinely new pending for the same id — same value
+  // or different — is never suppressed by its own card's tombstone.
+  // Burst-7 helpers: rating tombstones are sets (see the
+  // constructor), so a stored or recorded tombstone value is
+  // normalised to a Set before it is consulted — a legacy scalar
+  // reads as a one-element set. _recipeIdSet is the loaded list's
+  // ids, or null before the list loads (no pruning until then).
+  _ratingTombstoneSet(value) {
+    if (value === undefined || value === null) return new Set();
+    const values = value instanceof Set ? [...value] : Array.isArray(value) ? value : [value];
+    const out = new Set();
+    for (const v of values) {
+      // Burst-8: asRatingValue, like the sanitize functions — a
+      // stored value must be an integer in 0–5 (or an integer
+      // literal string). Number(null) === 0 used to read a corrupt
+      // null as a 0 guard here too.
+      const n = asRatingValue(v);
+      if (n !== undefined) out.add(n);
+    }
+    return out;
+  }
+
+  _addRatingTombstone(map, id, value) {
+    // Burst-8: asRatingValue — only an integer rating in 0–5 (or
+    // an integer literal string) joins a set.
+    const n = asRatingValue(value);
+    if (n === undefined) return;
+    let set = map.get(id);
+    if (!set) {
+      set = new Set();
+      map.set(id, set);
+    }
+    set.add(n);
+  }
+
+  // -- burst-8 provenance (see the constructor comment) ------------------
+  //
+  // A tombstone generation counts landings of one id+value as this
+  // instance observed them: 0 means "never seen in the store",
+  // 1 the first landing, 2 a re-landing after the value left the
+  // store, and so on. An entry's generation is the generation in
+  // force when the entry was created (by a local tap/typing) or
+  // restored (from the store). The entry is stale exactly when
+  // its generation is behind the tombstone's: the value was saved
+  // after the entry was made.
+
+  _ratingTombstoneGen(id, rating) {
+    const perId = this._tombstoneGenRatings.get(id);
+    return perId ? perId.get(rating) || 0 : 0;
+  }
+
+  _noteTombstoneGen(id, draft) {
+    const perId = this._tombstoneGenNotes.get(id);
+    return perId ? perId.get(draft) || 0 : 0;
+  }
+
+  // Read the tombstones in a freshly read store state and advance
+  // the generation of every value that transitioned absent ->
+  // present since this instance last observed the store (or last
+  // wrote it — see _setLastSeenFromWritten). A value present in
+  // both reads is the SAME landing, not a new one, so its
+  // generation does not move; a value that left the store is
+  // forgotten from last-seen, so a later return counts as a
+  // re-landing. Call BEFORE any merge/adoption decision that
+  // reads this state.
+  _observeStoredTombstones(prev) {
+    if (!prev) return;
+    const seenRatings = new Map();
+    if (prev.pendingRatingTombstones) {
+      for (const [id, raw] of Object.entries(prev.pendingRatingTombstones)) {
+        const set = this._ratingTombstoneSet(raw);
+        if (set.size === 0) continue;
+        seenRatings.set(id, set);
+        const last = this._lastSeenRatingTombstones.get(id);
+        for (const value of set) {
+          if (!last || !last.has(value)) {
+            let perId = this._tombstoneGenRatings.get(id);
+            if (!perId) {
+              perId = new Map();
+              this._tombstoneGenRatings.set(id, perId);
+            }
+            perId.set(value, (perId.get(value) || 0) + 1);
+          }
+        }
+      }
+    }
+    this._lastSeenRatingTombstones = seenRatings;
+    const seenNotes = new Map();
+    if (prev.noteDraftTombstones) {
+      for (const [id, draft] of Object.entries(prev.noteDraftTombstones)) {
+        if (typeof draft !== "string") continue;
+        seenNotes.set(id, draft);
+        if (this._lastSeenNoteTombstones.get(id) !== draft) {
+          let perId = this._tombstoneGenNotes.get(id);
+          if (!perId) {
+            perId = new Map();
+            this._tombstoneGenNotes.set(id, perId);
+          }
+          perId.set(draft, (perId.get(draft) || 0) + 1);
+        }
+      }
+    }
+    this._lastSeenNoteTombstones = seenNotes;
+  }
+
+  // The tombstone state a successful store write just left behind
+  // (the merged maps that were actually written). The next
+  // observation must diff against THIS, not against the pre-write
+  // read: the write itself evicted tombstones for live entries,
+  // and a value that returns to the store afterwards is a
+  // re-landing, not a continuation.
+  _setLastSeenFromWritten(writtenNoteTombstones, writtenRatingTombstones) {
+    const ratings = new Map();
+    if (writtenRatingTombstones) {
+      for (const [id, raw] of Object.entries(writtenRatingTombstones)) {
+        const set = this._ratingTombstoneSet(raw);
+        if (set.size > 0) ratings.set(id, set);
+      }
+    }
+    this._lastSeenRatingTombstones = ratings;
+    const notes = new Map();
+    if (writtenNoteTombstones) {
+      for (const [id, draft] of Object.entries(writtenNoteTombstones)) {
+        if (typeof draft === "string") notes.set(id, draft);
+      }
+    }
+    this._lastSeenNoteTombstones = notes;
+  }
+
+  // A live entry created by a LOCAL action (a tap, or typing):
+  // its generation is the tombstone generation in force right
+  // now, and it carries a one-shot fresh mark (see the
+  // constructor comment) for the D7-3 case — a tap this card has
+  // never learned the tombstone for.
+  _recordLocalRatingEntry(id, rating) {
+    this._entryGenRatings.set(id, { value: rating, gen: this._ratingTombstoneGen(id, rating) });
+    this._freshPendingRatings.set(id, rating);
+  }
+
+  _recordLocalNoteEntry(id, draft) {
+    this._entryGenNotes.set(id, { value: draft, gen: this._noteTombstoneGen(id, draft) });
+    this._freshNoteDrafts.set(id, draft);
+  }
+
+  // A live entry restored from the store: same generation stamp,
+  // but NO fresh mark — a restored entry predates the store state
+  // it came from, so a tombstone landing after the restore must
+  // still heal it.
+  _recordRestoredRatingEntry(id, rating) {
+    this._entryGenRatings.set(id, { value: rating, gen: this._ratingTombstoneGen(id, rating) });
+    if (this._freshPendingRatings.get(id) === rating) this._freshPendingRatings.delete(id);
+  }
+
+  _recordRestoredNoteEntry(id, draft) {
+    this._entryGenNotes.set(id, { value: draft, gen: this._noteTombstoneGen(id, draft) });
+    if (this._freshNoteDrafts.get(id) === draft) this._freshNoteDrafts.delete(id);
+  }
+
+  _clearRatingEntryProvenance(id) {
+    this._entryGenRatings.delete(id);
+    this._freshPendingRatings.delete(id);
+  }
+
+  _clearNoteEntryProvenance(id) {
+    this._entryGenNotes.delete(id);
+    this._freshNoteDrafts.delete(id);
+  }
+
+  // The drop rule's protection, for one live entry facing a stored
+  // tombstone for its exact value: fresh (a local action since the
+  // card's last store read — consumed by the merge, see
+  // _takeFresh*Entry below), or created at/after the tombstone's
+  // latest landing. An entry with no provenance record at all was
+  // not created through a tracked path, so it is NOT protected —
+  // treating it as genuine would re-introduce the guard's shield
+  // for exactly the entries provenance exists to catch.
+  _isProtectedRatingEntry(id, rating) {
+    if (this._freshPendingRatings.get(id) === rating) return true;
+    const rec = this._entryGenRatings.get(id);
+    return rec !== undefined && rec.value === rating && rec.gen >= this._ratingTombstoneGen(id, rating);
+  }
+
+  _isProtectedNoteEntry(id, draft) {
+    if (this._freshNoteDrafts.get(id) === draft) return true;
+    const rec = this._entryGenNotes.get(id);
+    return rec !== undefined && rec.value === draft && rec.gen >= this._noteTombstoneGen(id, draft);
+  }
+
+  // Consume the fresh mark for one live entry: the first merge
+  // after the local action has now read the store, so the
+  // "newer than the card's knowledge" bridge is spent whether or
+  // not a tombstone confronted the entry in this merge. Returns
+  // whether the entry was fresh. The generation rule governs from
+  // the next merge on.
+  _takeFreshRatingEntry(id, rating) {
+    if (this._freshPendingRatings.get(id) === rating) {
+      this._freshPendingRatings.delete(id);
+      return true;
+    }
+    return false;
+  }
+
+  _takeFreshNoteEntry(id, draft) {
+    if (this._freshNoteDrafts.get(id) === draft) {
+      this._freshNoteDrafts.delete(id);
+      return true;
+    }
+    return false;
+  }
+
+  _recipeIdSet() {
+    if (!this._recipes || this._recipes.length === 0) return null;
+    return new Set(this._recipes.map((recipe) => recipe.id));
+  }
+
+  _mergedNoteDraftsForSession(prev) {
+    const stored = (prev && prev.noteDrafts) || {};
+    const merged = { ...stored };
+    for (const id of Object.keys(merged)) {
+      const storedTombstone = prev && prev.noteDraftTombstones ? prev.noteDraftTombstones[id] : undefined;
+      const memoryTombstone = this._noteDraftTombstones.get(id);
+      if (
+        (storedTombstone !== undefined && merged[id] === storedTombstone) ||
+        (memoryTombstone !== undefined && merged[id] === memoryTombstone)
+      ) {
+        delete merged[id];
+      }
+    }
+    for (const [id, draft] of [...this._noteDrafts]) {
+      // Burst-8: protection is decided with the fresh mark still
+      // in place, then the mark is spent by this merge (see
+      // _takeFreshNoteEntry) — the first merge after the local
+      // action has now read the store.
+      const protectedEntry = this._isProtectedNoteEntry(id, draft);
+      this._takeFreshNoteEntry(id, draft);
+      const storedTombstone = prev && prev.noteDraftTombstones ? prev.noteDraftTombstones[id] : undefined;
+      if (
+        storedTombstone !== undefined &&
+        draft === storedTombstone &&
+        // Burst-8 (provenance): a draft is protected only when it
+        // was created by a local action at/after the tombstone's
+        // latest landing, or is fresh from a local action since
+        // the card's last store read. The old known-map check
+        // ("already knew this value") shielded restored entries
+        // and entries made stale after creation.
+        !protectedEntry
+      ) {
+        // Stale holder: this draft predates the tombstone's latest
+        // landing. Drop it from memory so this write — and every
+        // later one — can never re-publish it.
+        this._noteDrafts.delete(id);
+        this._clearNoteEntryProvenance(id);
+        if (this._selected && this._selected.id === id) {
+          // Burst-7 (verifier item b): the open recipe's editor
+          // still shows this draft — _saveSession re-renders
+          // after the write so the ghost text is not left
+          // editable (typing in it would re-adopt the stale text
+          // as a new live draft).
+          this._healedOpenNoteDraft = true;
+          if (this._noteStatus && this._noteStatus.retry === "retry-note") {
+            this._noteStatus = null;
+          }
+        }
+        continue;
+      }
+      merged[id] = draft;
+    }
+    return Object.keys(merged).length > 0 ? merged : undefined;
+  }
+
+  _mergedPendingRatingsForSession(prev) {
+    const stored = (prev && prev.pendingRatings) || {};
+    const merged = { ...stored };
+    for (const id of Object.keys(merged)) {
+      const storedTombstones = this._ratingTombstoneSet(
+        prev && prev.pendingRatingTombstones ? prev.pendingRatingTombstones[id] : undefined
+      );
+      const memoryTombstones = this._pendingRatingTombstones.get(id);
+      if (
+        storedTombstones.has(merged[id]) ||
+        (memoryTombstones !== undefined && memoryTombstones.has(merged[id]))
+      ) {
+        delete merged[id];
+      }
+    }
+    for (const [id, rating] of [...this._pendingRatings]) {
+      // Burst-8: protection is decided with the fresh mark still
+      // in place, then the mark is spent by this merge (see
+      // _takeFreshRatingEntry).
+      const protectedEntry = this._isProtectedRatingEntry(id, rating);
+      this._takeFreshRatingEntry(id, rating);
+      const storedTombstones = this._ratingTombstoneSet(
+        prev && prev.pendingRatingTombstones ? prev.pendingRatingTombstones[id] : undefined
+      );
+      if (
+        storedTombstones.has(rating) &&
+        // Burst-8 (provenance): a pending rating is protected only
+        // when it was created by a local tap at/after the
+        // tombstone's latest landing, or is fresh from a local tap
+        // since the card's last store read. The old known-map
+        // check shielded restored entries and entries made stale
+        // after creation.
+        !protectedEntry
+      ) {
+        // Stale holder: this pending predates the tombstone's
+        // latest landing. Drop it from memory so this write — and
+        // every later one — can never re-publish it.
+        this._pendingRatings.delete(id);
+        this._clearRatingEntryProvenance(id);
+        if (this._selected && this._selected.id === id) {
+          this._pendingRating = null;
+          if (this._ratingStatus && this._ratingStatus.retry === "retry-rating") {
+            this._ratingStatus = null;
+          }
+        }
+        continue;
+      }
+      merged[id] = rating;
+    }
+    return Object.keys(merged).length > 0 ? merged : undefined;
+  }
+
+  // The tombstones a store write carries: this instance's recorded
+  // ones plus the stored ones re-carried, so a tombstone PERSISTS
+  // in the store (burst-6 — burst-5 carried the recorded ones
+  // only, which dropped a stored copy on the next write and left
+  // the "at most one write cycle" lifetime, off by one as
+  // measured: an adopter's first write carried the tombstone and
+  // its second dropped it). A tombstone leaves the store only
+  // through the live-entry exclusion below (a genuine re-pend for
+  // the same id+value) or pruning when its id leaves the recipe
+  // list — never through an ordinary write. Tombstones for ids no
+  // longer in the loaded list are pruned here too (burst-7, F4),
+  // so a write after a recipe leaves the list cannot re-carry its
+  // tombstone; before the list loads (_recipes empty) nothing is
+  // pruned. NOTES (burst-7, F3a): on a conflict for one id the
+  // RECORDED value wins — the newest save's tombstone replaces
+  // the stored one, so the guard tracks the latest saved value
+  // (the tradeoff: a stale holder of an older saved value loses
+  // its guard). RATINGS (burst-7, F3b): there is no conflict —
+  // the carried set is the UNION of recorded and stored values,
+  // so every saved value keeps its guard. The live-entry
+  // exclusion is value-scoped, not id-scoped: a tombstone is left
+  // out only when a live entry for the same id has the SAME value
+  // — the genuine re-pend that must reach the store as a pending,
+  // not a tombstone, so a fresh card restores it. A live entry
+  // with a DIFFERENT value (another card's newer pending) leaves
+  // the tombstone carried, so the tombstone survives alongside
+  // it. Returns undefined when empty, like the map helpers.
+  _mergedNoteDraftTombstonesForSession(prev) {
+    const merged = {};
+    const knownIds = this._recipeIdSet();
+    if (prev && prev.noteDraftTombstones) {
+      for (const [id, draft] of Object.entries(prev.noteDraftTombstones)) {
+        if (knownIds && !knownIds.has(id)) continue;
+        merged[id] = draft;
+      }
+    }
+    // Burst-7 (F3a): recorded wins over stored — the newest save's
+    // tombstone is the guard that lands, not the stale stored one.
+    for (const [id, draft] of this._noteDraftTombstones) {
+      if (knownIds && !knownIds.has(id)) continue;
+      merged[id] = draft;
+    }
+    for (const [id, draft] of this._noteDrafts) {
+      if (merged[id] === draft) delete merged[id];
+    }
+    return Object.keys(merged).length > 0 ? merged : undefined;
+  }
+
+  _mergedPendingRatingTombstonesForSession(prev) {
+    const merged = {}; // id -> Set of guarded values
+    const knownIds = this._recipeIdSet();
+    const union = (id, values) => {
+      if (knownIds && !knownIds.has(id)) return;
+      let set = merged[id];
+      if (!set) {
+        set = new Set();
+        merged[id] = set;
+      }
+      for (const value of this._ratingTombstoneSet(values)) set.add(value);
+    };
+    if (prev && prev.pendingRatingTombstones) {
+      for (const [id, values] of Object.entries(prev.pendingRatingTombstones)) union(id, values);
+    }
+    // Burst-7 (F3b): union, not stored-wins — a recorded value
+    // joins the stored set instead of losing the slot to it, so
+    // each saved value keeps its own guard.
+    for (const [id, values] of this._pendingRatingTombstones) union(id, values);
+    for (const [id, rating] of this._pendingRatings) {
+      const set = merged[id];
+      if (set && set.has(rating)) {
+        set.delete(rating);
+        if (set.size === 0) delete merged[id];
+      }
+    }
+    const out = {};
+    for (const [id, set] of Object.entries(merged)) {
+      if (set.size > 0) out[id] = [...set].sort((a, b) => a - b);
+    }
+    return Object.keys(out).length > 0 ? out : undefined;
+  }
+
+  // Burst-5: bookkeeping for a store write that SUCCEEDED — call
+  // only after setItem returns without throwing. The store now
+  // holds exactly the merged maps, so _lastStored tracks them (the
+  // tombstone value for a later delete comes from here). And a
+  // tombstone the write carried has done its job — the stale entry
+  // is gone from the store — so it is consumed from memory. A
+  // tombstone the write did NOT carry (an id with a live entry, or
+  // a stored-only tombstone) is not consumed. A failed write calls
+  // nothing here: nothing was stored, nothing is consumed.
+  // Burst-7: rating tombstones are sets, so consumption is
+  // per-value — only the carried values leave the recorded set,
+  // and the id leaves the map only when its set empties. There is
+  // no superseded-consumption for ratings any more: the union
+  // merge carries every recorded value, so a recorded value can
+  // no longer lose its slot to a different stored value.
+  // The known-tombstone maps are never consumed here: they are the
+  // drop rule's protection, not the carried set.
+  _noteStoreWriteSucceeded(mergedNoteDrafts, mergedPendingRatings, writtenNoteTombstones, writtenPendingTombstones) {
+    this._lastStoredNoteDrafts = new Map(Object.entries(mergedNoteDrafts || {}));
+    this._lastStoredPendingRatings = new Map(Object.entries(mergedPendingRatings || {}));
+    if (writtenNoteTombstones) {
+      for (const [id, draft] of Object.entries(writtenNoteTombstones)) {
+        if (this._noteDraftTombstones.has(id)) this._noteDraftTombstones.delete(id);
+      }
+    }
+    if (writtenPendingTombstones) {
+      for (const [id, values] of Object.entries(writtenPendingTombstones)) {
+        const recorded = this._pendingRatingTombstones.get(id);
+        if (!recorded) continue;
+        for (const value of this._ratingTombstoneSet(values)) recorded.delete(value);
+        if (recorded.size === 0) this._pendingRatingTombstones.delete(id);
+      }
+    }
+    // Burst-8: the store now holds exactly the written tombstones
+    // — the next observation diffs against these, so a value this
+    // write evicted (a genuine re-pend's tombstone) counts as a
+    // fresh landing if it ever returns.
+    this._setLastSeenFromWritten(writtenNoteTombstones, writtenPendingTombstones);
+  }
+
+  // B3: bring back the drafts and pending ratings the session
+  // store kept — the typed note and the intended rating survive a
+  // real view re-open (a fresh card instance), not just the same
+  // instance's memory. Runs on every load, before the session
+  // re-opens its recipe. Entries for recipes no longer in the
+  // list are pruned, so the store never accumulates stale ids —
+  // and the pruning is written back to the store (burst-3):
+  // pruning in memory only left the stale ids in the store, where
+  // they would resurrect if the id ever returned to the list.
+  // The write-back is surgical — only the pruned keys are removed
+  // from the stored state — because no recipe is open yet at this
+  // point, so a full _saveSession() here would write openId null
+  // and wipe the re-open the session is about to do.
+  _restorePendingSaves() {
+    const state = this._readSavedSession();
+    if (!state) return;
+    // Burst-5: adopt the stored tombstones into memory first, so
+    // this instance's later merges keep guarding them — and so a
+    // stored entry that equals a tombstone is never restored into
+    // memory at all (it is a deleted entry the store still holds,
+    // e.g. because the cleaning write failed or a stale card
+    // re-published it). Such an entry is cleaned from the store by
+    // the write-back below, the same surgical write that prunes
+    // unknown ids.
+    // Burst-6: adoption goes into the KNOWN maps, not the recorded
+    // ones — an adopted tombstone is already in the store, so the
+    // stored check in the merge covers the skip and the re-carry
+    // covers persistence; the recorded maps stay for own-save
+    // tombstones only. The known maps are the drop rule's
+    // protection (see _mergedPendingRatingsForSession): a live
+    // entry created after this adoption is a genuine re-pend.
+    // Burst-7 (F1): adoption ALSO deletes a stale memory entry
+    // for the same id+value — a same-instance re-open restores
+    // nothing into memory (the entry is already there from the
+    // previous mount), so without the delete the adoption shields
+    // it and the drop rule is permanently disabled for that id.
+    // Burst-8: the delete is PROVENANCE-gated, not alreadyKnown-
+    // gated. The old skip ("this instance already knew that exact
+    // value, so the memory entry was created after learning it")
+    // shielded restored entries and entries made stale after
+    // creation (V7-3b, D7-1/D7-2): knowing a value says nothing
+    // about when the entry was made. The delete now fires unless
+    // the entry's provenance protects it — created by a local
+    // action at/after the tombstone's latest landing, or fresh
+    // from a local action since the card's last store read.
+    // Burst-7 (F4): tombstones for ids that left the recipe list
+    // are never adopted — they are pruned from the written state
+    // below, unconditionally, so a tombstone-only dead id cannot
+    // linger in the store forever.
+    const known = new Set(this._recipes.map((recipe) => recipe.id));
+    // Burst-8: observe this store state's tombstone landings
+    // BEFORE deciding any adoption delete — a re-landing since
+    // this instance last saw the store advances the generation
+    // the entries are judged against.
+    this._observeStoredTombstones(state);
+    if (state.noteDraftTombstones) {
+      for (const [id, draft] of Object.entries(state.noteDraftTombstones)) {
+        if (!known.has(id)) continue;
+        this._knownNoteDraftTombstones.set(id, draft);
+        if (this._noteDrafts.get(id) === draft && !this._isProtectedNoteEntry(id, draft)) {
+          this._noteDrafts.delete(id);
+          this._clearNoteEntryProvenance(id);
+          if (
+            this._selected &&
+            this._selected.id === id &&
+            this._noteStatus &&
+            this._noteStatus.retry === "retry-note"
+          ) {
+            this._noteStatus = null;
+          }
+        }
+      }
+    }
+    if (state.pendingRatingTombstones) {
+      for (const [id, raw] of Object.entries(state.pendingRatingTombstones)) {
+        if (!known.has(id)) continue;
+        for (const rating of this._ratingTombstoneSet(raw)) {
+          this._addRatingTombstone(this._knownPendingRatingTombstones, id, rating);
+          if (this._pendingRatings.get(id) === rating && !this._isProtectedRatingEntry(id, rating)) {
+            this._pendingRatings.delete(id);
+            this._clearRatingEntryProvenance(id);
+            if (this._selected && this._selected.id === id) {
+              this._pendingRating = null;
+              if (this._ratingStatus && this._ratingStatus.retry === "retry-rating") {
+                this._ratingStatus = null;
+              }
+            }
+          }
+        }
+      }
+    }
+    let writeBack = false;
+    if (state.noteDrafts) {
+      for (const [id, draft] of Object.entries(state.noteDrafts)) {
+        if (state.noteDraftTombstones && state.noteDraftTombstones[id] === draft) {
+          // Tombstoned: a deleted draft the store still holds.
+          // Skip it in memory and clean it from the store below.
+          writeBack = true;
+          continue;
+        }
+        this._noteDrafts.set(id, draft);
+        // Burst-8: a restored entry carries no fresh mark — it
+        // predates this store state, so a later tombstone landing
+        // must still heal it.
+        this._recordRestoredNoteEntry(id, draft);
+      }
+    }
+    if (state.pendingRatings) {
+      for (const [id, rating] of Object.entries(state.pendingRatings)) {
+        if (
+          state.pendingRatingTombstones &&
+          this._ratingTombstoneSet(state.pendingRatingTombstones[id]).has(rating)
+        ) {
+          writeBack = true;
+          continue;
+        }
+        this._pendingRatings.set(id, rating);
+        // Burst-8: restored, not locally created — see above.
+        this._recordRestoredRatingEntry(id, rating);
+      }
+    }
+    let pruned = false;
+    for (const id of [...this._noteDrafts.keys()]) {
+      if (!known.has(id)) {
+        this._noteDrafts.delete(id);
+        pruned = true;
+      }
+    }
+    for (const id of [...this._pendingRatings.keys()]) {
+      if (!known.has(id)) {
+        this._pendingRatings.delete(id);
+        pruned = true;
+      }
+    }
+    // Burst-7 (F4): a pruned id's tombstone is useless — the id is
+    // gone from the list — so it leaves the written state with the
+    // entry. This runs UNCONDITIONALLY, not only when a memory
+    // entry was pruned: a tombstone-only dead id (no memory entry
+    // to delete) never set `pruned` under burst-6, so its tombstone
+    // survived every load and write. Pruning one sets writeBack,
+    // so the store is actually rewritten. (Memory keeps its copy:
+    // harmless, it can never match a stored entry for an unknown
+    // id, and a failed write here consumes nothing.)
+    if (state.noteDraftTombstones) {
+      for (const id of Object.keys(state.noteDraftTombstones)) {
+        if (!known.has(id)) {
+          delete state.noteDraftTombstones[id];
+          writeBack = true;
+        }
+      }
+      if (Object.keys(state.noteDraftTombstones).length === 0) delete state.noteDraftTombstones;
+    }
+    if (state.pendingRatingTombstones) {
+      for (const id of Object.keys(state.pendingRatingTombstones)) {
+        if (!known.has(id)) {
+          delete state.pendingRatingTombstones[id];
+          writeBack = true;
+        }
+      }
+      if (Object.keys(state.pendingRatingTombstones).length === 0) delete state.pendingRatingTombstones;
+    }
+    if (pruned || writeBack) {
+      if (state.noteDrafts) {
+        for (const id of Object.keys(state.noteDrafts)) {
+          if (!this._noteDrafts.has(id)) delete state.noteDrafts[id];
+        }
+        if (Object.keys(state.noteDrafts).length === 0) delete state.noteDrafts;
+      }
+      if (state.pendingRatings) {
+        for (const id of Object.keys(state.pendingRatings)) {
+          if (!this._pendingRatings.has(id)) delete state.pendingRatings[id];
+        }
+        if (Object.keys(state.pendingRatings).length === 0) delete state.pendingRatings;
+      }
+      if (typeof sessionStorage !== "undefined") {
+        try {
+          sessionStorage.setItem(RECIPE_SESSION_KEY, serializeRecipeSession(state));
+          // The write succeeded: the store now holds exactly the
+          // written maps, so _lastStored tracks them.
+          this._lastStoredNoteDrafts = new Map(Object.entries(state.noteDrafts || {}));
+          this._lastStoredPendingRatings = new Map(Object.entries(state.pendingRatings || {}));
+          // Burst-8: the written tombstones are the new last-seen
+          // baseline (a pruned dead id's tombstone is gone, so its
+          // later return would count as a fresh landing).
+          this._setLastSeenFromWritten(state.noteDraftTombstones, state.pendingRatingTombstones);
+        } catch (_err) {
+          // Storage full or blocked: the in-memory prune already
+          // stands, so the view still works — the store just keeps
+          // the stale ids until a later write. Never throw from
+          // a cosmetic feature.
+        }
+      }
+    }
+    // The scalar mirrors the open recipe's entry (or nothing, when
+    // no recipe is open yet — _openRecipe syncs it on open).
+    this._pendingRating =
+      this._selected && this._pendingRatings.has(this._selected.id)
+        ? this._pendingRatings.get(this._selected.id)
+        : null;
+  }
+
   // Save the open recipe + the current step + the current scroll
   // into its own bucket (list or detail), keeping the other bucket's
   // saved value. The step is 1-based, updated on every step change,
@@ -3741,6 +4883,11 @@ class AnyListRecipeViewCard extends HTMLElement {
   _saveSession() {
     if (typeof sessionStorage === "undefined" || typeof window === "undefined") return;
     const prev = this._readSavedSession() || { openId: null, step: null, listScrollY: 0, detailScrollY: 0, query: "", collectionId: "", sort: "name" };
+    // Burst-8: observe this store state's tombstone landings
+    // BEFORE the merges below decide anything — a re-landing
+    // since this instance last saw the store advances the
+    // generation the live entries are judged against.
+    this._observeStoredTombstones(prev);
     const scrollY = sanitizeRecipeScroll(window.scrollY);
     const step = this._selected
       ? this._currentStepIndex(this._selected.id, this._navigableSteps(this._selected).length) + 1
@@ -3753,12 +4900,84 @@ class AnyListRecipeViewCard extends HTMLElement {
       query: this._query || "",
       collectionId: this._collectionId || "",
       sort: this._sort || "name",
+      // B3: the kept drafts and pending ratings ride in the same
+      // session, so they survive a real view re-open. Omitted
+      // when empty, so a session with nothing pending writes
+      // exactly what it wrote before.
+      // Burst-4 (F3): merged, not replaced — the stored maps are
+      // unioned with this instance's maps, in-memory winning per
+      // id, instead of the store being overwritten with only what
+      // this instance knows. Two live cards share one store: a
+      // wholesale replace by one card (e.g. the disconnect flush)
+      // used to clobber a draft or pending rating another live
+      // card had written since this one last read. Under union
+      // semantics a deletion NEVER propagates through _saveSession
+      // or _clearRecipeSession, even when the deletion succeeded:
+      // an absent-in-memory id cannot be told apart from an id
+      // this instance never knew about, so the merge re-unions
+      // the stored entry on every write — a successful retry
+      // resurrected its own pending rating, and a saved note's
+      // draft never left the store. Burst-5 closes that with
+      // value-scoped tombstones (see _mergedNoteDraftsForSession
+      // and the constructor): a successful save records the
+      // deleted entry's last-written value as a tombstone, and
+      // the merge skips a stored entry only when it equals that
+      // value — another card's different value for the same id
+      // still survives. Burst-6: tombstones PERSIST in the store
+      // (every write re-carries them; a tombstone leaves only on
+      // a genuine re-pend of the same id+value or pruning), and
+      // the merge HEALS a stale holder — a live entry equalling
+      // a stored tombstone on a card that never learned it is
+      // deleted from memory with its retry affordance cleared,
+      // so it can never be re-published. A tombstone is consumed
+      // only after a store write that carried it succeeds; a
+      // failed setItem consumes nothing. Burst-7: the burst-6
+      // residual is corrected, not carried forward. For RATINGS
+      // there is no residual left: tombstones are set-valued, so
+      // every saved value keeps its own guard and a stale holder
+      // of ANY saved value is healed on its next write or reload
+      // — it can never re-publish. (The burst-6 "re-publish once"
+      // was wrong in the first place: it recurred after every
+      // later save of the loser's value, because no tombstone for
+      // that value could ever land under stored-wins.) For NOTES
+      // one residual remains, stated not claimed away: the guard
+      // tracks only the latest saved value (recorded wins), so a
+      // stale holder of an OLDER saved note value loses its guard
+      // when a newer save overwrites the slot, and can re-publish
+      // that older value until it is saved again. Burst-8 closes
+      // the second half of that sentence: a genuine re-pend
+      // created while its tombstone was still in flight is now
+      // protected by provenance (the entry's generation, plus the
+      // one-shot fresh mark for a tap the card never learned the
+      // tombstone for) — only the older-value notes residual
+      // remains, and it needs a set-valued note tombstone, which
+      // for notes is unbounded.
+      noteDrafts: this._mergedNoteDraftsForSession(prev),
+      pendingRatings: this._mergedPendingRatingsForSession(prev),
+      noteDraftTombstones: this._mergedNoteDraftTombstonesForSession(prev),
+      pendingRatingTombstones: this._mergedPendingRatingTombstonesForSession(prev),
     };
     try {
       sessionStorage.setItem(RECIPE_SESSION_KEY, serializeRecipeSession(state));
+      this._noteStoreWriteSucceeded(
+        state.noteDrafts,
+        state.pendingRatings,
+        state.noteDraftTombstones,
+        state.pendingRatingTombstones
+      );
     } catch (_err) {
       // Storage full or blocked: the view still works, it just is
       // not remembered. Never throw from a cosmetic feature.
+    }
+    // Burst-7 (verifier item b): a merge that healed the open
+    // recipe's note draft leaves the editor showing the stale
+    // text — re-render so the cook sees the saved note, not a
+    // ghost they could type into and re-adopt as a new draft.
+    // The flag is set only by that one drop, so this renders at
+    // most once per heal, never on an ordinary write.
+    if (this._healedOpenNoteDraft) {
+      this._healedOpenNoteDraft = false;
+      this._render();
     }
   }
 
@@ -4712,50 +5931,288 @@ class AnyListRecipeViewCard extends HTMLElement {
     };
   }
 
+  // Settle every pending save backoff: clear its timer AND resolve
+  // its sleep as cancelled, so the awaiting save returns instead of
+  // hanging on a promise that can never settle (F1). Each in-flight
+  // save carries its own handle, so overlapping saves are all
+  // settled — clearing one shared timer could only ever cancel the
+  // latest (F2). Called from disconnectedCallback; the caller then
+  // treats "cancelled" as an abandoned save, not a failure — the
+  // draft / pending rating is kept and no status is shown.
+  _cancelSaveBackoffs() {
+    for (const backoff of this._saveBackoffs) {
+      clearTimeout(backoff.timer);
+      backoff.resolve();
+    }
+    this._saveBackoffs.clear();
+  }
+
+  // Bounded retry for an idempotent update_recipe save (cop-out
+  // audit C2): the same note or rating re-sent with backoff, up to
+  // SAVE_RETRY_MAX_ATTEMPTS retries. callFn makes one attempt and
+  // returns the service response; the attempt counts as confirmed
+  // only when the response carries a usable server recipe (the
+  // R-IMPL-39 honest-save rule — a non-throwing response with no
+  // usable recipe is NOT a confirmed save). A throw and an
+  // unconfirmed response are both retried: the save is idempotent,
+  // so re-sending the same value cannot double-apply it. Returns
+  // { ok: true } once confirmed, else { ok: false, reason } where
+  // reason is "threw", "unconfirmed" or "cancelled" (the view
+  // closed mid-backoff — the caller keeps the wording for each)
+  // or "superseded" (a newer save for the same recipe and kind
+  // has started — this save stops, makes no further attempt and
+  // applies nothing; the newer save owns the outcome).
+  // The draft / pending rating is untouched by this helper either
+  // way, so nothing typed is lost.
+  // B1: the disconnect flag is checked before every attempt, before
+  // scheduling every backoff, and after every attempt lands — a
+  // call already inside its service await when the view closes
+  // comes back "cancelled" instead of firing a retry or applying
+  // its result on the detached card. (Settling the backoff sleeps
+  // alone could not cover that window: nothing guards the loop
+  // iteration after the await returns.) targetRecipeId is the
+  // recipe the save is for — confirmation is checked against it,
+  // not against whatever recipe happens to be open now (B4).
+  // Burst-3 (P7d): saveCtx is { kind: "note" | "rating", seq } —
+  // the sequence number this save took when it started. Once a
+  // NEWER save for the same recipe and kind has started, this
+  // save is superseded: it makes no further attempt and never
+  // applies its result, so an older attempt landing after the
+  // newer save confirmed cannot clobber the newer text or rating
+  // back. Returns reason "superseded" for that case; the caller
+  // treats it like "cancelled" (no status, nothing kept or lost
+  // beyond what the newer save already owns). Burst-4 (D1): the
+  // check also runs after a backoff sleep resolves, so a save
+  // superseded DURING its backoff never dispatches on waking.
+  _saveSuperseded(kind, targetRecipeId, seq) {
+    if (seq === undefined || seq === null) return false;
+    const latest =
+      kind === "rating" ? this._ratingSaveLatest : this._noteSaveLatest;
+    const current = latest.get(targetRecipeId);
+    return current !== undefined && current > seq;
+  }
+
+  async _saveWithRetry(callFn, targetRecipeId, saveCtx) {
+    const kind = (saveCtx && saveCtx.kind) || "note";
+    const seq = saveCtx && saveCtx.seq;
+    let reason = "unconfirmed";
+    for (let attempt = 0; attempt <= SAVE_RETRY_MAX_ATTEMPTS; attempt++) {
+      if (this._saveDisconnected) return { ok: false, reason: "cancelled" };
+      if (this._saveSuperseded(kind, targetRecipeId, seq)) return { ok: false, reason: "superseded" };
+      if (attempt > 0) {
+        const delays = this._saveRetryDelays || SAVE_RETRY_DELAYS_MS;
+        const delay =
+          delays[attempt - 1] !== undefined
+            ? delays[attempt - 1]
+            : delays[delays.length - 1];
+        // One backoff handle per save: the sleep carries its own
+        // timer and resolver, so disconnect can settle THIS save
+        // without touching any other save's backoff (F1, F2).
+        const cancelled = await new Promise((resolve) => {
+          const backoff = {
+            timer: null,
+            resolve: () => resolve(true),
+          };
+          backoff.timer = setTimeout(() => {
+            this._saveBackoffs.delete(backoff);
+            resolve(false);
+          }, delay);
+          if (
+            backoff.timer &&
+            typeof backoff.timer.unref === "function"
+          ) {
+            backoff.timer.unref();
+          }
+          this._saveBackoffs.add(backoff);
+        });
+        if (cancelled) return { ok: false, reason: "cancelled" };
+        if (this._saveDisconnected) return { ok: false, reason: "cancelled" };
+        // Burst-4 (D1): a save superseded DURING its backoff sleep
+        // must not dispatch when it wakes — the loop-top check ran
+        // before the sleep, and the post-attempt checks run after
+        // the next attempt, so without this check the stale attempt
+        // fires and its landing can clobber the newer save.
+        if (this._saveSuperseded(kind, targetRecipeId, seq)) return { ok: false, reason: "superseded" };
+      }
+      try {
+        const result = await callFn();
+        if (this._saveDisconnected) return { ok: false, reason: "cancelled" };
+        if (this._saveSuperseded(kind, targetRecipeId, seq)) return { ok: false, reason: "superseded" };
+        if (this._applyUpdatedRecipe(result, targetRecipeId)) return { ok: true, reason: null };
+        reason = "unconfirmed";
+      } catch (_err) {
+        if (this._saveDisconnected) return { ok: false, reason: "cancelled" };
+        if (this._saveSuperseded(kind, targetRecipeId, seq)) return { ok: false, reason: "superseded" };
+        reason = "threw";
+      }
+    }
+    return { ok: false, reason };
+  }
+
   // Save the note draft: update_recipe with recipe_id + note only.
   // The action returns the updated recipe, so the card's copy is
   // refreshed from the server rather than assumed. On failure the
   // draft stays, the typed note is not lost, and the status says so.
   async _saveNote() {
     const recipe = this._selected;
-    if (!recipe || this._savingNote) return;
-    const draft = this._noteDrafts.has(recipe.id)
-      ? this._noteDrafts.get(recipe.id)
-      : recipe.note;
-    const note = asTrimmed(draft);
+    if (!recipe) return;
+    const currentDraft = () =>
+      this._noteDrafts.has(recipe.id)
+        ? this._noteDrafts.get(recipe.id)
+        : recipe.note;
+    const note = asTrimmed(currentDraft());
     if (note === asTrimmed(recipe.note)) return;
-    this._savingNote = true;
-    this._noteStatus = null;
-    this._render();
+    // Per-recipe busy (burst-3, burst-4 F5): a save for THIS recipe
+    // is already in flight when its id is in the set. A re-save of
+    // the SAME text the in-flight attempt already sent is a
+    // duplicate — blocked. A save of NEWER text is not: the
+    // in-flight attempt already sent the old text, so the newer
+    // save supersedes it (P7d) and the older attempt's landing is
+    // discarded by the sequence check in _saveWithRetry instead of
+    // clobbering the newer text. The comparison is against the
+    // last-sent text only: no await sits between the in-flight
+    // save's Set.add and its first callFn() invocation, so a
+    // "not yet sent" state cannot be observed while the id is in
+    // the set, and there is no separate not-yet-sent arm. (A save
+    // whose first attempt has not dispatched yet re-reads the
+    // draft on its next attempt (F3), so it already carries newer
+    // text — but that is the retry's behaviour, not this guard's.)
+    const sent = this._inFlightNoteText.get(recipe.id);
+    if (
+      this._savingNoteRecipeIds.has(recipe.id) &&
+      note === asTrimmed(sent)
+    ) {
+      return;
+    }
+    // The text of the most recent attempt: the retry re-reads the
+    // draft each time, so text typed during the backoff is sent
+    // instead of the stale first attempt (F3).
+    let sentNote = note;
+    const seq = ++this._saveSeq;
     try {
-      const result = await this._callAction("update_recipe", {
-        recipe_id: recipe.id,
-        note,
-      });
-      // R-IMPL-39 (honest save): "Note saved." only when the
-      // response carries a usable recipe. A non-throwing response
-      // with no usable recipe (the rig stub's update_recipe returns
-      // {}) is NOT a confirmed save — the draft is kept and the
-      // status says so, with a tappable retry.
-      const applied = this._applyUpdatedRecipe(result);
-      if (applied) {
-        this._noteDrafts.delete(recipe.id);
-        this._noteStatus = { text: "Note saved.", error: false };
+      // Burst-5 (F2): the flag-setting and the _render() live
+      // inside the try (see below) — a _render() throw before the
+      // try used to leave _savingNote true with no save in flight
+      // and no finally to re-derive it.
+      this._savingNote = true;
+      this._noteStatus = null;
+      this._render();
+      // Burst-4 (F4): the in-flight Set.add lives inside the try —
+      // before this, a _render() throw left the id in the set with
+      // no finally to clear it, and every later save for that
+      // recipe was blocked forever by the guard above. The finally
+      // below re-derives the flag from the set and renders again,
+      // so the throw now leaves no stuck flag. (The seq allocation
+      // above the try is a plain counter increment — it cannot
+      // throw — so it stays outside.)
+      this._noteSaveLatest.set(recipe.id, seq);
+      this._savingNoteRecipeIds.add(recipe.id);
+      // C2: the save retries itself with backoff before it admits
+      // failure — the tappable retry below is the manual fallback
+      // once the budget is spent, not the only path.
+      const { ok, reason } = await this._saveWithRetry(() => {
+        sentNote = asTrimmed(currentDraft());
+        this._inFlightNoteText.set(recipe.id, sentNote);
+        return this._callAction("update_recipe", {
+          recipe_id: recipe.id,
+          note: sentNote,
+        });
+      }, recipe.id, { kind: "note", seq });
+      // B4: the status lines belong to the recipe that was saved.
+      // If another recipe is open by now, no status is shown for
+      // it — the save is still confirmed (the list copy is
+      // refreshed) and the draft handling below is per recipe, so
+      // a status on the wrong detail and a dead retry never appear.
+      const stillOpen = this._selected && this._selected.id === recipe.id;
+      if (ok) {
+        // Delete the draft only if nothing newer was typed since
+        // the text that just saved — newer typing stays a draft
+        // with Save enabled, so it is never silently discarded (F3).
+        if (asTrimmed(currentDraft()) === sentNote) {
+          // Burst-5: record the tombstone BEFORE the finally's
+          // _saveSession merges — the value is what this card
+          // last wrote to the store for this id (an older
+          // debounced text), falling back to the text just saved
+          // when this card never wrote the id. Without it the
+          // merge re-unions the stored draft on every later
+          // write and the saved draft never leaves the store.
+          const storedDraft = this._lastStoredNoteDrafts.get(recipe.id);
+          this._noteDraftTombstones.set(
+            recipe.id,
+            storedDraft !== undefined ? storedDraft : sentNote
+          );
+          // Burst-6: the known map records the tombstone too, so
+          // the drop rule never mistakes a live entry this card
+          // creates afterwards (a genuine re-pend) for a stale one.
+          this._knownNoteDraftTombstones.set(
+            recipe.id,
+            storedDraft !== undefined ? storedDraft : sentNote
+          );
+          this._noteDrafts.delete(recipe.id);
+          // Burst-8: the entry is gone, so its provenance goes
+          // with it — a later draft for this id is stamped afresh.
+          this._clearNoteEntryProvenance(recipe.id);
+          if (stillOpen) this._noteStatus = { text: "Note saved.", error: false };
+        } else if (stillOpen) {
+          this._noteStatus = {
+            text: "Note saved — newer text is still unsaved.",
+            error: false,
+          };
+        }
+      } else if (reason === "cancelled") {
+        // The view closed mid-save: the save was abandoned, not
+        // failed. The draft is kept and persisted to the session
+        // store (see finally), so the fresh card on re-open shows
+        // the kept text with Save enabled — the cook does not have
+        // to retype it (B3). No status is shown on the detached
+        // card. (The burst's "the cook saves again when the view
+        // re-opens" was only true for the same instance: the draft
+        // lived in instance memory and a fresh card never saw it.)
+      } else if (reason === "superseded") {
+        // A newer save for this recipe has started (P7d): it owns
+        // the outcome — its own status and draft handling — so
+        // this save shows nothing, keeps nothing and retries
+        // nothing. The draft is untouched here: if the newer save
+        // already confirmed, it deleted the draft itself; if it
+        // is still in flight, the draft is its to settle.
+      } else if (reason === "threw") {
+        if (stillOpen) {
+          this._noteStatus = {
+            text: "Couldn't save the note — your text is still here, try again.",
+            error: true,
+            retry: "retry-note",
+          };
+        }
       } else {
-        this._noteStatus = {
-          text: "Couldn't save — tap to retry",
-          error: true,
-          retry: "retry-note",
-        };
+        // R-IMPL-39 (honest save): a non-throwing response with no
+        // usable recipe (the rig stub's update_recipe returns {}) is
+        // NOT a confirmed save — the draft is kept and the status
+        // says so, with a tappable retry.
+        if (stillOpen) {
+          this._noteStatus = {
+            text: "Couldn't save — tap to retry",
+            error: true,
+            retry: "retry-note",
+          };
+        }
       }
-    } catch (err) {
-      this._noteStatus = {
-        text: "Couldn't save the note — your text is still here, try again.",
-        error: true,
-        retry: "retry-note",
-      };
     } finally {
-      this._savingNote = false;
+      // Only the latest save for this recipe clears its id from
+      // the in-flight set (burst-3): an older save's finally must
+      // never clear a newer save's flag — the newer save is still
+      // in flight and owns the id until its own finally. The
+      // display flag is then re-derived for whatever recipe is
+      // open now, not the recipe this save was for (B4).
+      if (this._noteSaveLatest.get(recipe.id) === seq) {
+        this._savingNoteRecipeIds.delete(recipe.id);
+        this._inFlightNoteText.delete(recipe.id);
+      }
+      this._savingNote = this._selected
+        ? this._savingNoteRecipeIds.has(this._selected.id)
+        : false;
+      // Persist the outcome (B3): a kept draft stays in the
+      // session store, a saved one leaves it.
+      this._saveSession();
       this._render();
     }
   }
@@ -4766,48 +6223,159 @@ class AnyListRecipeViewCard extends HTMLElement {
   // says so.
   async _rate(value) {
     const recipe = this._selected;
-    if (!recipe || this._ratingBusy) return;
+    if (!recipe) return;
     const rating = Number(value);
     if (!Number.isFinite(rating) || rating < 0 || rating > 5) return;
     const current = recipe.rating || 0;
     if (rating === current) return;
-    this._ratingBusy = true;
-    this._ratingStatus = null;
-    this._render();
+    // Per-recipe busy (burst-3, burst-4 F5): a rating save for THIS
+    // recipe is already in flight when its id is in the set.
+    // Re-tapping the SAME rating the in-flight attempt already
+    // sent is a duplicate — blocked. Tapping a DIFFERENT rating
+    // supersedes it (P7d, same shape as notes): the older
+    // attempt's landing is discarded by the sequence check in
+    // _saveWithRetry instead of clobbering the newer rating back.
+    // The comparison is against the last-sent rating only: no
+    // await sits between the in-flight save's Set.add and its
+    // first callFn() invocation, so a "not yet sent" state cannot
+    // be observed while the id is in the set, and there is no
+    // separate not-yet-sent arm. Unlike notes, a rating attempt
+    // does NOT re-read anything — _rate's callFn closes over the
+    // tapped rating — so a second tap of a different rating is
+    // never redundant: it starts a new save that supersedes the
+    // first.
+    const sent = this._inFlightRating.get(recipe.id);
+    if (this._ratingBusyRecipeIds.has(recipe.id) && rating === sent) {
+      return;
+    }
+    const seq = ++this._saveSeq;
     try {
-      const result = await this._callAction("update_recipe", {
-        recipe_id: recipe.id,
-        rating,
-      });
-      // R-IMPL-39 (honest save): "Rating saved." only when the
-      // response carries a usable recipe; a response with no usable
-      // recipe keeps the old rating and offers a tappable retry.
-      const applied = this._applyUpdatedRecipe(result);
-      if (applied) {
-        this._pendingRating = null;
-        this._ratingStatus = { text: "Rating saved.", error: false };
+      // Burst-5 (F2): the flag-setting and the _render() live
+      // inside the try — a _render() throw before the try used to
+      // leave _ratingBusy true with no save in flight and no
+      // finally to re-derive it, and the next render showed the
+      // stars disabled. The finally below re-derives the flag
+      // from the set and renders again, so the throw now leaves
+      // no stuck flag. (The seq allocation above the try is a
+      // plain counter increment — it cannot throw.)
+      this._ratingBusy = true;
+      this._ratingStatus = null;
+      this._render();
+      // Burst-4 (F4): the in-flight Set.add lives inside the try —
+      // before this, a _render() throw left the id in the set
+      // with no finally to clear it, and every later rating save
+      // for that recipe was blocked forever by the guard above.
+      this._ratingSaveLatest.set(recipe.id, seq);
+      this._ratingBusyRecipeIds.add(recipe.id);
+      // C2: the save retries itself with backoff before it admits
+      // failure — the tappable retry below is the manual fallback
+      // once the budget is spent, not the only path.
+      const { ok, reason } = await this._saveWithRetry(() => {
+        this._inFlightRating.set(recipe.id, rating);
+        return this._callAction("update_recipe", {
+          recipe_id: recipe.id,
+          rating,
+        });
+      }, recipe.id, { kind: "rating", seq });
+      // B4: the status lines belong to the recipe that was saved.
+      // If another recipe is open by now, no status is shown for
+      // it — the pending rating is still recorded per recipe, so
+      // re-opening the saved recipe offers the retry.
+      const stillOpen = this._selected && this._selected.id === recipe.id;
+      if (ok) {
+        // Burst-5: record the tombstone BEFORE the finally's
+        // _saveSession merges — the value is what this card last
+        // wrote to the store for this id, falling back to the
+        // rating just saved when this card never wrote the id.
+        // Without it the merge re-unions the stored pending
+        // rating on every later write and the retry can never
+        // leave the store.
+        const storedRating = this._lastStoredPendingRatings.get(recipe.id);
+        const tombValue = storedRating !== undefined ? storedRating : rating;
+        // Burst-7 (F3b): set-valued — this value JOINS the set,
+        // it does not overwrite the guard for an earlier value.
+        this._addRatingTombstone(this._pendingRatingTombstones, recipe.id, tombValue);
+        // Burst-6: the known map records the tombstone too, so
+        // the drop rule never mistakes a live entry this card
+        // creates afterwards (a genuine re-pend) for a stale one.
+        this._addRatingTombstone(this._knownPendingRatingTombstones, recipe.id, tombValue);
+        this._pendingRatings.delete(recipe.id);
+        // Burst-8: the entry is gone, so its provenance goes with
+        // it — a later rating for this id is stamped afresh.
+        this._clearRatingEntryProvenance(recipe.id);
+        if (stillOpen) {
+          this._pendingRating = null;
+          this._ratingStatus = { text: "Rating saved.", error: false };
+        }
+      } else if (reason === "cancelled") {
+        // The view closed mid-save: the save was abandoned, not
+        // failed. The intended rating is kept — in the per-recipe
+        // pending map and persisted to the session store (see
+        // finally) — and an honest retry status is set, so the
+        // re-open offers the retry instead of the cook having to
+        // notice the old stars and re-tap (B2, B3). The old
+        // rating stays displayed until the retry confirms.
+        // (The burst's "the tap can simply be made again" left
+        // the intended value nowhere: _pendingRating was null,
+        // the retry handler was a no-op, and no retry rendered.)
+        this._pendingRatings.set(recipe.id, rating);
+        // Burst-8: a tap is a local action — stamp the pending
+        // rating's provenance (and its one-shot fresh mark) now,
+        // so the finally's write cannot mistake this just-tapped
+        // value for a stale entry (critic D7-3).
+        this._recordLocalRatingEntry(recipe.id, rating);
+        if (stillOpen) {
+          this._pendingRating = rating;
+          this._ratingStatus = {
+            text: "Rating not saved yet — tap to retry",
+            error: true,
+            retry: "retry-rating",
+          };
+        }
+      } else if (reason === "superseded") {
+        // A newer rating save for this recipe has started (P7d):
+        // it owns the outcome, so this save shows nothing, keeps
+        // no pending rating and retries nothing.
       } else {
-        this._pendingRating = rating;
-        this._ratingStatus = {
-          text: "Couldn't save — tap to retry",
-          error: true,
-          retry: "retry-rating",
-        };
+        // R-IMPL-39 (honest save): a response with no usable recipe
+        // keeps the old rating and offers a tappable retry; a throw
+        // says so with its own wording. Either way the rating the
+        // failed save was trying to set stays pending for the retry.
+        this._pendingRatings.set(recipe.id, rating);
+        // Burst-8: a tap is a local action — see above (critic D7-3).
+        this._recordLocalRatingEntry(recipe.id, rating);
+        if (stillOpen) {
+          this._pendingRating = rating;
+          this._ratingStatus = {
+            text:
+              reason === "threw"
+                ? "Couldn't save the rating — try again."
+                : "Couldn't save — tap to retry",
+            error: true,
+            retry: "retry-rating",
+          };
+        }
       }
-    } catch (err) {
-      this._pendingRating = rating;
-      this._ratingStatus = {
-        text: "Couldn't save the rating — try again.",
-        error: true,
-        retry: "retry-rating",
-      };
     } finally {
-      this._ratingBusy = false;
+      // Only the latest save for this recipe clears its id from
+      // the in-flight set (burst-3): an older save's finally must
+      // never clear a newer save's flag. The display flag is then
+      // re-derived for whatever recipe is open now (B4).
+      if (this._ratingSaveLatest.get(recipe.id) === seq) {
+        this._ratingBusyRecipeIds.delete(recipe.id);
+        this._inFlightRating.delete(recipe.id);
+      }
+      this._ratingBusy = this._selected
+        ? this._ratingBusyRecipeIds.has(this._selected.id)
+        : false;
+      // Persist the outcome (B3): a pending rating stays in the
+      // session store, a saved one leaves it.
+      this._saveSession();
       this._render();
     }
   }
 
-  // Refresh the card's copy of the open recipe from an update_recipe
+  // Refresh the card's copy of a recipe from an update_recipe
   // response. Only the note and rating are taken from the server —
   // the save changed nothing else, and the response's ingredient list
   // may not carry the heading-aware entries, so the local
@@ -4819,15 +6387,27 @@ class AnyListRecipeViewCard extends HTMLElement {
   // value, the draft is kept, and the status says so with a retry.
   // (The old code fell back to the just-saved value on any
   // non-throwing response, which certified a save on the rig stub.)
-  _applyUpdatedRecipe(result) {
-    const recipe = this._selected;
-    if (!recipe) return false;
+  // B4: confirmation is checked against targetRecipeId — the recipe
+  // the save was for — not against this._selected. The cook may
+  // have opened another recipe mid-save; a server-confirmed save
+  // for the first recipe must refresh THAT recipe's list copy and
+  // confirm, not burn the whole retry budget and report a failure
+  // on the newly opened detail. When the target is not the open
+  // recipe, only its list copy is refreshed — the open detail is
+  // untouched, and the callers show no status for it.
+  _applyUpdatedRecipe(result, targetRecipeId) {
+    const targetId = targetRecipeId || (this._selected && this._selected.id);
+    if (!targetId) return false;
     const updated = result && result.recipe ? normalizeRecipe(result.recipe) : null;
-    if (!updated || updated.id !== recipe.id) return false;
-    const next = { ...recipe, note: updated.note, rating: updated.rating };
-    const index = this._recipes.findIndex((item) => item.id === recipe.id);
-    if (index >= 0) this._recipes[index] = next;
-    this._selected = next;
+    if (!updated || updated.id !== targetId) return false;
+    const index = this._recipes.findIndex((item) => item.id === targetId);
+    if (index >= 0) {
+      const stored = this._recipes[index];
+      this._recipes[index] = { ...stored, note: updated.note, rating: updated.rating };
+    }
+    if (this._selected && this._selected.id === targetId) {
+      this._selected = { ...this._selected, note: updated.note, rating: updated.rating };
+    }
     return true;
   }
 
@@ -4844,10 +6424,22 @@ class AnyListRecipeViewCard extends HTMLElement {
   // instead of assuming the local edit stuck. A failed save keeps
   // the typed note (the draft stays) and says so honestly — the
   // cook never loses what they typed to a silent failure.
-  _friendlyError(err) {
+  // Whether a failure means the AnyList integration itself is not
+  // installed: the service call fails with "not found" + "service".
+  // That is not a transient failure — retrying cannot install it —
+  // so the load shows its remedy at once (C4) instead of burning
+  // the retry budget on it.
+  _isIntegrationMissingError(err) {
     const message = String((err && err.message) || err || "");
-    if (/not found/i.test(message) && /service/i.test(message)) {
-      return "The AnyList integration is not available on this Home Assistant.";
+    return /not found/i.test(message) && /service/i.test(message);
+  }
+
+  _friendlyError(err) {
+    if (this._isIntegrationMissingError(err)) {
+      // C4: name the remedy, not just the failure — install the
+      // integration, then re-open the Recipes view; the load already
+      // re-runs on every view-open, so that is all it takes.
+      return "The AnyList integration is not available on this Home Assistant. Install the AnyList integration in HACS (or re-run the setup wizard), then open the Recipes view again — the list loads when the view opens.";
     }
     // Load failure (N-IMPL-27): the design's verbatim text, for every
     // connection-flavoured failure — the old timeout/generic strings
@@ -4869,10 +6461,19 @@ class AnyListRecipeViewCard extends HTMLElement {
       // Typing a note updates the draft only — no re-render, or the
       // textarea would be rebuilt (and lose focus) on every
       // keystroke. The Save button's disabled state is updated
-      // directly instead.
+      // directly instead. The draft is persisted (debounced) to
+      // the session store as it is typed, so a typed-but-unsaved
+      // note survives a real view re-open too — not only a draft
+      // kept by a cancelled save (B3).
       if (!this._selected) return;
       const draft = target.value || "";
       this._noteDrafts.set(this._selected.id, draft);
+      // Burst-8: typing is a local action — stamp the draft's
+      // provenance (and its one-shot fresh mark) now, so the
+      // debounce write that follows cannot mistake this just-typed
+      // text for a stale entry (critic D7-3b/D7-7b2).
+      this._recordLocalNoteEntry(this._selected.id, draft);
+      this._scheduleSessionSave();
       const save = this.shadowRoot.querySelector('[data-action="save-note"]');
       if (save) {
         save.disabled =
@@ -5420,6 +7021,11 @@ class AnyListRecipeViewCard extends HTMLElement {
       statusEl.textContent =
         `${visible.length} recipe${visible.length === 1 ? "" : "s"}` +
         (this._query ? ` matching “${this._query}”` : "");
+    } else if (this._loadRetrying) {
+      // C1: a load retry is scheduled — a transient state, not an
+      // error. The list body keeps its skeleton rows; the status
+      // says the card is still trying.
+      statusEl.textContent = "Recipes didn't load — trying again…";
     } else {
       // No count while loading, errored, or empty — and no
       // "Searching…" state at all: local search answers instantly.
@@ -5954,6 +7560,10 @@ if (typeof module !== "undefined" && module.exports) {
     CORE_LOOKUP_RETRY_THROTTLE_MS,
     CORE_LOOKUP_INTERVAL_MS,
     REQUIRED_CORE,
+    LOAD_RETRY_MAX_ATTEMPTS,
+    LOAD_RETRY_DELAYS_MS,
+    SAVE_RETRY_MAX_ATTEMPTS,
+    SAVE_RETRY_DELAYS_MS,
     _setCoreForTests,
     pluralTimeUnit,
     timerName,

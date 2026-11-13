@@ -1315,6 +1315,33 @@ test("parseRecipeSession/serializeRecipeSession: round-trip, garbage -> null, ba
   // collectionId, sort — so a reload re-opens the list as left.
   const state = { openId: "abc123", step: 2, listScrollY: 400, detailScrollY: 120, query: "pasta", collectionId: "col-x", sort: "cook" };
   assert.deepEqual(parseRecipeSession(serializeRecipeSession(state)), state);
+  // Burst-5: the tombstone fields round-trip like the maps they
+  // guard, and are omitted when empty.
+  const withTombstones = {
+    ...state,
+    noteDraftTombstones: { "rec-pasta": "v1 text." },
+    // Burst-7: rating tombstones are set-valued — id -> the sorted
+    // array of guarded values.
+    pendingRatingTombstones: { "rec-pasta": [3] },
+  };
+  assert.deepEqual(parseRecipeSession(serializeRecipeSession(withTombstones)), withTombstones);
+  // Burst-7: a legacy scalar (burst-5/6 store shape) reads as a
+  // one-element set, and a set of several values round-trips
+  // sorted and deduplicated; invalid values are dropped.
+  assert.deepEqual(
+    parseRecipeSession(
+      JSON.stringify({ ...state, pendingRatingTombstones: { "rec-pasta": 3 } })
+    ).pendingRatingTombstones,
+    { "rec-pasta": [3] }
+  );
+  assert.deepEqual(
+    parseRecipeSession(
+      serializeRecipeSession({ ...state, pendingRatingTombstones: { "rec-pasta": [4, 3, 3, 9, "x"] } })
+    ).pendingRatingTombstones,
+    { "rec-pasta": [3, 4] }
+  );
+  assert.equal(parseRecipeSession(serializeRecipeSession(state)).noteDraftTombstones, undefined);
+  assert.equal(parseRecipeSession(serializeRecipeSession(state)).pendingRatingTombstones, undefined);
   assert.equal(parseRecipeSession(null), null);
   assert.equal(parseRecipeSession(""), null);
   assert.equal(parseRecipeSession("not json"), null);
@@ -1342,6 +1369,74 @@ test("parseRecipeSession/serializeRecipeSession: round-trip, garbage -> null, ba
   // An unknown sort key falls back to "name"; a bad one never sticks.
   assert.equal(parseRecipeSession('{"sort": "bogus"}').sort, "name");
   assert.equal(parseRecipeSession('{"sort": "prep"}').sort, "prep");
+});
+
+test("parseRecipeSession/serializeRecipeSession: kept drafts and pending ratings round-trip (B3)", () => {
+  // A session with pending saves carries them; a session without
+  // them serializes exactly as before (no empty keys).
+  const state = {
+    openId: "abc123",
+    step: 2,
+    listScrollY: 400,
+    detailScrollY: 120,
+    query: "",
+    collectionId: "",
+    sort: "name",
+    noteDrafts: { "rec-pasta": "More salt next time." },
+    pendingRatings: { "rec-pasta": 3 },
+  };
+  assert.deepEqual(parseRecipeSession(serializeRecipeSession(state)), state);
+  // Garbage drafts / ratings are dropped, never trusted.
+  assert.deepEqual(
+    parseRecipeSession('{"noteDrafts": {"rec-pasta": 42, "": "x"}, "pendingRatings": {"rec-pasta": 9, "rec-soup": "3"}}'),
+    {
+      openId: null,
+      step: null,
+      listScrollY: 0,
+      detailScrollY: 0,
+      query: "",
+      collectionId: "",
+      sort: "name",
+      pendingRatings: { "rec-soup": 3 },
+    }
+  );
+  assert.equal(serializeRecipeSession({ openId: null }).includes("noteDrafts"), false);
+  assert.equal(serializeRecipeSession({ openId: null }).includes("pendingRatings"), false);
+});
+
+test("burst-8 sanitize: rating tombstones are bounded by the integer 0–5 domain — fractions and null never become guards", () => {
+  const base = { openId: null, step: null, listScrollY: 0, detailScrollY: 0, query: "", collectionId: "", sort: "name" };
+  const read = (tombstones) =>
+    parseRecipeSession(JSON.stringify({ ...base, pendingRatingTombstones: tombstones })).pendingRatingTombstones;
+  // Legacy scalar reads as a one-element set.
+  assert.deepEqual(read({ "rec-soup": 2 }), { "rec-soup": [2] }, "legacy scalar 2 reads as [2]");
+  // The verifier's flood: eleven fractional values keep only the
+  // one integer in range (1.0) — the bound holds for corrupt input.
+  assert.deepEqual(
+    read({ "rec-soup": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.5] }),
+    { "rec-soup": [1] },
+    "fractional flood keeps only the integer 1.0"
+  );
+  // The critic's case — DECIDED output is [3,5]: 9 is out of range,
+  // "x" is not a number, and null must NOT become a 0 guard
+  // (Number(null) === 0 was the old coercion).
+  assert.deepEqual(read({ "rec-soup": [5, 3, 3, 9, "x", null] }), { "rec-soup": [3, 5] }, "[5,3,3,9,'x',null] -> [3,5]");
+  assert.equal(read({ "rec-soup": [null] }), undefined, "a lone null leaves no tombstone at all — never a [0] guard");
+  assert.equal(read({ "rec-soup": 9 }), undefined, "out-of-range 9 dropped");
+  assert.equal(read({ "rec-soup": "x" }), undefined, "non-numeric dropped");
+  // The bound is SIX, not five: 0 is a legitimate clear-rating
+  // value, so the 0–5 integer domain holds six distinct values.
+  // The old "at most five" comment counted only 1–5 and forgot 0.
+  assert.deepEqual(read({ "rec-soup": [0, 1, 2, 3, 4, 5] }), { "rec-soup": [0, 1, 2, 3, 4, 5] }, "all six integer ratings 0–5 are kept");
+  // The same coercion hole in pending ratings: null/true/"" never
+  // become a phantom pending 0/1; an integer-literal string ("3")
+  // still reads as 3, as the B3 test pins.
+  const readPending = (pending) =>
+    parseRecipeSession(JSON.stringify({ ...base, pendingRatings: pending })).pendingRatings;
+  assert.equal(readPending({ "rec-soup": null }), undefined, "null pending rating dropped, never a phantom 0");
+  assert.equal(readPending({ "rec-soup": true }), undefined, "boolean pending rating dropped, never a 1");
+  assert.equal(readPending({ "rec-soup": "" }), undefined, "empty-string pending rating dropped, never a 0");
+  assert.deepEqual(readPending({ "rec-soup": "3" }), { "rec-soup": 3 }, "integer-literal string '3' still reads as 3");
 });
 
 // -- Phase 7: success green (OQ-1) -----------------------------------------
