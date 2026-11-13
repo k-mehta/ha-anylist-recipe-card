@@ -1169,8 +1169,9 @@ function runningTimers(states) {
 // implementation log; family-hub-nav-strip.js is the reference
 // implementation). Noun labels, Home first, the current view marked
 // with the accent background, heavier weight, and aria-current.
-// Navigation is history.pushState + a location-changed dispatch —
-// no reload.
+// Navigation is the core SPA helper (§16, RB-R4-2) — no reload. The
+// card's own pushState + location-changed dispatch survives only as
+// the helper's pre-core-load fallback (see _spaNavigateTo).
 const NAV_STRIP_VIEWS = [
   { key: "home", label: "Home", path: "/family-hub" },
   { key: "timers", label: "Timers", path: "/family-hub/timers" },
@@ -3983,17 +3984,25 @@ class AnyListRecipeViewCard extends HTMLElement {
     if (options && options.pushHistory) this._pushDetailHistory(id);
   }
 
-  // ONE history entry for a tap-opened detail (decision F): a
-  // state-carrying push at the same URL, never a bare same-URL push.
+  // ONE history entry for a tap-opened detail (decision F), now
+  // written as a real route (RB-R4-2): the open recipe id and step
+  // go into the URL — /family-hub/recipes?recipe=<id>&step=<n> —
+  // via navigateTo, so the §7.2 guard can see the open recipe and
+  // suppress the screensaver, and the controller's currentRoute()
+  // tracks the detail at once. The old same-URL pushState left
+  // tap-opened recipes without ?recipe=, so the guard could never
+  // suppress (R4-1 L2b). The step is the 1-based "Step N of M" the
+  // cook sees — the same expression _saveSession uses. ?kiosk is
+  // carried when the session launched with it. Only tap-open passes
+  // pushHistory: true; a popstate/deep-link open never pushes.
   _pushDetailHistory(recipeId) {
-    if (typeof window === "undefined" || !window.history) return;
-    if (typeof window.history.pushState !== "function") return;
-    try {
-      const url = `${window.location.pathname || "/family-hub/recipes"}${window.location.search || ""}`;
-      window.history.pushState({ fhNav: "detail", openId: recipeId }, "", url);
-    } catch (_err) {
-      // A pushState failure never breaks the open.
-    }
+    if (typeof window === "undefined") return;
+    const steps = this._selected ? this._navigableSteps(this._selected) : [];
+    const step = this._currentStepIndex(recipeId, Math.max(steps.length, 1)) + 1;
+    const url = this._withKiosk(
+      `/family-hub/recipes?recipe=${encodeURIComponent(recipeId)}&step=${step}`
+    );
+    this._spaNavigateTo(url);
   }
 
   // -- detail close + history (N-IMPL-7/9, decision F) ----------------------
@@ -4001,8 +4010,10 @@ class AnyListRecipeViewCard extends HTMLElement {
   // Strip Recipes from a detail is list intent: close the detail, show
   // the list at scrollY 0, clear the saved open detail (openId + step
   // + both scroll buckets — the next restore starts at list top), and
-  // push exactly ONE history entry ({fhNav:"list", openId:null}) so
-  // system-back from the list returns to the detail exactly once.
+  // navigate to the plain list URL via navigateTo — exactly ONE
+  // history entry, so system-back from the list returns to the detail
+  // exactly once. The old raw pushState left currentRoute() stale
+  // for 65 s after closing (R4-1 L2); the route must clear at once.
   // A reload is restore intent and keeps the saved detail; an explicit
   // Recipes tap from a detail is list intent and clears it — the two
   // intents are distinguished by the action, not the URL.
@@ -4018,17 +4029,7 @@ class AnyListRecipeViewCard extends HTMLElement {
       }
     }
     this._clearRecipeSession();
-    if (typeof window !== "undefined" && window.history && typeof window.history.pushState === "function") {
-      try {
-        window.history.pushState(
-          { fhNav: "list", openId: null },
-          "",
-          "/family-hub/recipes"
-        );
-      } catch (_err) {
-        // A pushState failure never breaks the close.
-      }
-    }
+    this._spaNavigateTo(this._listUrl());
   }
 
   // Write the clean list-top session state (no open detail, no step,
@@ -4110,6 +4111,41 @@ class AnyListRecipeViewCard extends HTMLElement {
       this._saveSession();
       this._scrollCurrentStepIntoView();
       return;
+    }
+    // URL-based branch (RB-R4-2): detail URLs now carry ?recipe=
+    // (written by _pushDetailHistory via navigateTo), so a system
+    // Back/Forward lands on a URL that names the recipe — the SPA
+    // helper's pushState carries no fhNav state, and the shell's
+    // popstate carries the URL the user actually landed on. Read the
+    // live URL, not the event state. A Forward into a detail opens
+    // it at the URL's step; a Back onto the plain list URL falls
+    // through to the list branch below. A popstate must never push
+    // a new entry, so _openRecipe runs WITHOUT pushHistory here.
+    // The _deepLinkApplied once-gate does NOT apply: this is the
+    // user's own Back/Forward, not a load.
+    if (typeof window !== "undefined" && window.location) {
+      const params = new URLSearchParams(String(window.location.search || ""));
+      const urlRecipeId = asTrimmed(params.get("recipe") || params.get("from_recipe"));
+      if (urlRecipeId) {
+        const recipe = this._recipes.find((item) => item.id === urlRecipeId);
+        if (recipe) {
+          if (!this._selected || this._selected.id !== urlRecipeId) {
+            this._openRecipe(urlRecipeId);
+          }
+          const step = Number(params.get("step"));
+          if (Number.isFinite(step) && step > 0) {
+            const steps = this._navigableSteps(recipe);
+            if (steps.length > 0) {
+              this._currentStep.set(urlRecipeId, Math.min(step - 1, steps.length - 1));
+              this._saveCookState(urlRecipeId);
+              this._render();
+              this._saveSession();
+            }
+          }
+          this._scrollCurrentStepIntoView();
+          return;
+        }
+      }
     }
     // List entry (or no Navigation state): the list, at the saved
     // list scroll (N-IMPL-9).
@@ -5681,6 +5717,11 @@ class AnyListRecipeViewCard extends HTMLElement {
       }
     }
     this._hidePip();
+    // RB-R4-2 (§16): write the return state BEFORE navigating — the
+    // session already persists openId + step continuously, but the
+    // write is explicit here so the Timers "← Back to recipe" return
+    // can never race a not-yet-flushed session.
+    this._saveSession();
     this._navigate("/family-hub/timers");
   }
 
@@ -5771,8 +5812,72 @@ class AnyListRecipeViewCard extends HTMLElement {
 
   // -- navigation (NAV-1) -------------------------------------------------
   //
-  // history.pushState + a location-changed dispatch — no reload. The
-  // same mechanism the standalone nav strip and the home card use.
+  // RB-R4-2 (§16 as amended, parent BLOCKER 1 decision ~03:49 PST
+  // Nov 13): ALL in-app URL writes go through _spaNavigateTo —
+  // the core SPA helper `navigateTo` when the core is loaded (the
+  // helper performs the frontend's own two operations itself —
+  // pushState + location-changed dispatch — and resolves on the
+  // observed card mount, never on its return value alone), the
+  // card's own pushState + location-changed dispatch only while the
+  // core is absent (the pre-core-load window) or when the helper
+  // call itself throws or rejects. Navigation must never dead-end
+  // waiting for the core. (The core SPA helper replaces this whole
+  // method in R4 — this IS that replacement.)
+  _spaNavigateTo(url) {
+    if (typeof window === "undefined") return;
+    if (_coreModule && typeof _coreModule.navigateTo === "function") {
+      let result;
+      try {
+        result = _coreModule.navigateTo(url);
+      } catch (_err) {
+        this._legacyNavigate(url);
+        return;
+      }
+      Promise.resolve(result).catch(() => this._legacyNavigate(url));
+      return;
+    }
+    this._legacyNavigate(url);
+  }
+
+  // The card's own pushState + location-changed dispatch — the
+  // mechanism the shell honours, kept as the pre-core-load path and
+  // the fallback when the core helper cannot run. §16: all in-app
+  // URL writes go through navigateTo; this is the helper's fallback,
+  // never a parallel navigation path.
+  _legacyNavigate(url) {
+    if (typeof window === "undefined") return;
+    try {
+      if (window.history && typeof window.history.pushState === "function") {
+        window.history.pushState(null, "", url);
+      }
+    } catch (_err) {
+      // A pushState failure never breaks the tap; the
+      // location-changed dispatch below still runs.
+    }
+    if (typeof window.dispatchEvent === "function") {
+      window.dispatchEvent(new CustomEvent("location-changed"));
+    }
+  }
+
+  // ?kiosk is launch-only for ordinary in-app navigation (R1), but
+  // the list/detail URLs the card writes must carry it when the
+  // session launched with it — otherwise a tap-open or a close
+  // would drop the wall out of kiosk (§16).
+  _hasKioskInUrl() {
+    if (typeof window === "undefined" || !window.location) return false;
+    return /(?:^|[?&])kiosk(?:=|&|$)/.test(String(window.location.search || ""));
+  }
+
+  _withKiosk(url) {
+    if (!this._hasKioskInUrl()) return url;
+    if (/(?:^|[?&])kiosk(?:=|&|$)/.test(url)) return url;
+    return url + (url.includes("?") ? "&kiosk" : "?kiosk");
+  }
+
+  _listUrl() {
+    return this._withKiosk("/family-hub/recipes");
+  }
+
   _navigate(path) {
     if (typeof window === "undefined") return;
     const target = String(path || "/family-hub");
@@ -5784,19 +5889,9 @@ class AnyListRecipeViewCard extends HTMLElement {
     const targetPath = target.split("?")[0];
     if (targetPath === "/family-hub/recipes" || targetPath.endsWith("/recipes")) return;
     // R1: in-app navigation no longer carries ?kiosk — it is launch-only
-    // (§4/§19). (The core SPA helper replaces this whole method in R4.)
-    const url = target;
-    try {
-      if (window.history && typeof window.history.pushState === "function") {
-        window.history.pushState(null, "", url);
-      }
-    } catch (_err) {
-      // A pushState failure (a test stub, a file URL) never breaks
-      // the tap; the location-changed dispatch below still runs.
-    }
-    if (typeof window.dispatchEvent === "function") {
-      window.dispatchEvent(new CustomEvent("location-changed"));
-    }
+    // (§4/§19). The ?kiosk carry for the detail/list URLs lives in
+    // _pushDetailHistory/_closeDetailToListTop/back, not here.
+    this._spaNavigateTo(target);
   }
 
   // -- photo fallback (RECIPE-10) ----------------------------------------
@@ -6614,8 +6709,12 @@ class AnyListRecipeViewCard extends HTMLElement {
       // N-IMPL-9: ← All recipes restores the SAVED listScrollY — never
       // list top. The old code saved the session after closing, which
       // overwrote the saved list scroll with the detail scroll.
-      // R-IMPL-11: push ONE list entry ({fhNav:"list", openId:null}) —
-      // pushState, NOT replaceState. The spec's Change text says
+      // R-IMPL-11: navigate to the plain list URL via navigateTo —
+      // exactly ONE history entry, so one system-back press returns
+      // to the detail once. (The old code pushed {fhNav:"list",
+      // openId:null} with a raw pushState that left currentRoute()
+      // stale — RB-R4-2 routes the close through the SPA helper, so
+      // the route clears at once.) The spec's Change text says
       // replaceState, but its own Validate line requires "one
       // system-back press returns to the detail once", which only a
       // push delivers: replaceState would erase the detail entry, so
@@ -6635,17 +6734,7 @@ class AnyListRecipeViewCard extends HTMLElement {
         }
       }
       this._saveSession();
-      if (typeof window !== "undefined" && window.history && typeof window.history.pushState === "function") {
-        try {
-          window.history.pushState(
-            { fhNav: "list", openId: null },
-            "",
-            "/family-hub/recipes"
-          );
-        } catch (_err) {
-          // A pushState failure never breaks the return.
-        }
-      }
+      this._spaNavigateTo(this._listUrl());
       return;
     }
     if (action === "tab") {
@@ -6707,6 +6796,10 @@ class AnyListRecipeViewCard extends HTMLElement {
       return;
     }
     if (action === "goto-timers") {
+      // RB-R4-2 (§16): write the return state BEFORE navigating, so
+      // the Timers "← Back to recipe" return lands on this recipe at
+      // this step even if the session had not flushed yet.
+      this._saveSession();
       this._navigate("/family-hub/timers");
       return;
     }

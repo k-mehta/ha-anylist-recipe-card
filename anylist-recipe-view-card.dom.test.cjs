@@ -4030,12 +4030,14 @@ test("the running-timer strip shows name + remaining and taps through to Timers 
     assert.match(items[0].textContent, /7:3\d/);
     assert.ok(items[1].classList.contains("paused"));
     // Tapping a strip item goes to the Timers view. nav.pushed holds
-    // the tap-open's same-URL detail entry FIRST (decision F — a
-    // state push, not a navigation), then the Timers navigation.
+    // the tap-open's detail route FIRST (RB-R4-2 — the open writes
+    // ?recipe=&step= into the URL), then the Timers navigation.
     card.shadowRoot.dispatchClick(fakeTarget("goto-timers"));
     await flush();
-    assert.deepEqual(nav.pushed, ["/family-hub/recipes", "/family-hub/timers"]);
-    assert.deepEqual(nav.dispatched, ["location-changed"]);
+    assert.deepEqual(nav.pushed, ["/family-hub/recipes?recipe=rec-pasta&step=1", "/family-hub/timers"]);
+    // Both navigations dispatch location-changed (the open's route
+    // write and the Timers navigation).
+    assert.deepEqual(nav.dispatched, ["location-changed", "location-changed"]);
   } finally {
     // Always disconnect: the open detail with running timers starts
     // the 1s strip tick, and a live interval hangs the suite.
@@ -4368,21 +4370,193 @@ test("Wave 1: opening a recipe pushes ONE detail history entry; system-back re-o
     ({ card } = await loadedCard());
     card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
     await flush();
+    // RB-R4-2: the tap-open writes the open recipe + step into the
+    // URL as a real route (via navigateTo; the legacy pushState runs
+    // here because no core is injected), so the §7.2 guard can see
+    // it and currentRoute() tracks the detail at once. The old
+    // same-URL fhNav-state push is gone.
     assert.deepEqual(nav.pushedStates, [
-      { state: { fhNav: "detail", openId: "rec-pasta" }, url: "/family-hub/recipes" },
+      { state: null, url: "/family-hub/recipes?recipe=rec-pasta&step=1" },
     ]);
-    assert.deepEqual(nav.pushed, ["/family-hub/recipes"]);
+    assert.deepEqual(nav.pushed, ["/family-hub/recipes?recipe=rec-pasta&step=1"]);
+    assert.deepEqual(nav.dispatched, ["location-changed"]);
     // System-back to the list entry, then forward to the detail entry.
+    // The stub window does not move location on pushState, so the test
+    // moves it the way the browser would on Back/Forward.
+    globalThis.window.location.search = "";
     card._onPopState({ state: null });
     await flush();
     assert.equal(card.shadowRoot.querySelector(".list-view").hidden, false);
+    // The legacy fhNav-state entry (written by the pre-R4-2 card in
+    // the same session) still re-opens the detail.
     card._onPopState({ state: { fhNav: "detail", openId: "rec-pasta" } });
     await flush();
     assert.equal(card.shadowRoot.querySelector(".list-view").hidden, true);
     assert.match(card.shadowRoot.innerHTML, /Step 1 of 3/);
+    // The URL-based entry: Back onto the plain list URL closes the
+    // detail, and Forward onto ?recipe=&step= re-opens it at the
+    // URL's step — no fhNav state needed.
+    globalThis.window.location.search = "";
+    card._onPopState({ state: null });
+    await flush();
+    assert.equal(card.shadowRoot.querySelector(".list-view").hidden, false);
+    globalThis.window.location.search = "?recipe=rec-pasta&step=2";
+    card._onPopState({ state: null });
+    await flush();
+    assert.equal(card.shadowRoot.querySelector(".list-view").hidden, true);
+    assert.match(card.shadowRoot.innerHTML, /Step 2 of 3/);
+    globalThis.window.location.search = "";
+    card._onPopState({ state: null });
+    await flush();
+    assert.equal(card.shadowRoot.querySelector(".list-view").hidden, false);
   } finally {
     if (card) card.disconnectedCallback();
     clearWindow();
+  }
+});
+
+// -- RB-R4-2 (§16): route writing goes through navigateTo ------------
+//
+// A fake core is the real core with navigateTo stubbed + recorded:
+// the card's hass setter still gets identify/deviceFromIdentity from
+// the real core, so the card mounts exactly as on the hub.
+
+function r42FakeCore(navigateTo) {
+  return { ...core, navigateTo };
+}
+
+test("R4-2: tap-open with core loaded calls navigateTo with the detail URL — no pushState, no dispatch", async () => {
+  const nav = stubHistoryWindow(HUB_WINDOW);
+  const navigated = [];
+  _setCoreForTests(r42FakeCore((url) => {
+    navigated.push(url);
+    return Promise.resolve(true);
+  }));
+  let card;
+  try {
+    ({ card } = await loadedCard());
+    card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+    await flush();
+    assert.deepEqual(navigated, ["/family-hub/recipes?recipe=rec-pasta&step=1"]);
+    assert.deepEqual(nav.pushed, [], "the legacy pushState never runs when the helper is used");
+    assert.deepEqual(nav.dispatched, [], "no location-changed dispatch from the card either");
+  } finally {
+    if (card) card.disconnectedCallback();
+    resetCore();
+    clearWindow();
+  }
+});
+
+test("R4-2: tap-open carries ?kiosk when the session launched with it — and the close keeps it", async () => {
+  const nav = stubHistoryWindow({ ...HUB_WINDOW, search: "?kiosk" });
+  const navigated = [];
+  _setCoreForTests(r42FakeCore((url) => {
+    navigated.push(url);
+    return Promise.resolve(true);
+  }));
+  let card;
+  try {
+    ({ card } = await loadedCard());
+    card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+    await flush();
+    assert.deepEqual(navigated, [
+      "/family-hub/recipes?recipe=rec-pasta&step=1&kiosk",
+    ]);
+    card.shadowRoot.dispatchClick(fakeTarget("back"));
+    await flush();
+    assert.deepEqual(navigated, [
+      "/family-hub/recipes?recipe=rec-pasta&step=1&kiosk",
+      "/family-hub/recipes?kiosk",
+    ]);
+    assert.deepEqual(nav.pushed, []);
+  } finally {
+    if (card) card.disconnectedCallback();
+    resetCore();
+    clearWindow();
+  }
+});
+
+test("R4-2: close/back without core writes the plain list URL at once (legacy path)", async () => {
+  const nav = stubHistoryWindow(HUB_WINDOW);
+  let card;
+  try {
+    ({ card } = await loadedCard());
+    card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+    await flush();
+    nav.pushed.length = 0;
+    nav.pushedStates.length = 0;
+    nav.dispatched.length = 0;
+    card.shadowRoot.dispatchClick(fakeTarget("back"));
+    await flush();
+    assert.equal(card.shadowRoot.querySelector(".list-view").hidden, false);
+    assert.deepEqual(nav.pushed, ["/family-hub/recipes"]);
+    assert.deepEqual(nav.dispatched, ["location-changed"]);
+  } finally {
+    if (card) card.disconnectedCallback();
+    clearWindow();
+  }
+});
+
+test("R4-2: _navigate with core loaded calls the helper; a throwing helper falls back to the legacy path", async () => {
+  const nav = stubHistoryWindow(HUB_WINDOW);
+  const navigated = [];
+  _setCoreForTests(r42FakeCore((url) => {
+    navigated.push(url);
+    return Promise.resolve(true);
+  }));
+  let card;
+  try {
+    ({ card } = await loadedCard());
+    card._navigate("/family-hub/timers");
+    assert.deepEqual(navigated, ["/family-hub/timers"]);
+    assert.deepEqual(nav.pushed, []);
+    card.disconnectedCallback();
+    card = null;
+  } finally {
+    resetCore();
+    clearWindow();
+  }
+  // Throwing helper: the legacy pushState + dispatch runs instead —
+  // navigation must never dead-end on a helper failure.
+  const nav2 = stubHistoryWindow(HUB_WINDOW);
+  _setCoreForTests(r42FakeCore(() => {
+    throw new Error("SPA call unavailable");
+  }));
+  try {
+    ({ card } = await loadedCard());
+    card._navigate("/family-hub/timers");
+    assert.deepEqual(nav2.pushed, ["/family-hub/timers"]);
+    assert.deepEqual(nav2.dispatched, ["location-changed"]);
+    card.disconnectedCallback();
+    card = null;
+  } finally {
+    resetCore();
+    clearWindow();
+  }
+});
+
+test("R4-2: goto-timers and PIP tap write the return state before navigating", async () => {
+  const store = stubSessionStorage({});
+  const nav = stubHistoryWindow(HUB_WINDOW);
+  let card;
+  try {
+    ({ card } = await loadedCard());
+    card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+    await flush();
+    // Step to step 2, then leave for Timers: the session must carry
+    // openId + step 2 so "← Back to recipe" can return to it.
+    card.shadowRoot.dispatchClick(fakeTarget("step-next"));
+    await flush();
+    card.shadowRoot.dispatchClick(fakeTarget("goto-timers"));
+    await flush();
+    assert.deepEqual(nav.pushed.slice(-1), ["/family-hub/timers"]);
+    const saved = JSON.parse(store.get("family-hub:recipe:state"));
+    assert.equal(saved.openId, "rec-pasta");
+    assert.equal(saved.step, 2);
+  } finally {
+    if (card) card.disconnectedCallback();
+    clearWindow();
+    clearSessionStorage();
   }
 });
 
@@ -4435,12 +4609,16 @@ test("Wave 1: session restore re-opens the saved detail at the saved step (N-IMP
       sort: "name",
     });
     assert.deepEqual(nav.pushedStates, [
-      { state: { fhNav: "list", openId: null }, url: "/family-hub/recipes" },
+      { state: null, url: "/family-hub/recipes" },
     ]);
-    // System-back from the list returns to the detail exactly once.
-    card._onPopState({ state: { fhNav: "detail", openId: "rec-pasta" } });
+    // System-back from the list returns to the detail exactly once —
+    // via the URL now: Back lands on ?recipe=&step=, which re-opens
+    // the detail at the URL's step (RB-R4-2).
+    globalThis.window.location.search = "?recipe=rec-pasta&step=2";
+    card._onPopState({ state: null });
     await flush();
     assert.equal(card.shadowRoot.querySelector(".list-view").hidden, true);
+    assert.match(card.shadowRoot.innerHTML, /Step 2 of 3/);
   } finally {
     if (card) card.disconnectedCallback();
     clearWindow();
@@ -4467,6 +4645,12 @@ test("Wave 1: ← All recipes restores the saved list scroll (N-IMPL-9)", async 
     await flush();
     assert.equal(card.shadowRoot.querySelector(".list-view").hidden, false);
     assert.deepEqual(nav.scrolled, [[0, 400]]);
+    // RB-R4-2: the close routes through navigateTo — the plain list
+    // URL, one entry, no fhNav state, no stale route.
+    assert.deepEqual(nav.pushed, ["/family-hub/recipes"]);
+    assert.deepEqual(nav.pushedStates, [
+      { state: null, url: "/family-hub/recipes" },
+    ]);
   } finally {
     if (card) card.disconnectedCallback();
     clearWindow();
@@ -4572,8 +4756,8 @@ test("Wave 1 (Recipes): a chip tap shows the PIP in place and does NOT navigate 
     assert.match(pip.textContent, /Creamy Tomato Pasta/);
     assert.match(pip.textContent, /10:00/);
     // No navigation: the cook stays on the recipe. (The one push is
-    // the detail entry from opening the recipe, not a navigation.)
-    assert.deepEqual(nav.pushed, ["/family-hub/recipes"]);
+    // the detail route from opening the recipe, not a navigation.)
+    assert.deepEqual(nav.pushed, ["/family-hub/recipes?recipe=rec-pasta&step=1"]);
     // The 5 s auto-hide clock is armed (the fade itself is covered
     // by the fade test below, not by waiting 5 s here).
     assert.notEqual(card._pipHideTimer, null);
@@ -4601,8 +4785,8 @@ test("Wave 1 (Recipes): tapping the PIP pins the timer and goes to Timers (OQ-7 
       store.get("family-hub:timers:pin"),
       JSON.stringify({ timerId: "01MPASTA" })
     );
-    // The first push is the detail entry from opening the recipe.
-    assert.deepEqual(nav.pushed, ["/family-hub/recipes", "/family-hub/timers"]);
+    // The first push is the detail route from opening the recipe.
+    assert.deepEqual(nav.pushed, ["/family-hub/recipes?recipe=rec-pasta&step=1", "/family-hub/timers"]);
     assert.equal(card.shadowRoot.querySelector(".pip"), null);
     card.disconnectedCallback();
   } finally {
@@ -4623,7 +4807,7 @@ test("Wave 1 (Recipes): a PIP tap with no timer_id attribute navigates unpinned 
     card.shadowRoot.dispatchClick(fakeTarget("pip-tap"));
     await flush();
     assert.equal(store.get("family-hub:timers:pin"), undefined);
-    assert.deepEqual(nav.pushed, ["/family-hub/recipes", "/family-hub/timers"]);
+    assert.deepEqual(nav.pushed, ["/family-hub/recipes?recipe=rec-pasta&step=1", "/family-hub/timers"]);
     card.disconnectedCallback();
   } finally {
     clearWindow();
@@ -4875,12 +5059,15 @@ test("Wave 1 (Recipes): <- All recipes pushes ONE list history entry, so one sys
     assert.equal(card.shadowRoot.querySelector(".list-view").hidden, false);
     assert.deepEqual(nav.scrolled, [[0, 400]]);
     assert.deepEqual(nav.pushedStates, [
-      { state: { fhNav: "list", openId: null }, url: "/family-hub/recipes" },
+      { state: null, url: "/family-hub/recipes" },
     ]);
-    // One system-back press from that list entry returns to the detail.
-    card._onPopState({ state: { fhNav: "detail", openId: "rec-pasta" } });
+    // One system-back press from that list entry returns to the detail —
+    // via the URL now: Back lands on ?recipe=&step= (RB-R4-2).
+    globalThis.window.location.search = "?recipe=rec-pasta&step=1";
+    card._onPopState({ state: null });
     await flush();
     assert.equal(card.shadowRoot.querySelector(".list-view").hidden, true);
+    assert.match(card.shadowRoot.innerHTML, /Step 1 of 3/);
   } finally {
     if (card) card.disconnectedCallback();
     clearWindow();
