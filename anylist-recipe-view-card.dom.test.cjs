@@ -6339,3 +6339,66 @@ test("burst-8 race isolation: re-attaching with a recipe left open writes NOTHIN
     clearSessionStorage();
   }
 });
+
+// -- Screensaver mount (§7.5, RB-R4-1) ---------------------------------------
+//
+// The shared singleton's refcount is file-global (one core module per
+// test file), so these tests read the count before and after instead
+// of assuming it starts at zero.
+
+test("Screensaver mount: connect attaches, hass pushes update without touching the refcount, disconnect detaches", async () => {
+  injectCore();
+  try {
+    const before = core.screensaver.getRefcount();
+    const { card } = await loadedCard();
+    card.connectedCallback();
+    assert.equal(core.screensaver.getRefcount(), before + 1);
+    // Every hass push feeds the controller + the PIP Host; the
+    // refcount is mount-scoped and never moves on a push.
+    card.hass = fakeHass();
+    card.hass = fakeHass();
+    assert.equal(core.screensaver.getRefcount(), before + 1);
+    card.disconnectedCallback();
+    assert.equal(core.screensaver.getRefcount(), before);
+  } finally {
+    resetCore();
+  }
+});
+
+test("Screensaver mount: two cards mounted at once attach twice; each detach decrements", async () => {
+  injectCore();
+  try {
+    const before = core.screensaver.getRefcount();
+    const first = await loadedCard();
+    const second = await loadedCard();
+    first.card.connectedCallback();
+    second.card.connectedCallback();
+    assert.equal(core.screensaver.getRefcount(), before + 2);
+    first.card.disconnectedCallback();
+    assert.equal(core.screensaver.getRefcount(), before + 1);
+    second.card.disconnectedCallback();
+    assert.equal(core.screensaver.getRefcount(), before);
+  } finally {
+    resetCore();
+  }
+});
+
+test("Screensaver mount: attach is once per instance even when core loads after connect", async () => {
+  resetCore();
+  try {
+    const before = core.screensaver.getRefcount();
+    const { card } = await loadedCard();
+    card.connectedCallback();
+    assert.equal(core.screensaver.getRefcount(), before);
+    // Core loads: the re-apply attaches the live card once.
+    injectCore();
+    assert.equal(core.screensaver.getRefcount(), before + 1);
+    // A second connect-side attach attempt is a no-op (the flag).
+    card._screensaverAttach();
+    assert.equal(core.screensaver.getRefcount(), before + 1);
+    card.disconnectedCallback();
+    assert.equal(core.screensaver.getRefcount(), before);
+  } finally {
+    resetCore();
+  }
+});
