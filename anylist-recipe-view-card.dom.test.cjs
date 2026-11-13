@@ -5198,7 +5198,14 @@ test("R1-5: old bridge (no contract_version) -> Timer bridge mismatch in the str
     await flush();
     const mismatch = card.shadowRoot.querySelector(".fh-core-mismatch");
     assert.ok(mismatch);
+    assert.equal(mismatch.getAttribute("role"), "status");
     assert.match(mismatch.textContent, /Timer bridge mismatch: card expects contract v2/);
+    // Gates fix: the notice names the exact remedy (update in HACS,
+    // restart HA, reload) — never a bare message.
+    assert.match(
+      mismatch.textContent,
+      /Update Satellite Timers in HACS, restart Home Assistant, then reload this page\./
+    );
     assert.equal(card.shadowRoot.querySelectorAll(".timer-strip-item").length, 0);
     card.disconnectedCallback();
   } finally {
@@ -5216,7 +5223,12 @@ test("R1-5: mixed v2 + v1 sensors -> the error shows, the v2 pill still renders"
     await flush();
     const mismatch = card.shadowRoot.querySelector(".fh-core-mismatch");
     assert.ok(mismatch);
+    assert.equal(mismatch.getAttribute("role"), "status");
     assert.match(mismatch.textContent, /Timer bridge mismatch/);
+    assert.match(
+      mismatch.textContent,
+      /Update Satellite Timers in HACS, restart Home Assistant, then reload this page\./
+    );
     const items = card.shadowRoot.querySelectorAll(".timer-strip-item");
     assert.equal(items.length, 1);
     assert.match(items[0].textContent, /Pasta/);
@@ -5226,7 +5238,7 @@ test("R1-5: mixed v2 + v1 sensors -> the error shows, the v2 pill still renders"
   }
 });
 
-test("R1-5: core version skew -> Hub core mismatch replaces the strip, browsing intact", async () => {
+test("R1-5: core version skew -> Hub core mismatch degrades: notice + remedy, pills and browsing intact (gates fix)", async () => {
   const wrongCore = {
     identify: core.identify,
     deviceFromIdentity: core.deviceFromIdentity,
@@ -5244,8 +5256,217 @@ test("R1-5: core version skew -> Hub core mismatch replaces the strip, browsing 
     await flush();
     const mismatch = card.shadowRoot.querySelector(".fh-core-mismatch");
     assert.ok(mismatch);
+    assert.equal(mismatch.getAttribute("role"), "status");
     assert.match(mismatch.textContent, /Hub core mismatch: card needs 2.0.0, core is 9.9.9/);
+    // The stale-core fallback wraps the old bare-string API with the
+    // wizard remedy — the notice names the fix, not just the failure.
+    assert.match(
+      mismatch.textContent,
+      /Re-run the setup wizard to update the hub core, then reload this page\./
+    );
+    // Degrade, never blank: the running v2 timer still shows its pill.
+    const items = card.shadowRoot.querySelectorAll(".timer-strip-item");
+    assert.equal(items.length, 1);
+    assert.match(items[0].textContent, /Pasta/);
+    card.disconnectedCallback();
+  } finally {
+    resetCore();
+  }
+});
+
+test("R1-5: new-API core gate (checkCoreGate) degrades the same way — pills keep rendering, notice names the remedy (gates fix)", async () => {
+  // The loaded core exports checkCoreGate; this stub proves the card
+  // consumes the structured API directly, not only the stale-core
+  // fallback path the previous test covers.
+  const newApiCore = {
+    identify: core.identify,
+    deviceFromIdentity: core.deviceFromIdentity,
+    checkCoreGate: () => ({
+      gate: "core",
+      expected: "2.0.0",
+      actual: "9.9.9",
+      message: "Hub core mismatch: card needs 2.0.0, core is 9.9.9",
+      remedy: "Re-run the setup wizard to update the hub core, then reload this page.",
+    }),
+    checkBridgeGate: core.checkBridgeGate,
+    layoutBand: core.layoutBand,
+  };
+  _setCoreForTests(newApiCore);
+  try {
+    const v2 = timerSensor("sensor.satellite_timer_pasta", "Pasta", "active");
+    const { card } = await loadedCard({ states: [v2] });
+    card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+    await flush();
+    const mismatch = card.shadowRoot.querySelector(".fh-core-mismatch");
+    assert.ok(mismatch);
+    assert.equal(mismatch.getAttribute("role"), "status");
+    assert.match(mismatch.textContent, /Hub core mismatch: card needs 2.0.0, core is 9.9.9/);
+    assert.match(
+      mismatch.textContent,
+      /Re-run the setup wizard to update the hub core, then reload this page\./
+    );
+    const items = card.shadowRoot.querySelectorAll(".timer-strip-item");
+    assert.equal(items.length, 1);
+    assert.match(items[0].textContent, /Pasta/);
+    card.disconnectedCallback();
+  } finally {
+    resetCore();
+  }
+});
+
+test("R1-5: both gates trip at once -> two notices, each with its own remedy, v2 pill still renders (gates fix)", async () => {
+  const wrongCore = {
+    identify: core.identify,
+    deviceFromIdentity: core.deviceFromIdentity,
+    checkCoreVersion: () =>
+      "Hub core mismatch: card needs 2.0.0, core is 9.9.9",
+    checkBridgeContract: core.checkBridgeContract,
+    layoutBand: core.layoutBand,
+  };
+  _setCoreForTests(wrongCore);
+  try {
+    const v2 = timerSensor("sensor.satellite_timer_pasta", "Pasta", "active");
+    const v1 = timerSensor("sensor.satellite_timer_soup", "Soup", "active", { contract_version: null });
+    const { card } = await loadedCard({ states: [v2, v1] });
+    card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+    await flush();
+    const notices = card.shadowRoot.querySelectorAll(".fh-core-mismatch");
+    assert.equal(notices.length, 2);
+    assert.match(notices[0].textContent, /Hub core mismatch/);
+    assert.match(
+      notices[0].textContent,
+      /Re-run the setup wizard to update the hub core, then reload this page\./
+    );
+    assert.match(notices[1].textContent, /Timer bridge mismatch/);
+    assert.match(
+      notices[1].textContent,
+      /Update Satellite Timers in HACS, restart Home Assistant, then reload this page\./
+    );
+    const items = card.shadowRoot.querySelectorAll(".timer-strip-item");
+    assert.equal(items.length, 1);
+    assert.match(items[0].textContent, /Pasta/);
+    card.disconnectedCallback();
+  } finally {
+    resetCore();
+  }
+});
+
+test("R1-5: bridge gate clears on the next hass push once the bridge is v2 — notice gone, pill appears (gates fix)", async () => {
+  injectCore();
+  try {
+    const v1 = timerSensor("sensor.satellite_timer_pasta", "Pasta", "active", { contract_version: null });
+    const { card, hass } = await loadedCard({ states: [v1] });
+    card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+    await flush();
+    assert.ok(card.shadowRoot.querySelector(".fh-core-mismatch"));
     assert.equal(card.shadowRoot.querySelectorAll(".timer-strip-item").length, 0);
+    // The bridge is updated and Home Assistant restarted: the sensor
+    // now stamps contract_version 2 on the next push.
+    const v2 = timerSensor("sensor.satellite_timer_pasta", "Pasta", "active");
+    card.hass = { ...hass, states: [v2] };
+    await flush();
+    assert.equal(card.shadowRoot.querySelector(".fh-core-mismatch"), null);
+    const items = card.shadowRoot.querySelectorAll(".timer-strip-item");
+    assert.equal(items.length, 1);
+    assert.match(items[0].textContent, /Pasta/);
+    card.disconnectedCallback();
+  } finally {
+    resetCore();
+  }
+});
+
+test("R1-5: bridge gate clears on a hass push when the v1 sensor is DELETED, not just corrected in place (gates fix)", async () => {
+  // The timer card had this exact bug (T1 L-T6): its gate notices only
+  // re-rendered when the timer-list key moved, and a deleted mismatched
+  // sensor is excluded from that list, so the notice stayed up forever
+  // even though the gate was already null in memory. The recipe card
+  // re-renders on every hass push (set hass -> _render), so the notice
+  // must clear here too — this test pins that, with the timer list
+  // UNCHANGED across the push (the v2 pill was already rendering).
+  injectCore();
+  try {
+    const v2 = timerSensor("sensor.satellite_timer_pasta", "Pasta", "active");
+    const v1 = timerSensor("sensor.satellite_timer_soup", "Soup", "active", { contract_version: null });
+    const { card, hass } = await loadedCard({ states: [v2, v1] });
+    card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+    await flush();
+    assert.ok(card.shadowRoot.querySelector(".fh-core-mismatch"));
+    assert.equal(card.shadowRoot.querySelectorAll(".timer-strip-item").length, 1);
+    // The bridge is updated and Home Assistant restarted: the old
+    // sensor is gone entirely — no replacement v2 sensor for it.
+    card.hass = { ...hass, states: [v2] };
+    await flush();
+    assert.equal(card.shadowRoot.querySelector(".fh-core-mismatch"), null);
+    const items = card.shadowRoot.querySelectorAll(".timer-strip-item");
+    assert.equal(items.length, 1);
+    assert.match(items[0].textContent, /Pasta/);
+    card.disconnectedCallback();
+  } finally {
+    resetCore();
+  }
+});
+
+test("R1-5: core gate does NOT clear on a hass push — it clears only on reload (gates fix)", async () => {
+  const wrongCore = {
+    identify: core.identify,
+    deviceFromIdentity: core.deviceFromIdentity,
+    checkCoreVersion: () =>
+      "Hub core mismatch: card needs 2.0.0, core is 9.9.9",
+    checkBridgeContract: core.checkBridgeContract,
+    layoutBand: core.layoutBand,
+  };
+  _setCoreForTests(wrongCore);
+  try {
+    const v2 = timerSensor("sensor.satellite_timer_pasta", "Pasta", "active");
+    const { card, hass } = await loadedCard({ states: [v2] });
+    card.shadowRoot.dispatchClick(fakeTarget("open", { recipeId: "rec-pasta" }));
+    await flush();
+    assert.ok(card.shadowRoot.querySelector(".fh-core-mismatch"));
+    assert.equal(card.shadowRoot.querySelectorAll(".timer-strip-item").length, 1);
+    // A hass push arrives (the timer's remaining time moved on) while
+    // the loaded core is still stale: the gate re-evaluates against the
+    // same imported module and stays tripped — only a page reload,
+    // which re-imports the updated core, clears it. This is the core
+    // half of the split clearing rule (the bridge half is the test
+    // above: the bridge gate clears on the next push once v2 arrives).
+    const v2later = timerSensor("sensor.satellite_timer_pasta", "Pasta", "active", {
+      finishes_at: new Date(Date.now() + 300000).toISOString(),
+    });
+    card.hass = { ...hass, states: [v2later] };
+    await flush();
+    const mismatch = card.shadowRoot.querySelector(".fh-core-mismatch");
+    assert.ok(mismatch);
+    assert.match(mismatch.textContent, /Hub core mismatch/);
+    assert.match(
+      mismatch.textContent,
+      /Re-run the setup wizard to update the hub core, then reload this page\./
+    );
+    const items = card.shadowRoot.querySelectorAll(".timer-strip-item");
+    assert.equal(items.length, 1);
+    assert.match(items[0].textContent, /Pasta/);
+    card.disconnectedCallback();
+  } finally {
+    resetCore();
+  }
+});
+
+test("R1-5: strip badge still counts on a core skew — the badge degrades with the strip, it is not hidden (gates fix)", async () => {
+  const wrongCore = {
+    identify: core.identify,
+    deviceFromIdentity: core.deviceFromIdentity,
+    checkCoreVersion: () =>
+      "Hub core mismatch: card needs 2.0.0, core is 9.9.9",
+    checkBridgeContract: core.checkBridgeContract,
+    layoutBand: core.layoutBand,
+  };
+  _setCoreForTests(wrongCore);
+  try {
+    const v2 = timerSensor("sensor.satellite_timer_pasta", "Pasta", "active");
+    const { card } = await loadedCard({ states: [v2] });
+    const badges = card.shadowRoot.querySelectorAll(".timer-badge");
+    assert.equal(badges.length, 1);
+    assert.equal(badges[0].hidden, false);
+    assert.equal(badges[0].textContent, "1");
     card.disconnectedCallback();
   } finally {
     resetCore();

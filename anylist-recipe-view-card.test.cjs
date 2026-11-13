@@ -41,6 +41,10 @@ const {
   CORE_LOOKUP_RETRY_THROTTLE_MS,
   CORE_LOOKUP_INTERVAL_MS,
   REQUIRED_CORE,
+  CORE_GATE_REMEDY_FALLBACK,
+  BRIDGE_GATE_REMEDY_FALLBACK,
+  coreGateFromModule,
+  bridgeGateFromModule,
   _setCoreForTests,
   timerName,
   timerRemainingSeconds,
@@ -1154,6 +1158,92 @@ test("R1: identity banner + core-mismatch CSS exist (§4/§9)", () => {
   assert.ok(CARD_CSS.includes("background: #7f1d1d;"));
   assert.ok(CARD_CSS.includes(".fh-identity-banner[hidden] { display: none; }"));
   assert.ok(CARD_CSS.includes(".fh-core-mismatch {"));
+  // The gate remedy renders as its own line under the message.
+  assert.ok(CARD_CSS.includes(".fh-gate-remedy {"));
+});
+
+// -- §9 version gates, structured API + stale-core fallback (gates fix) --
+
+test("gates: remedy fallback literals match the core's verbatim remedies", () => {
+  assert.equal(
+    CORE_GATE_REMEDY_FALLBACK,
+    "Re-run the setup wizard to update the hub core, then reload this page."
+  );
+  assert.equal(
+    BRIDGE_GATE_REMEDY_FALLBACK,
+    "Update Satellite Timers in HACS, restart Home Assistant, then reload this page."
+  );
+  // The loaded core exports the same strings — the card's copies are
+  // only a fallback for a stale cached core.
+  assert.equal(core.CORE_GATE_REMEDY, CORE_GATE_REMEDY_FALLBACK);
+  assert.equal(core.BRIDGE_GATE_REMEDY, BRIDGE_GATE_REMEDY_FALLBACK);
+});
+
+test("gates: coreGateFromModule uses the new checkCoreGate API when present", () => {
+  assert.equal(coreGateFromModule(core, "2.0.0"), null);
+  const gate = coreGateFromModule(core, "9.9.9");
+  assert.equal(gate.gate, "core");
+  assert.equal(gate.expected, "9.9.9");
+  assert.equal(gate.actual, "2.0.0");
+  assert.match(gate.message, /Hub core mismatch: card needs 9.9.9, core is 2.0.0/);
+  assert.equal(gate.remedy, CORE_GATE_REMEDY_FALLBACK);
+});
+
+test("gates: coreGateFromModule wraps the old checkCoreVersion API with the remedy", () => {
+  const stale = {
+    checkCoreVersion: (required) =>
+      required === "2.0.0" ? null : `Hub core mismatch: card needs ${required}, core is 9.9.9`,
+  };
+  assert.equal(coreGateFromModule(stale, "2.0.0"), null);
+  const gate = coreGateFromModule(stale, "9.9.9");
+  assert.equal(gate.gate, "core");
+  assert.match(gate.message, /Hub core mismatch: card needs 9.9.9, core is 9.9.9/);
+  assert.equal(gate.remedy, CORE_GATE_REMEDY_FALLBACK);
+});
+
+test("gates: coreGateFromModule never silently passes — null module is unknown, a gateless module trips the guard", () => {
+  assert.equal(coreGateFromModule(null, "2.0.0"), null);
+  const gate = coreGateFromModule({}, "2.0.0");
+  assert.equal(gate.gate, "core");
+  assert.match(gate.message, /too old to report its version/);
+  assert.equal(gate.remedy, CORE_GATE_REMEDY_FALLBACK);
+});
+
+test("gates: bridgeGateFromModule uses the new checkBridgeGate API when present", () => {
+  const v2 = {
+    entity_id: "sensor.satellite_timer_pasta",
+    state: "active",
+    attributes: { contract_version: 2 },
+  };
+  assert.equal(bridgeGateFromModule(core, [v2]), null);
+  const v1 = {
+    entity_id: "sensor.satellite_timer_soup",
+    state: "active",
+    attributes: {},
+  };
+  const gate = bridgeGateFromModule(core, [v2, v1]);
+  assert.equal(gate.gate, "bridge");
+  assert.equal(gate.expected, 2);
+  assert.deepEqual(gate.mismatched, ["sensor.satellite_timer_soup"]);
+  assert.match(gate.message, /Timer bridge mismatch: card expects contract v2/);
+  assert.equal(gate.remedy, BRIDGE_GATE_REMEDY_FALLBACK);
+});
+
+test("gates: bridgeGateFromModule wraps the old checkBridgeContract API with the remedy", () => {
+  const stale = { checkBridgeContract: core.checkBridgeContract };
+  const v1 = {
+    entity_id: "sensor.satellite_timer_soup",
+    state: "active",
+    attributes: {},
+  };
+  const gate = bridgeGateFromModule(stale, [v1]);
+  assert.equal(gate.gate, "bridge");
+  assert.deepEqual(gate.mismatched, ["sensor.satellite_timer_soup"]);
+  assert.equal(gate.remedy, BRIDGE_GATE_REMEDY_FALLBACK);
+  assert.equal(bridgeGateFromModule(stale, []), null);
+  // A gateless module returns null here only because the core gate
+  // already trips for the same module — the failure is never silent.
+  assert.equal(bridgeGateFromModule({}, [v1]), null);
 });
 
 test("timer helpers: name, remaining, formatting (RECIPE-22)", () => {

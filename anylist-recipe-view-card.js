@@ -1211,9 +1211,83 @@ const CORE_LOOKUP_RETRY_THROTTLE_MS = 10 * 1000;
 const CORE_LOOKUP_INTERVAL_MS = 30 * 1000;
 
 // Core contract version this card was built against (§9). On mismatch
-// the card renders a visible "Hub core mismatch" error in the timer
-// strip area only — browsing never blocks on it.
+// the card degrades in the timer strip area only — a non-blocking notice
+// naming the exact remedy, with the running timers still shown —
+// browsing never blocks on it.
 const REQUIRED_CORE = "2.0.0";
+
+// Structured gate results from a core module (`mod`): prefer the new
+// checkCoreGate()/checkBridgeGate() API (gates fix, pi 65433f5); a stale
+// cached core only has the old bare-string checkCoreVersion() /
+// checkBridgeContract(), so wrap those into the same shape with this
+// card's own remedy strings. These literals match CORE_GATE_REMEDY /
+// BRIDGE_GATE_REMEDY in family-hub-core.js exactly.
+// Returns null when the gate passes, else
+// { gate, expected, actual?, mismatched?, message, remedy }.
+// A module with NEITHER gate function cannot be evaluated — that case
+// is unreachable in practice (core.js was created in R1 already
+// exporting checkCoreVersion), so it is a defensive guard, not a
+// silent pass: the core gate reports the core as too old to check,
+// with the wizard remedy. The bridge gate returns null in that same
+// case ONLY because the core gate already trips for the same module
+// and its notice names the remedy — the failure is never silent
+// overall. A null `mod` (core not loaded yet) still returns null: the
+// import-failed path is separate, not here.
+const CORE_GATE_REMEDY_FALLBACK =
+  "Re-run the setup wizard to update the hub core, then reload this page.";
+const BRIDGE_GATE_REMEDY_FALLBACK =
+  "Update Satellite Timers in HACS, restart Home Assistant, then reload this page.";
+function coreGateFromModule(mod, required) {
+  if (!mod) return null;
+  if (typeof mod.checkCoreGate === "function") {
+    return mod.checkCoreGate(required);
+  }
+  if (typeof mod.checkCoreVersion === "function") {
+    const message = mod.checkCoreVersion(required);
+    if (message === null || message === undefined) return null;
+    return {
+      gate: "core",
+      expected: String(required),
+      actual: typeof mod.CORE_VERSION === "string" ? mod.CORE_VERSION : null,
+      message,
+      remedy: mod.CORE_GATE_REMEDY || CORE_GATE_REMEDY_FALLBACK,
+    };
+  }
+  // Defensive guard (unreachable in practice — see above): a core
+  // that cannot even report its version is too old to trust.
+  return {
+    gate: "core",
+    expected: String(required),
+    actual: typeof mod.CORE_VERSION === "string" ? mod.CORE_VERSION : null,
+    message: `Hub core mismatch: card needs ${required}, core is too old to report its version`,
+    remedy: mod.CORE_GATE_REMEDY || CORE_GATE_REMEDY_FALLBACK,
+  };
+}
+function bridgeGateFromModule(mod, states) {
+  if (!mod) return null;
+  if (typeof mod.checkBridgeGate === "function") {
+    return mod.checkBridgeGate(states);
+  }
+  if (typeof mod.checkBridgeContract === "function") {
+    const res = mod.checkBridgeContract(states);
+    if (!res || !res.error) return null;
+    return {
+      gate: "bridge",
+      expected:
+        typeof mod.BRIDGE_CONTRACT_VERSION === "number"
+          ? mod.BRIDGE_CONTRACT_VERSION
+          : 2,
+      mismatched: res.mismatched || [],
+      message: res.error,
+      remedy: mod.BRIDGE_GATE_REMEDY || BRIDGE_GATE_REMEDY_FALLBACK,
+    };
+  }
+  // No bridge function to call — but this module also has no core
+  // gate function, so coreGateFromModule above already trips for it
+  // and its notice names the remedy. Returning null here is not a
+  // silent pass: the core notice is showing.
+  return null;
+}
 
 let _coreModule = null; // The imported core namespace, once loaded.
 let _corePromise = null; // The in-flight lookup+import, shared by instances.
@@ -2642,6 +2716,11 @@ const CARD_CSS = `
     border-radius: 12px;
     margin-bottom: 12px;
   }
+  .fh-gate-remedy {
+    display: block;
+    font-weight: 400;
+    margin-top: 4px;
+  }
   /* Desktop: a mouse is precise, so targets shrink and the grid gets
      denser — three columns from 1500px (D1920 = 3 columns, 12 cards;
      there is no four-column rule — R-IMPL-3 deleted the 1700px one).
@@ -3304,8 +3383,10 @@ class AnyListRecipeViewCard extends HTMLElement {
     this._detailEl = null;
     this._device = null; // { category, orientation } from core deviceFromIdentity, or null outside a browser.
     this._identity = null; // Last core identify() result, or null before core loads.
-    this._coreMismatch = null; // checkCoreVersion() message, or null when core matches.
-    this._bridgeMismatch = null; // checkBridgeContract() error, or null when all sensors are v2.
+    this._coreGate = null; // checkCoreGate() result, or null when core matches.
+    this._coreMismatch = null; // _coreGate.message, or null when core matches.
+    this._bridgeGate = null; // checkBridgeGate() result, or null when all sensors are v2.
+    this._bridgeMismatch = null; // _bridgeGate.message, or null when all sensors are v2.
     this._bridgeMismatched = new Set(); // entity ids excluded from timer UI by the bridge gate.
     this._identityBanner = null;
     this._coreRetryTimer = null; // 30 s core-lookup retry interval, while mounted.
@@ -3605,10 +3686,8 @@ class AnyListRecipeViewCard extends HTMLElement {
       // Identity comes from core (§4): the registered Browser Mod id.
       identity = _coreModule.identify(this._hass);
       device = _coreModule.deviceFromIdentity(identity, width, height);
-      this._coreMismatch =
-        typeof _coreModule.checkCoreVersion === "function"
-          ? _coreModule.checkCoreVersion(REQUIRED_CORE)
-          : null;
+      this._coreGate = coreGateFromModule(_coreModule, REQUIRED_CORE);
+      this._coreMismatch = this._coreGate ? this._coreGate.message : null;
     } else {
       // Core not loaded yet (or failed): unknown → desktop-safe (§4).
       // The kiosk class still follows the launch URL so the strip does
@@ -3618,6 +3697,7 @@ class AnyListRecipeViewCard extends HTMLElement {
         category: "desktop",
         orientation: width >= height ? "landscape" : "portrait",
       };
+      this._coreGate = null;
       this._coreMismatch = null;
     }
     const changed =
@@ -5230,8 +5310,10 @@ class AnyListRecipeViewCard extends HTMLElement {
     const states = this._hass && this._hass.states;
     // hass.states may be an array (classic) or an object keyed by
     // entity id (HA 2026.2+) — the badge helper takes the object form.
-    // §9 bridge gate (R1-5): mismatched sensors contribute no count,
-    // and a core skew shows no badge at all.
+    // §9 bridge gate (R1-5, degraded in fix/copout-recipe-gates):
+    // mismatched sensors contribute no count. A core skew does NOT
+    // hide the badge: the gate degrades (notice + timers from the
+    // sensors the card has) instead of blanking the timer UI.
     this._refreshGates();
     const badgeStates = Array.isArray(states)
       ? Object.fromEntries(
@@ -5246,9 +5328,7 @@ class AnyListRecipeViewCard extends HTMLElement {
             )
           )
         : null;
-    const badgeState = this._coreMismatch
-      ? null
-      : timerBadgeFromHassStates(badgeStates);
+    const badgeState = timerBadgeFromHassStates(badgeStates);
     if (!badgeState) {
       badge.hidden = true;
       badge.textContent = "";
@@ -5303,41 +5383,39 @@ class AnyListRecipeViewCard extends HTMLElement {
     this._syncStripSummary();
   }
 
-  // §9 version gates (R1-5): evaluate both gates from core. Called
-  // from _runningTimers + _pipOnHassPush + _pipResolveSensor (not only
-  // _applyDevice, which early-returns without a window in node tests):
-  // the gates must evaluate wherever timer UI renders. Before core
-  // loads both read null and the timer list passes through unchanged
-  // (the R1-3 behaviour).
+  // §9 version gates (R1-5, degraded in fix/copout-recipe-gates): evaluate
+  // both gates from core via the structured API, with the stale-core
+  // fallback wrapping the old functions. Called from _runningTimers +
+  // _pipOnHassPush + _pipResolveSensor (not only _applyDevice, which
+  // early-returns without a window in node tests): the gates must
+  // evaluate wherever timer UI renders. Before core loads both read
+  // null and the timer list passes through unchanged (the R1-3
+  // behaviour). Clearing is split: the bridge gate re-evaluates on
+  // every hass push and clears by itself once the bridge is updated
+  // and Home Assistant restarted; the core gate clears ONLY on the
+  // page reload its remedy instructs (a push re-runs the check against
+  // the same stale imported module).
   _refreshGates() {
-    if (_coreModule && typeof _coreModule.checkCoreVersion === "function") {
-      this._coreMismatch = _coreModule.checkCoreVersion(REQUIRED_CORE);
-    } else {
-      this._coreMismatch = null;
-    }
-    let mismatched = new Set();
-    if (
-      _coreModule &&
-      typeof _coreModule.checkBridgeContract === "function" &&
-      this._hass
-    ) {
-      const res = _coreModule.checkBridgeContract(this._hass.states);
-      this._bridgeMismatch = res.error;
-      mismatched = new Set(res.mismatched || []);
-    } else {
-      this._bridgeMismatch = null;
-    }
-    this._bridgeMismatched = mismatched;
+    this._coreGate = coreGateFromModule(_coreModule, REQUIRED_CORE);
+    this._coreMismatch = this._coreGate ? this._coreGate.message : null;
+    this._bridgeGate = this._hass
+      ? bridgeGateFromModule(_coreModule, this._hass.states)
+      : null;
+    this._bridgeMismatch = this._bridgeGate ? this._bridgeGate.message : null;
+    this._bridgeMismatched = new Set(
+      (this._bridgeGate && this._bridgeGate.mismatched) || []
+    );
   }
 
   // The running timers for the strip, from the hass states.
   _runningTimers() {
     if (!this._hass) return [];
     this._refreshGates();
-    // A core-version skew admits no timers at all: the card does not
-    // run against a contract it does not understand (C-5/T-10
-    // "instead of running"). A bridge skew admits the v2 sensors.
-    if (this._coreMismatch) return [];
+    // A core-version skew admits the same sensors as a match: the gate
+    // degrades (notice + timers from the sensors the card has) instead
+    // of blanking the timer UI (cop-out audit A1; the old "instead of
+    // running" rule is superseded by the gates fix). A bridge skew
+    // admits the v2 sensors; mismatched sensors contribute nothing.
     const states = timerSensorList(this._hass.states || []).filter(
       (s) => s && !this._bridgeMismatched.has(s.entity_id)
     );
@@ -7348,22 +7426,25 @@ class AnyListRecipeViewCard extends HTMLElement {
   // layout rule, not a data rule: the "+N more" pill says exactly
   // how many timers the strip is hiding.
   _timerStripHtml() {
-    // §9 version gates (R1-5): a core skew OR a bridge skew shows here,
-    // in the timer strip area only — never in the browse UI. It shows
-    // even with no timers running, so a skew is never silent — and,
-    // unlike the R1-3 shape, it also shows while timers run (a skew
-    // was silent whenever the strip had pills).
+    // §9 version gates (R1-5, degraded in fix/copout-recipe-gates): a
+    // core skew OR a bridge skew shows here as NON-BLOCKING notices —
+    // message + the exact remedy — above the timer pills, in the timer
+    // strip area only, never in the browse UI. Both gates can trip at
+    // once; each renders its own notice with its own remedy. The pills
+    // keep rendering under either skew (v2 sensors only on a bridge
+    // skew); a skew is never silent and never blanks the strip.
     const timers = this._runningTimers();
-    const gateError = this._coreMismatch || this._bridgeMismatch;
-    const mismatch = gateError
-      ? `<div class="fh-core-mismatch" role="alert">${escapeHtml(gateError)}</div>`
-      : "";
-    // Core skew: the error replaces the timer UI entirely.
-    if (this._coreMismatch) return mismatch;
-    if (timers.length === 0) return mismatch;
+    const gates = [this._coreGate, this._bridgeGate].filter(Boolean);
+    const notices = gates
+      .map(
+        (gate) =>
+          `<div class="fh-core-mismatch" role="status"><span class="fh-gate-message">${escapeHtml(gate.message)}</span><span class="fh-gate-remedy">${escapeHtml(gate.remedy)}</span></div>`
+      )
+      .join("");
+    if (timers.length === 0) return notices;
     const shown = this._shownStripTimers();
     const extra = timers.length - shown.length;
-    return `${mismatch}<div class="timer-strip" aria-label="Running timers">${shown
+    return `${notices}<div class="timer-strip" aria-label="Running timers">${shown
       .map((timer) => {
         const remaining = timerRemainingSeconds(timer);
         return `<button class="timer-strip-item${timer.state === "paused" ? " paused" : ""}" data-action="goto-timers" aria-label="Go to ${escapeHtml(timerName(timer))} timer">
@@ -7726,6 +7807,10 @@ if (typeof module !== "undefined" && module.exports) {
     CORE_LOOKUP_RETRY_THROTTLE_MS,
     CORE_LOOKUP_INTERVAL_MS,
     REQUIRED_CORE,
+    CORE_GATE_REMEDY_FALLBACK,
+    BRIDGE_GATE_REMEDY_FALLBACK,
+    coreGateFromModule,
+    bridgeGateFromModule,
     LOAD_RETRY_MAX_ATTEMPTS,
     LOAD_RETRY_DELAYS_MS,
     SAVE_RETRY_MAX_ATTEMPTS,
