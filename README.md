@@ -54,28 +54,44 @@ layout per device.
 ## How it works
 
 The card is a single vanilla-JS file (`anylist-recipe-view-card.js`,
-no dependencies, no build step, no backend of its own). It calls one
-AnyList action per view-open — `anylist.get_recipes` with ingredients
-and steps included — and everything after that reads from memory: the
-list, the collection chips (derived from the recipes themselves), the
-search, and the detail view. No per-search download, no per-recipe
-download. The one exception is a save: editing a note or a rating
-calls `anylist.update_recipe` with only the changed field. Serving
-scaling is transient and client-side — it changes only the quantities
-shown while cooking and never calls the server.
+no dependencies, no build step, no backend of its own). It reads the
+recipes from one canonical JSON file over HTTP (default
+`/local/recipes.json`, produced by
+[k-mehta/anylist-exporter](https://github.com/k-mehta/anylist-exporter)),
+gated on `schema_version: 1` and stamped with `exported_at`. The file
+is re-fetched every 5 minutes and whenever the view becomes visible
+again; a failed load keeps the last good data. Everything after the
+load reads from memory: the list, the collection chips (derived from
+the recipes themselves), the search, and the detail view. No
+per-search download, no per-recipe download. The two exceptions are
+saves and timers: editing a note or a rating calls
+`anylist.update_recipe` with only the changed field, and a step's
+duration chip starts a timer through the Satellite Timers bridge
+(`satellite_timers.start_timer`), which returns the timer's entity id
+for the picture-in-picture. Serving scaling is transient and
+client-side — it changes only the quantities shown while cooking and
+never calls the server.
 
 ## Requirements
 
 - Home Assistant 2025.12.0 or newer.
+- A `recipes.json` canonical export served by Home Assistant at
+  `/local/recipes.json` (see
+  [k-mehta/anylist-exporter](https://github.com/k-mehta/anylist-exporter)).
 - The [AnyList integration](https://github.com/moryoav/ha-anylist)
-  (AnyList by moryoav) installed and configured — the card calls its
-  `get_recipes` action over the websocket API. Note and rating
-  editing need the
+  (AnyList by moryoav) installed and configured — note and rating
+  editing call `anylist.update_recipe` over the websocket API and
+  need the
   [k-mehta/ha-anylist fork](https://github.com/k-mehta/ha-anylist)
-  0.11.1 or newer, which adds `note` and `rating` to `update_recipe`
-  (and a local SQLite recipe cache); with the upstream integration
-  the card still browses and cooks, but a note/rating save reports
-  honestly that it could not be saved.
+  0.11.1 or newer, which adds `note` and `rating` to `update_recipe`;
+  with the upstream integration the card still browses and cooks,
+  but a note/rating save reports honestly that it could not be
+  saved.
+- The Satellite Timers bridge
+  ([k-mehta/ha-satellite-timers](https://github.com/k-mehta/ha-satellite-timers))
+  for step duration chips; without it a chip tap reports the
+  missing bridge in place and names the Timers view as the
+  alternative.
 
 ## Install
 

@@ -6,6 +6,56 @@ and the version numbers follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Releases
 are tagged `vX.Y.Z`.
 
+## [2.0.0] - Unreleased
+
+Phase 2 Wave W7 — rewritten from scratch against the settled
+architecture (the 1.x card is superseded and is not a build base).
+
+### Added
+
+- Canonical-JSON read path: the card fetches one `recipes.json`
+  export over HTTP (default `/local/recipes.json`), gated on
+  `schema_version: 1`, with the export stamp (`exported_at`) shown
+  as the export age and the fetch time shown as "Updated 2:14 PM".
+  The file is re-fetched every 5 minutes and on visibility return;
+  a failed load keeps the last good data and retries on the
+  [2, 8, 30] s ladder, never blanking the screen.
+- Local search: one index built per data load, debounced 250 ms,
+  fields ranked title > ingredient > step > description > notes >
+  source, tokens AND-across-words / OR-across-fields, per-token
+  substring or plain Levenshtein ≤ 1, ties by title. Settled counts
+  reproduce the measured counts ("biryani" 6/14, "chickpea" 46/336,
+  "biryanni" 6/14, "Simple Tomato Soup" 2, "Crème Brûlée" 1).
+- Ingredient headings render from both shapes: the fork's
+  `ingredient_entries` (section/ingredient) and upstream PR #15's
+  headings inside `ingredients` (`is_heading: true` + `id`).
+- Voice step navigation exactly as recorded in the design record
+  (D9): the bridge publishes the command on
+  `sensor.family_hub_voice_step_command` (state `next`/`previous`,
+  monotonic `sequence` attribute); the card routes it to the one
+  step-change handler and never re-applies a sequence.
+- Recipe→timer contract: a duration chip calls
+  `satellite_timers.start_timer` with `return_response: true` and
+  binds the picture-in-picture to the returned entity id — no
+  name+time-window heuristic, no fallback that can bind the wrong
+  timer.
+- A 60 s re-probe that actually exists in code: while a load or save
+  failure is shown, the card re-checks every minute; a recovery
+  clears the error silently and a persistent failure re-arms it.
+
+### Removed
+
+- Cook state is gone entirely (Q4 settled): no ingredient/step
+  check-offs, no Finish control, no persisted cook state, no 24 h
+  TTL, no wipe message. The current step is session state only.
+- The exact-size device signature is gone (Nov 11 ruling): the card
+  has no device detection and no per-device layout — one column at
+  every viewport.
+- The total-time line is not shipped (I43, RECIPE-V1 time-unit
+  question, gated until the exporter's canonical JSON is resolved
+  against a live round-trip).
+
+
 ## [1.5.0] - 2026-11-11
 
 Family Hub redo, Recipes wave 1 (R-IMPL-1–60) against the locked design.

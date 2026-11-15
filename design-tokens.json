@@ -768,9 +768,9 @@
    "value": "18px"
   },
   "font-timer-name-desktop": {
-   "spec": "home .timer-name (no desktop override)",
+   "spec": "home .screen.dev-desktop .timer-name (grouped with todo-name, note-text, nav-button at 20px — the token's old 'no desktop override' note was wrong; the override exists)",
    "status": "CURRENT",
-   "value": "24px"
+   "value": "20px"
   },
   "font-timer-name-hub": {
    "spec": "home .timer-name; TIMER-1 full name wraps to 2 lines, min 20px on hub",
@@ -783,9 +783,9 @@
    "value": "18px"
   },
   "font-timer-name-tablet": {
-   "spec": "OQ-4",
+   "spec": "OQ-4, grouped with todo-name, note-text, nav-button at 20px like desktop (the token's old 24px was wrong; the card overrides it)",
    "status": "DECISION",
-   "value": "24px"
+   "value": "20px"
   },
   "line-height-body": {
    "spec": "home + recipe .screen",
